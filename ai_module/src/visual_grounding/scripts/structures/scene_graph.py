@@ -57,13 +57,13 @@ class SceneGraph:
             #     if kf_id >= 10000:
             #         self.history_keyframes[kf_id] = kf
 
-    def get_entity_names(self, names, etype: Literal['object', 'detection', 'all'] = 'object') -> Entities:
+    def get_entity_names(self, names, etype: Literal['object', 'detection', 'all'] = 'object', *args, **kwargs) -> Entities:
         if not isinstance(names, list):
             names = [names]
-        return Entities({id: data for id, data in self.entities(etype).items() if data.name in names})
+        return Entities({id: data for id, data in self.entities(etype).items() if data.name in names}, *args, **kwargs)
 
-    def get_candidate_entities(self, etype: Literal['object', 'detection', 'all'] = 'object') -> Entities:
-        return self.get_entity_names(self.candidate_names, etype=etype)
+    def get_candidate_entities(self, etype: Literal['object', 'detection', 'all'] = 'object', *args, **kwargs) -> Entities:
+        return self.get_entity_names(self.candidate_names, etype=etype, *args, **kwargs)
 
     def get_reference_entities(self, etype: Literal['object', 'detection', 'all'] = 'object') -> Entities:
         return self.get_entity_names(self.reference_names, etype=etype)

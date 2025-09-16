@@ -361,7 +361,7 @@ class Entities(Datas):
     def __ne__(self, other) -> bool:
         return not self.__eq__(other)
 
-    def __call__(self, etype: Literal['object', 'detection', 'all'] = 'object', include_untracked: bool = True):
+    def __call__(self, etype: Literal['object', 'detection', 'all'] = 'object', include_untracked: bool = True, *args, **kwargs):
         if etype == 'object':
             if include_untracked:
                 entities = {id: entity for id, entity in self.items() if entity.is_object}

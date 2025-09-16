@@ -37,6 +37,9 @@ try:
 except:
     use_rospy = False
 
+ANSWER_TOPIC_NAME = {'find': 'selected_object_marker', 'count': '/numerical_response'}
+
+
 class VisualFollower(BaseActiveVisualGrounder):
     def __init__(self, logger=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -373,7 +376,7 @@ class VisualFollower(BaseActiveVisualGrounder):
             action = self.action
             self.logger.loginfo(f"<main.1> Action: {action}")
             
-            self.answer_pub = rospy.Publisher('/answer', ANSWER_TYPE.get(action, String), queue_size=1)
+            self.answer_pub = rospy.Publisher(ANSWER_TOPIC_NAME.get(action, '/answer'), ANSWER_TYPE.get(action, String), queue_size=1)
             
             """ LLM Client """
             etypes = self.etypes
