@@ -19,7 +19,7 @@
 
 <!-- User Interface -->
     <node name="user_interface" type="user_interface" pkg="user_interface" output="screen">
-        <param name="debug" value="$(arg debug)"/>
+        <param name="debug" value="true"/>
     </node>
 
 </launch>
