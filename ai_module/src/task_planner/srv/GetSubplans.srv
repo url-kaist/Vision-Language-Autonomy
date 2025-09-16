@@ -1,0 +1,7 @@
+# Request
+string question
+---
+# Response
+bool success
+string message
+Plan plan

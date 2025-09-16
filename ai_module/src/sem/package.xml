@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>sem</name>
+  <version>0.0.1</version>
+  <description>ROS interface to tensorrt segmentation</description>
+
+  <maintainer email="na26933@mit.edu">Nathan Hughes</maintainer>
+  <author email="na26933@mit.edu">Nathan Hughes</author>
+  <license>TODO</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+  <depend>roscpp</depend>
+  <build_depend>message_generation</build_depend>
+  <build_depend>service_generation</build_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>message_runtime</exec_depend>
+  <exec_depend>message_generation</exec_depend>
+
+  <build_depend>snapshot</build_depend>
+  <exec_depend>snapshot</exec_depend>
+  
+</package>

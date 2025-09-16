@@ -1,0 +1,7 @@
+# Request
+string[] object_of_interest
+---
+# Response
+bool success
+string message
+geometry_msgs/Pose2D target_pose

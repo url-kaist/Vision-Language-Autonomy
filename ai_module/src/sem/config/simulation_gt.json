@@ -1,0 +1,7 @@
+{
+  "classnames": [],
+  "image_topic": "/camera/image",
+  "semantic_image_topic": "/camera/semantic_image",
+  "lidar_topic": "/semantic_scan",
+  "odom_topic": "/state_estimation"
+}

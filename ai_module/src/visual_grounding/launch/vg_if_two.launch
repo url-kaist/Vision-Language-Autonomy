@@ -1,0 +1,33 @@
+<launch>
+    <arg name="quiet" default="false"/>
+
+<!-- Visual Grounding -->
+    <include file="$(find visual_grounding)/launch/one_vg_if.launch">
+        <arg name="quiet" value="$(arg quiet)"/>
+        <arg name="vg_index" value="0"/>
+    </include>
+
+    <include file="$(find visual_grounding)/launch/one_vg_if.launch">
+        <arg name="quiet" value="$(arg quiet)"/>
+        <arg name="vg_index" value="1"/>
+    </include>
+
+<!--     <include file="$(find visual_grounding)/launch/one_vg.launch"> -->
+<!--         <arg name="quiet" value="$(arg quiet)"/> -->
+<!--         <arg name="vg_index" value="2"/> -->
+<!--     </include> -->
+
+<!-- Active Grounding -->
+    <node name="exploration" pkg="exploration" type="path_recorder.py" output="screen">
+        <param name="quiet" value="true"/>
+    </node>
+
+    <!-- <node pkg="exploration" type="path_follower.py" name="path_follower" output="screen">
+        <param name="quiet" value="true"/>
+    </node> -->
+
+    <node pkg="exploration" type="multi_view.py" name="multi_view" output="screen">
+        <param name="quiet" value="true"/>
+    </node>
+
+</launch>

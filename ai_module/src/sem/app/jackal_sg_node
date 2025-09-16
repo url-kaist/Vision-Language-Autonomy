@@ -1,0 +1,1878 @@
+#!/usr/bin/env python3
+
+import rospy
+from sensor_msgs.msg import Image, PointCloud2
+from geometry_msgs.msg import Point
+from nav_msgs.msg import Odometry
+import std_msgs.msg
+import sensor_msgs.point_cloud2 as pc2
+from sensor_msgs.msg import PointField
+from visualization_msgs.msg import Marker, MarkerArray
+from std_srvs.srv import Empty, EmptyResponse
+from message_filters import Subscriber, ApproximateTimeSynchronizer
+
+import random
+import time
+import threading
+import numpy as np
+from collections import deque
+import json
+import tf
+import cv2
+import math
+from cv_bridge import CvBridge
+from PIL import Image as PILImage
+import networkx as nx
+import os
+import shutil
+from datetime import datetime
+from networkx.readwrite.json_graph.node_link import node_link_data
+import open3d as o3d
+from scipy.spatial.transform import Rotation, Slerp
+from collections import defaultdict
+import sys
+from multiprocessing import shared_memory
+
+
+from utils import (
+    load_depth_intrinsics,
+    compute_iou_3d,
+    generate_random_position,
+    convert_pointcloud2_to_xyz,
+    compute_overlap_ratio,
+    cluster_dbscan,
+    voxel_downsample,
+    get_distance_between_poses,
+    get_angle_between_poses,
+)
+
+from label_constants import MATTERPORT_COLOR_MAP_160, MATTERPORT_LABELS_160
+from bg_process import BGProcessor
+from generate_seg_cloud import generate_seg_cloud, generate_color_cloud, generate_seg_comp_cloud, generate_seg_comp_cloud_jackal
+
+import sys
+sys.path.append("/ws/external/ai_module/src/")
+# from sem.srv import SetClasses, SetClassesResponse
+
+import torch
+from ultralytics import YOLO, SAM
+import open_clip
+
+scene = "scene"
+
+room_names = ["a photo of living room", "a photo of kitchen", "a photo of bedroom", "a photo of bathroom", "a photo of garage"]
+room_labels = ["living room", "kitchen", "bedroom", "bathroom", "garage"]
+
+import multiprocessing as mp
+import queue as pyqueue
+mp.set_start_method('spawn', force=True)
+
+class SceneGraphProcessor:
+    def __init__(self):
+        image_save_dir = "/ws/external/keyframes"
+        if os.path.exists(image_save_dir) and os.path.isdir(image_save_dir):
+            shutil.rmtree(image_save_dir)
+        os.makedirs(image_save_dir, exist_ok=True)
+        self.image_path = image_save_dir + "/{}.jpg"
+
+        self.bridge = CvBridge()
+        self.lock = threading.Lock()
+        self.running = True
+
+        # data
+        self.obj_classes = MATTERPORT_LABELS_160
+        self.color_map = {i + 1: color for i, color in enumerate(MATTERPORT_COLOR_MAP_160.values())}
+        self.room_names = room_names
+        self.room_labels = room_labels
+
+        # models
+        self.yolo_model = YOLO("yolov8l-world.pt").to("cuda")
+        self.yolo_model.eval()
+        template = "{}" #an image of 
+        self.classnames = [
+            template.format(name.replace("_", " ")) for name in self.obj_classes
+        ]
+        self.yolo_model.set_classes(self.classnames)
+        self.prev_max_id = -1
+        self.new_detection_signal = True
+
+        self.sam_model = SAM("mobile_sam.pt").to("cuda")
+        self.sam_model.eval()
+
+        self.clip_model, _, self.clip_preprocess = (
+            open_clip.create_model_and_transforms('hf-hub:laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K')
+        )
+        self.clip_model = self.clip_model.to("cuda")
+        self.clip_model.eval()
+        self.clip_tokenizer = open_clip.get_tokenizer('hf-hub:laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K')
+        with torch.no_grad():
+            tokens = self.clip_tokenizer(self.room_names).to("cuda")                   # (len(room_names), token_length)
+            text_embeddings = self.clip_model.encode_text(tokens)                      # (len(room_names), 512)
+            text_embeddings = text_embeddings / text_embeddings.norm(dim=-1, keepdim=True)
+        self.room_text_embeddings = text_embeddings.cpu()
+
+
+        # object mapping
+        self.yolo_results = {}
+        self.objects = {}
+        self.missing_objects = {}
+        self.detections = []
+        self.missing_detections = []
+        self.id_remap = {}
+        self.map_hash = {}
+        self.id_color_map = {}
+
+        self.bg_processor = BGProcessor(voxel_size=0.1, grid_size=0.1)
+
+        # scene graph variables
+        self.sg_graph = nx.DiGraph()
+        self.sg_graph.add_node(scene, type="building", name=scene, position=[0, 0, 0])
+
+        self.current_room_id = 0
+        self.current_room_label = None
+        self.room_nodes = set()
+        self.room_label_seq = []
+        # self.add_room_node(self.current_room_id)
+
+        self.keyframe_counter = 0
+        self.place_positions = {}
+        self.place_room_map = {}
+        self.last_keyframe_id = 0
+        self.last_keyframe_pose = None
+
+        # queues
+        # self.image_queue = deque(maxlen=1000000)
+        # self.cloud_queue = deque(maxlen=1000000)
+        # self.odom_queue = deque(maxlen=2000000)
+        # self.last_image_stamp = None
+        # self.last_cloud_stamp = None
+        # self.last_odom_t0 = None
+        # self.image_queue = deque(maxlen=100000)
+        # self.pose_queue = deque(maxlen=200000)
+        # self.cloud_queue = deque(maxlen=100000)
+        # self.last_stamp = None
+
+        ctx = mp.get_context('spawn')
+        self.rgb_queue  = ctx.Queue()   # 콜백 → YOLO 프로세스
+        self.yolo_queue = ctx.Queue()   # YOLO 프로세스 → 메인 스레드
+
+        self.sync_queue = {}
+        self.lock       = threading.Lock()
+
+        self.yolo_proc = ctx.Process(
+            target=SceneGraphProcessor._yolo_process,
+            args=(self.yolo_model, self.rgb_queue, self.yolo_queue),
+            daemon=True
+        )
+        self.yolo_proc.start()
+
+        self.publish_thread = threading.Thread(target=self.publish_loop, daemon=True)
+        self.main_thread    = threading.Thread(target=self.run, daemon=True)
+
+        self.frame_id = "map"
+
+        self.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="rgb", offset=12, datatype=PointField.UINT32, count=1),
+        ]
+
+        # ROS I/O
+        self.rgb_sub = Subscriber("/theta_driver_node/image_raw", Image)
+        self.cloud_sub = Subscriber("/cloud_registered_body", PointCloud2)
+        self.odom_sub = Subscriber("/Odometry", Odometry)
+        self.sync_sub = ApproximateTimeSynchronizer([self.rgb_sub, self.cloud_sub, self.odom_sub], queue_size=10, slop=0.02) # image(4Hz, 0.25s)
+        self.sync_sub.registerCallback(self.sync_callback)
+
+        self.hash_map_pub = rospy.Publisher(
+            "/hash_map", PointCloud2, queue_size=1
+        )
+        self.graph_markers_pub = rospy.Publisher(
+            "/scene_graph_markers", MarkerArray, queue_size=1
+        )
+        self.object_markers_pub = rospy.Publisher(
+            "/object_marker", MarkerArray, queue_size=1
+        )
+        self.object_markers = None
+        self.graph_markers = None
+        self.save_srv = rospy.Service('/save_data', Empty, self.handle_save_data)
+        print("SceneGraphProcessor initialized")
+        # self.add_classes_srv = rospy.Service('/scene_graph/add_classes', SetClasses, self.handle_add_classes) # DSHONG
+
+        for t in (self.publish_thread, self.main_thread):
+            t.start()
+        rospy.on_shutdown(self.shutdown)
+
+    # def handle_add_classes(self, req): # DSHONG
+    #     try:
+    #         template = req.template_str if req.template_str else "{}"
+    #         classnames_old = self.classnames
+    #         classnames_new = [template.format(name.replace("_", " ")) for name in req.classnames]
+    #         self.classnames = list(set(classnames_old + classnames_new))
+    #         self.yolo_model.set_classes(self.classnames)
+
+    #         self.obj_classes = self.classnames
+    #         self.color_map = {
+    #             idx: tuple(random.randint(0, 255) for _ in range(3))
+    #             for idx in range(len(self.classnames))
+    #         }
+    #         return SetClassesResponse(success=True, message="YOLO classes updated.")
+    #     except Exception as e:
+    #         return SetClassesResponse(success=False, message=str(e))
+
+    def odom_msg_to_pose(self, odom_msg):
+        position = odom_msg.pose.pose.position
+        orientation = odom_msg.pose.pose.orientation
+        linear_velocity = odom_msg.twist.twist.linear
+        quat = [orientation.x, orientation.y, orientation.z, orientation.w]
+        rotation = tf.transformations.quaternion_matrix(quat)[:3, :3]
+        odom_data = {
+            "position": np.array([position.x, position.y, position.z]),
+            "orientation": np.array(quat),
+            "rotation": rotation,
+            "linear_velocity": np.array(
+            [linear_velocity.x, linear_velocity.y, linear_velocity.z]
+            ),
+        }
+        return odom_data
+
+    def sync_callback(self, img_msg, cloud_msg, odom_msg):
+        stamp = img_msg.header.stamp.to_nsec()
+        rgb = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
+        self.rgb_queue.put((stamp, rgb))
+
+        # cloud = convert_pointcloud2_to_xyz(cloud_msg)
+
+        pose = self.odom_msg_to_pose(odom_msg)
+
+        with self.lock:
+            self.sync_queue[stamp] = (rgb, cloud_msg, pose)
+
+    @staticmethod
+    def _yolo_process(yolo_model, rgb_queue, yolo_queue):
+        """별도 프로세스에서 YOLO 추론만 담당"""
+        while True:
+            stamp, rgb = rgb_queue.get()       # blocking
+            torch.cuda.synchronize()
+            t0 = time.time()
+
+            # inference
+            results = yolo_model.track(
+                rgb, conf=0.5, persist=True, verbose=False
+            )[0]
+
+            cv2.imshow("YOLO11 Tracking", results.plot())
+            cv2.waitKey(1)
+
+            torch.cuda.synchronize()
+            infer_time = time.time() - t0
+
+            # CUDA 텐서를 CPU로 옮겨야 피클 가능
+            results = results.cpu()
+            # print(f"yolo: {infer_time:.3f}")
+
+            # 4) 원본 boxes, masks, 소요시간을 메인 프로세스로 전달
+            yolo_queue.put((stamp, results.boxes))
+
+    def gen_hash_key_3d(self, points, voxel_size=0.1):
+        points_xyz = points[:, :3] / voxel_size
+        points_xyz = np.round(points_xyz).astype(np.int32)
+        vec = points_xyz.view(np.uint32)
+        hash_key = (
+            (vec[:, 0] * 73856093) ^ (vec[:, 1] * 19349669) ^ (vec[:, 2] * 83492791)
+        )
+        return hash_key
+
+    def override_points(self, points, new_id, yolo_conf, size_conf, voxel_size=0.05): #, new_conf, voxel_size=0.05):
+        keys = self.gen_hash_key_3d(points[:, :3], voxel_size=voxel_size)
+        affected_ids = set()
+        affected_pts = defaultdict(list)
+
+        # 1. 모든 key에 대해 map_hash 덮어쓰기 & 기존 id 기록
+        for i, key in enumerate(keys):
+            x, y, z = points[i][:3]
+            new_point = np.array([x, y, z, new_id, yolo_conf, size_conf], dtype=np.float32)
+
+            if key in self.map_hash:
+                old_point = self.map_hash[key][0]
+                old_id = int(old_point[3])
+                old_conf = old_point[4]
+                old_size_conf = old_point[5]
+                if old_id != new_id and (old_conf< yolo_conf or old_size_conf < size_conf):
+                    affected_ids.add(old_id) 
+                    affected_pts[old_id].append(f"{old_point[0]}_{old_point[1]}_{old_point[2]}")
+                    continue
+            self.map_hash[key] = [new_point]
+
+        # 2. affected id의 points 재계산
+        for affected_id in affected_ids:
+            updated_pts = []
+            old_pt_keys = affected_pts[affected_id]
+            for val in self.map_hash.values():
+                pt = val[0]
+                if int(pt[3]) != affected_id : 
+                    continue
+                if f"{pt[0]}_{pt[1]}_{pt[2]}" in old_pt_keys:
+                    if pt[5] > size_conf:
+                        updated_pts.append(pt[:3])
+                else:
+                    updated_pts.append(pt[:3])
+            if len(updated_pts) <= 0:
+                if affected_id in self.objects:
+                    del self.objects[affected_id]
+            elif affected_id in self.objects:
+                pts = np.array(updated_pts)
+                self.objects[affected_id]["points"] = pts
+                self.objects[affected_id]["n_points"] = pts.shape[0]
+                self.objects[affected_id]["size_conf"] = min(size_conf, self.objects[affected_id]["size_conf"])
+                self.objects[affected_id]["center"] = np.mean(pts, axis=0)
+                self.objects[affected_id]["min_bbox"] = np.min(pts, axis=0)
+                self.objects[affected_id]["max_bbox"] = np.max(pts, axis=0)
+                self.objects[affected_id]["bbox"] = np.stack(
+                    [self.objects[affected_id]["min_bbox"], self.objects[affected_id]["max_bbox"]], axis=0
+                )
+
+        # 3. new_id 포인트 재계산
+        updated_pts = []
+        for val in self.map_hash.values():
+            pt = val[0]
+            if int(pt[3]) == new_id:
+                updated_pts.append(pt[:3])
+
+        if len(updated_pts) > 0:
+            pts = np.array(updated_pts)
+            self.objects[new_id]["points"] = pts
+            self.objects[new_id]["n_points"] = pts.shape[0]
+            self.objects[new_id]["size_conf"] = min(size_conf, self.objects[new_id]["size_conf"])
+            self.objects[new_id]["center"] = np.mean(pts, axis=0)
+            self.objects[new_id]["min_bbox"] = np.min(pts, axis=0)
+            self.objects[new_id]["max_bbox"] = np.max(pts, axis=0)
+            self.objects[new_id]["bbox"] = np.stack(
+                [self.objects[new_id]["min_bbox"], self.objects[new_id]["max_bbox"]], axis=0
+            )
+        else:
+            del self.objects[new_id]
+            if f"object_{new_id}" in self.sg_graph:
+                self.objects.pop(f"object_{new_id}", None)
+                self.sg_graph.remove_node(f"object_{new_id}")
+
+    def pose_changed_enough(self, cur_pose, prev_pose, keyframe_dist=0.5, keyframe_deg=400.0):
+        if self.last_keyframe_pose is None:
+            return True
+        dist = get_distance_between_poses(cur_pose, prev_pose)
+        # angle = get_angle_between_poses(cur_pose, prev_pose)
+        return dist > keyframe_dist #or angle > keyframe_deg
+    
+    def classify_room(self, image):
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_img = PILImage.fromarray(img_rgb)
+        clip_input = self.clip_preprocess(pil_img).unsqueeze(0).to("cuda")  # (1, 3, H, W)
+
+        with torch.no_grad():
+            image_features = self.clip_model.encode_image(clip_input)         # (1, 512)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        img_feat = image_features.cpu().squeeze(0)  # (512,)
+
+        scores = {}
+        for idx, room_label in enumerate(self.room_labels):
+            text_feat = self.room_text_embeddings[idx]  # (512,)
+            sim = torch.cosine_similarity(img_feat.unsqueeze(0), text_feat.unsqueeze(0)).item()
+            scores[room_label] = sim
+
+        best_label = max(scores, key=scores.get)
+        # if max(scores.values()) < 0.13:
+            # best_label = "unknown"
+        return {
+            "image_embedding": img_feat,
+            "scores": scores,
+            "best_label": best_label
+        }
+    
+    def add_room_node(self, room_id, room_label, center_pos=[0, 0, 0]):
+        node_id = f"room_{room_id}"
+        if node_id not in self.sg_graph:
+            self.sg_graph.add_node(node_id, type="room", label=room_label, position=center_pos)
+            self.sg_graph.add_edge(scene, node_id, type="building_edge")
+            self.room_nodes.add(room_id)
+    
+    def update_room_center(self, room_id):
+        node_id = f"room_{room_id}"
+        places_in_room = [place_id for place_id, rm_id in self.place_room_map.items() if rm_id == room_id]
+        if not places_in_room:
+            return
+        positions = np.array([self.place_positions[place_id] for place_id in places_in_room])
+        center = np.mean(positions, axis=0)
+        if node_id in self.sg_graph.nodes:
+            self.sg_graph.nodes[node_id]["position"] = center
+
+    def get_connected_objects(self, place_id):
+        place_node = f"place_{place_id}"
+        connected_objects = set()
+        
+        if place_node in self.sg_graph:
+            for neighbor in self.sg_graph.neighbors(place_node):
+                if neighbor.startswith("object_"):
+                    connected_objects.add(neighbor)
+        
+        return connected_objects
+    
+    def get_room_connected_objects(self, room_id):
+        room_objects = set()
+        
+        for place_id, mapped_room_id in self.place_room_map.items():
+            if mapped_room_id == room_id:
+                place_objects = self.get_connected_objects(place_id)
+                room_objects.update(place_objects) 
+        
+        return room_objects
+    
+    def check_object_overlap(self, place_id1, place_id2, min_overlap=1):
+
+        room_id1 = self.place_room_map.get(place_id1, None)
+        if room_id1 is not None:
+            objects1 = self.get_room_connected_objects(room_id1)
+            print(f"[OVERLAP] Place {place_id1} has room {room_id1} -> using room objects ({len(objects1)} unique objects)")
+        else:
+            objects1 = self.get_connected_objects(place_id1)
+            print(f"[OVERLAP] Place {place_id1} has no room -> using place objects ({len(objects1)} objects)")
+        
+        room_id2 = self.place_room_map.get(place_id2, None)
+        if room_id2 is not None:
+            objects2 = self.get_room_connected_objects(room_id2)
+            print(f"[OVERLAP] Place {place_id2} has room {room_id2} -> using room objects ({len(objects2)} unique objects)")
+        else:
+            objects2 = self.get_connected_objects(place_id2)
+            print(f"[OVERLAP] Place {place_id2} has no room -> using place objects ({len(objects2)} objects)")
+        
+        # if len(objects1) <= min_overlap or len(objects2) <= min_overlap:
+            # print(f"[OVERLAP] Auto-allow: one side has ≤1 objects ({len(objects1)}, {len(objects2)})")
+            # print(f"[OVERLAP] Overlap count: infinity (threshold: {min_overlap})")
+            # return True, float('inf')
+        
+        overlapped_objects = objects1.intersection(objects2)
+        overlap_count = len(overlapped_objects)
+        
+        # print(f"[OVERLAP] Overlapped objects: {sorted(list(overlapped_objects))}")
+        print(f"[OVERLAP] Overlap count: {overlap_count} (threshold: {min_overlap})")
+        return overlap_count >= min_overlap, overlap_count
+    
+    def find_closest_same_room_place(self, place_center, current_room_label, threshold=1.0):
+        cx, cy = place_center[0], place_center[1]
+        min_dist2 = float('inf')
+        closest_place_id = None
+
+        if not self.place_positions:
+            return None
+        last_place_id = max(self.place_positions.keys()) - 1
+
+        for place_id, pos in self.place_positions.items():
+            node_name = f"place_{place_id}"
+            if node_name not in self.sg_graph.nodes:
+                continue
+            if place_id >= last_place_id:
+                continue
+
+            node = self.sg_graph.nodes[node_name]
+
+            if node.get("room_label") != current_room_label:
+                continue
+
+            x, y = pos[0], pos[1]
+            dist2 = (cx - x)**2 + (cy - y)**2
+            if dist2 == 0.0:
+                continue
+            if dist2 < min_dist2 and dist2 <= threshold**2:
+                min_dist2 = dist2
+                closest_place_id = place_id
+            
+        print(f"closest dist {min_dist2:.3f} with label {current_room_label} -> {closest_place_id is not None}")
+
+        return closest_place_id
+    
+    def add_keyframe_and_place_node(self, position, room_label, place_center, image=None, pose=None, detections=None):
+        self.keyframe_counter += 1
+        keyframe_id = self.keyframe_counter
+        cur_keyframe_node = f"keyframe_{keyframe_id}"
+        cur_place_node = f"place_{keyframe_id}"
+        self.sg_graph.add_edge(cur_place_node, cur_keyframe_node, type="keyframe_edge")
+
+
+        self.sg_graph.add_node(cur_keyframe_node, 
+                               type="keyframe", 
+                               position=position)
+        if image is not None:
+            cv2.imwrite(self.image_path.format(cur_place_node), image)
+        self.sg_graph.add_node(cur_place_node,
+                               type="place",
+                               position=place_center,
+                               room_label=room_label["best_label"],
+                               room_scores=room_label["scores"],
+                               image_path=self.image_path.format(cur_place_node),
+                               pose=pose, detections=detections, # DSHONG
+                               correct=True)
+        self.place_positions[keyframe_id] = place_center
+
+        if self.last_keyframe_id is not None:
+            prev_place_node = f"place_{self.last_keyframe_id}"
+            self.sg_graph.add_edge(prev_place_node, cur_place_node, type="traversable_edge")
+        return keyframe_id
+
+
+        
+    def connect_room_and_place(self, keyframe_id, cur_room_id, room_label, place_center):
+        cur_place_node = f"place_{keyframe_id}"
+        cur_room_node = f"room_{cur_room_id}"
+        prev_place_node = f"place_{self.last_keyframe_id}"
+        cur_room_node = f"room_{cur_room_id}"
+        new_room_id = cur_room_id
+        new_room_label = room_label["best_label"]
+
+        if new_room_label == self.current_room_label:
+            print(f"[KF {keyframe_id}] CUR: {self.current_room_label} / SAME ROOM LABEL: {new_room_label}")
+            if self.sg_graph.nodes[cur_room_node]["label"] != new_room_label:
+                # create new room node
+                max_room_id = max(self.room_nodes) if self.room_nodes else 0
+                new_room_id = max_room_id + 1
+                self.add_room_node(new_room_id, new_room_label)    
+                self.place_room_map[keyframe_id] = new_room_id
+                self.place_room_map[self.last_keyframe_id] = new_room_id
+                self.sg_graph.nodes[prev_place_node]["correct"] = True
+                new_room_node = f"room_{new_room_id}"
+                self.sg_graph.add_edge(new_room_node, prev_place_node, type="room_edge", correct=True)
+                self.sg_graph.add_edge(new_room_node, cur_place_node, type="room_edge", correct=True)
+                self.current_room_id = new_room_id
+                print(f"[KF {keyframe_id}] CREATED new room {new_room_id} with label {new_room_label} for current and previous place)")
+
+            else:
+                self.sg_graph.add_edge(cur_room_node, cur_place_node, type="room_edge", correct=True)
+                self.place_room_map[keyframe_id] = cur_room_id
+                print(f"[KF {keyframe_id}] CONNECTED current place to current room {cur_room_id} with label {new_room_label}")
+
+            
+        else:
+            print(f"[KF {keyframe_id}] CUR: {self.current_room_label} / DIFF ROOM LABEL: {new_room_label}")
+            self.current_room_label = new_room_label
+            self.sg_graph.nodes[cur_place_node]["correct"] = False
+
+
+        closest_place_id = self.find_closest_same_room_place(place_center, new_room_label, 2.0)
+        if closest_place_id is not None:
+            # has_overlap, overlap_count = self.check_object_overlap(keyframe_id, closest_place_id)
+            
+            # if not has_overlap:
+            #     print(f"[KF {keyframe_id}] SKIPPED connection ({overlap_count} < 1)")
+            #     print("\n")
+            #     self.update_room_center(self.current_room_id)
+            #     return
+            
+            # print(f"[KF {keyframe_id}] Object overlap check passed ({overlap_count} >= 1)")
+        
+            # current place node has room edge and closest place node has room edge but not connected -> merged
+            if self.place_room_map.get(keyframe_id, None) is not None \
+                and self.place_room_map.get(closest_place_id, None) is not None \
+                and self.place_room_map[closest_place_id] != new_room_id:
+                # merge to room node of closest place node
+                closest_room_id = self.place_room_map[closest_place_id]
+                closest_room_node = f"room_{closest_room_id}"
+                new_room_node = f"room_{new_room_id}"
+                if new_room_node in self.sg_graph:
+                    self.sg_graph.remove_node(new_room_node)
+                    self.room_nodes.discard(new_room_id)
+                    print(f"REMOVE CUR ROOM NODE {new_room_node} with label {new_room_label}")
+
+                for pid, rid in self.place_room_map.items():
+                    if rid == new_room_id:
+                        self.place_room_map[pid] = closest_room_id
+                        self.sg_graph.add_edge(closest_room_node, f"place_{pid}", type="room_edge", correct=True)
+
+                self.current_room_id = closest_room_id
+                print(f"[KF {keyframe_id}] MERGED to closest place {closest_place_id} in room {closest_room_id} with label {new_room_label}")
+
+            elif self.place_room_map.get(keyframe_id, None) is not None \
+                and self.place_room_map.get(closest_place_id, None) is None:
+                # connect closest place node to current room node
+                closest_place_node = f"place_{closest_place_id}"
+                self.sg_graph.add_edge(closest_place_node, cur_place_node, type="near_edge")
+                
+                self.place_room_map[closest_place_id] = new_room_id
+                self.sg_graph.nodes[closest_place_node]["correct"] = True
+                self.sg_graph.add_edge(cur_room_node, closest_place_node, type="near1_edge", correct=True)
+
+                print(f"[KF {keyframe_id}] CONNECTED closest place {closest_place_id} to current place {keyframe_id} in room {new_room_id} with label {new_room_label}")
+
+            elif self.place_room_map.get(keyframe_id, None) is None \
+                and self.place_room_map.get(closest_place_id, None) is not None:
+                # connect current place node to closest place node
+                closest_place_node = f"place_{closest_place_id}"
+                self.sg_graph.add_edge(cur_place_node, closest_place_node, type="near_edge")
+
+                closest_room_id = self.place_room_map[closest_place_id]
+                self.place_room_map[keyframe_id] = closest_room_id
+                self.sg_graph.nodes[cur_place_node]["correct"] = True
+                closest_room_node = f"room_{closest_room_id}"
+                self.sg_graph.add_edge(closest_room_node, cur_place_node, type="near1_edge", correct=True)
+
+                self.current_room_id = closest_room_id
+
+                print(f"[KF {keyframe_id}] CONNECTED current place {keyframe_id} to closest place {closest_place_id} in room {closest_room_id} with label {new_room_label}")
+
+            elif self.place_room_map.get(keyframe_id, None) is None \
+                and self.place_room_map.get(closest_place_id, None) is None:
+                closest_place_node = f"place_{closest_place_id}"
+                self.sg_graph.add_edge(closest_place_node, cur_place_node, type="near_edge")
+
+                # create new room node
+                max_room_id = max(self.room_nodes) if self.room_nodes else 0
+                new_room_id = max_room_id + 1
+                self.add_room_node(new_room_id, new_room_label)    
+                self.place_room_map[keyframe_id] = new_room_id
+                self.place_room_map[closest_place_id] = new_room_id
+                self.sg_graph.nodes[cur_place_node]["correct"] = True
+                self.sg_graph.nodes[closest_place_node]["correct"] = True
+                new_room_node = f"room_{new_room_id}"
+                self.sg_graph.add_edge(new_room_node, cur_place_node, type="near1_edge", correct=True)
+                self.sg_graph.add_edge(new_room_node, closest_place_node, type="near1_edge", correct=True)
+
+                self.current_room_id = new_room_id
+
+                print(f"[KF {keyframe_id}] CREATED new room {new_room_id} with label {new_room_label} for current place {keyframe_id} and closest place {closest_place_id}")
+
+               
+        print("\n")
+        
+        self.update_room_center(self.current_room_id)
+    
+    def add_object_nodes_for_place_node(self, keyframe_id, detections, missing_detections):
+        place_node = f"place_{keyframe_id}"
+        for i, det in enumerate(missing_detections):
+            det_id = det["id"]
+            object_node = f"object_{det_id}"
+            missing_object_node = f"missing_object_{det_id}"
+            bbox = det.get("bbox", [0, 0, 0, 0])
+            yolo_conf = det.get("yolo_conf", 0.0)
+            # print(missing_object_node)
+            if object_node not in self.sg_graph:
+                self.missing_objects[det_id] = {
+                    "id": det_id,
+                    "class_id": det["class_id"],
+                    "class_name": det["class_name"],
+                    "yolo_conf": yolo_conf,
+                    "bbox": bbox,
+                }
+                self.sg_graph.add_node(
+                    missing_object_node,
+                    type="missing_object",
+                    instance_id=det_id,
+                    class_name=det["class_name"],
+                    # bbox=bbox,
+                )
+                self.sg_graph.add_edge(place_node, missing_object_node, type="missing_object_edge")
+                continue
+            if self.sg_graph.nodes[object_node]["type"] != "missing_object" and (place_node,object_node) not in self.sg_graph.edges:
+                # print(f"{object_node} 3D exists but missing at {place_node}")
+                self.missing_objects[det_id] = {
+                    "id": det_id,
+                    "class_id": det["class_id"],
+                    "class_name": det["class_name"],
+                    "yolo_conf": yolo_conf,
+                    "bbox": bbox,
+                }
+                self.sg_graph.add_node(
+                    missing_object_node,
+                    type="missing_object",
+                    instance_id=det_id,
+                    class_name=det["class_name"],
+                    # bbox=bbox,
+                )
+                self.sg_graph.add_edge(place_node, missing_object_node, type="missing_object_edge")
+                continue
+
+        place_position = self.place_positions.get(keyframe_id, [0, 0, 0])
+        
+        for i, det in enumerate(detections):
+            det_id = det["id"]
+            object_node = f"object_{det_id}"
+            object_position = det.get("center", [0, 0, 0])
+            dist = np.linalg.norm(place_position - object_position)
+            
+            if object_node not in self.sg_graph:
+                self.sg_graph.add_node(
+                    object_node,
+                    type="object",
+                    instance_id=det_id,
+                    class_name=det["class_name"],
+                    position=object_position,
+                    has_close_place = False,
+                    closest_temp_dist=float("inf"),
+                    closest_temp_place=None,
+                )
+                if dist < 3.0:
+                    edge_type = "close_edge"
+                    self.sg_graph.nodes[object_node]["has_close_place"] = True
+                    # print(f"add close edge for new object {det_id} at {keyframe_node}")
+                else:
+                    edge_type = "temporary_edge"
+                    # print(f"add temp edge for new object {det_id} at {keyframe_node}")
+                self.sg_graph.nodes[object_node]["closest_temp_dist"] = dist
+                self.sg_graph.nodes[object_node]["closest_temp_place"] = place_node
+                self.sg_graph.add_edge(place_node, object_node,
+                                    type=edge_type, distance=dist)
+                continue
+            
+            node_data = self.sg_graph.nodes[object_node]
+            has_close_place = node_data["has_close_place"]
+            if has_close_place and dist < 3.0:
+                self.sg_graph.add_edge(place_node, object_node,
+                                       type="close_edge", distance=dist)
+                # print(f"add close edge for existing object {det_id} (temp X) at {keyframe_node}")
+                continue
+            
+            if dist < 3.0:
+                old_kf = node_data["closest_temp_place"]
+                if old_kf is not None and self.sg_graph.has_edge(old_kf, object_node):
+                    self.sg_graph.remove_edge(old_kf, object_node)
+                self.sg_graph.add_edge(place_node, object_node,
+                                       type="close_edge", distance=dist)
+                node_data["has_close_place"] = True
+                node_data["closest_temp_dist"] = dist
+                node_data["closest_temp_place"] = place_node
+                # print(f"add close edge for existing object {det_id} (temp O) at {keyframe_node}")
+            else:
+                if dist < node_data["closest_temp_dist"]:
+                    old_kf = node_data["closest_temp_place"]
+                    if old_kf is not None and self.sg_graph.has_edge(old_kf, object_node):
+                        self.sg_graph.remove_edge(old_kf, object_node)
+                    self.sg_graph.add_edge(place_node, object_node,
+                                        type="temporary_edge", distance=dist)
+                    node_data["closest_temp_dist"] = dist   
+                    node_data["closest_temp_place"] = place_node
+                    # print(f"add temp edge for existing object {det_id} (temp O) at {keyframe_node}")
+                
+    def get_latest_blocking(self, q):
+        item = q.get()  # blocking
+        while True:
+            try:
+                item = q.get_nowait()
+            except pyqueue.Empty:   # ← 모듈명까지 붙여서 예외 지정
+                break
+        return item
+    
+    def run(self):
+        iter = 0
+        while self.running and not rospy.is_shutdown():
+            # print(f"===== Iteration {iter} =====")
+            
+            iter += 1
+            stamp, boxes = self.get_latest_blocking(self.yolo_queue)
+            with self.lock:
+                synced_data = self.sync_queue.pop(stamp, None)
+            if synced_data is None:
+                rospy.sleep(0.01)
+                continue
+            
+            t1 = time.time()
+            image, cloud_msg, pose = synced_data
+            for k in list(self.sync_queue.keys()):
+                if k < stamp:
+                    del self.sync_queue[k]
+
+            cloud_body = convert_pointcloud2_to_xyz(cloud_msg)   
+            cloud_body = cloud_body[np.linalg.norm(cloud_body, axis=1) < 5.0]
+            # cloud_body = voxel_downsample(cloud_body, 0.02)
+
+            # cloud = cloud[cloud[:, 2] > 0.05]
+            R_b2w = pose["rotation"]
+            t_b2w = pose["position"]
+            cloud = cloud_body @ R_b2w.T + t_b2w
+            
+
+            #4x4 pose
+            cur_pose = np.eye(4)
+            cur_pose[:3, :3] = pose["rotation"]
+            cur_pose[:3, 3] = pose["position"]
+
+            # Check if the pose has changed enough to add a keyframe
+            if self.pose_changed_enough(cur_pose, self.last_keyframe_pose):
+            #or self.new_detection_signal:
+                self.new_detection_signal = False
+
+                room_label = self.classify_room(image)
+                cloud_center = np.mean(cloud[:, :3], axis=0)
+
+                if self.current_room_id == 0:
+                    self.current_room_label = room_label["best_label"]
+                    self.current_room_id += 1
+                    self.add_room_node(self.current_room_id, self.current_room_label)
+                    print(f"first room {self.current_room_id} with label {room_label['best_label']}")
+
+                keyframe_id = self.add_keyframe_and_place_node(
+                    cur_pose[:3, 3], room_label, cloud_center,
+                    image=image, pose=cur_pose, detections=self.detections)
+                self.add_object_nodes_for_place_node(keyframe_id, self.detections, self.missing_detections)
+                self.connect_room_and_place(keyframe_id, self.current_room_id, room_label, cloud_center)
+                self.last_keyframe_id = keyframe_id
+                self.last_keyframe_pose = cur_pose
+                self.detections = []
+                self.missing_detections = []
+                # sim_str = ", ".join(f"{name}: {score:.3f}" for name, score in room_label["scores"].items())
+                # print(f"[KF {self.keyframe_counter}] {sim_str} -> {room_label['best_label']}")
+            t21 = time.time()
+            self.graph_markers = self.create_graph_markers()
+            
+            t2 = time.time()
+            # obtain YOLO and SAM results
+            if (
+                boxes is None
+                or boxes.id is None
+                or boxes.xyxy is None
+                or len(boxes.xyxy) == 0
+            ):
+                # print("No detections")
+                continue
+
+            tracking_ids = boxes.id.int().tolist()
+            confs = boxes.conf.cpu().tolist()
+            class_ids = boxes.cls.int().tolist()
+            bounding_boxes = boxes.xyxy.cpu().numpy()
+            labels = np.array(class_ids)
+
+            sam_results = self.sam_model.predict(
+                image.copy(), bboxes=bounding_boxes, verbose=False,
+            )
+            masks = sam_results[0].masks.data
+            masks_np = []
+            for i, box in enumerate(boxes.xyxy):
+                kernel_width = int((box[2]-box[0])/5)
+                if kernel_width > 10:
+                    kernel = np.ones((1, kernel_width), np.uint8)
+                    eroded_mask = cv2.erode(masks[i].cpu().numpy().astype(np.uint8), kernel, iterations=1)
+                    masks_np.append(eroded_mask)
+                else:
+                    masks_np.append(masks[i].cpu().numpy())
+
+            sam_boxes = []
+
+            def mask_to_bbox(mask: torch.Tensor):
+                if isinstance(mask, np.ndarray):
+                    mask = torch.tensor(mask)
+                coords = torch.nonzero(mask, as_tuple=True) # (y_indices, x_indices)
+                if coords[0].numel() == 0 or coords[1].numel() == 0: # Check if there are any non-zero elements
+                    return None
+                y_indices, x_indices = coords
+
+                x1, y1 = x_indices.min().item(), y_indices.min().item()
+                x2, y2 = x_indices.max().item(), y_indices.max().item()
+                return [x1, y1, x2, y2]
+
+            for mask in masks:
+                box = mask_to_bbox(mask)
+                if box:
+                    sam_boxes.append(box)
+
+            t3 = time.time()
+            projected_image = image.copy()
+            obj_clouds_world, colors_list, semantic_labels = generate_seg_comp_cloud_jackal(
+                cloud_body,
+                masks_np,
+                labels,  # same order with masks_np
+                pose["rotation"],
+                pose["position"],
+                image_src=image.copy(),
+                platform="jackal",
+            )
+
+            # self.xyzrgbl_pub.publish(pointcloud2_msg)
+            # self.publish_pointcloud(obj_clouds_world, colors_list, semantic_labels, image_stamp)
+
+            t4 = time.time()
+
+            # MERGE
+            all_num = len(obj_clouds_world)
+            filtered1_num = 0
+            filtered2_num = 0
+            filtered3_num = 0
+            filtered4_num = 0
+            tracked_num = 0
+            diff_cls_num = 0
+            merged_num = 0
+            new_num = 0
+            # detections = []
+
+
+            for i, obj_cloud in enumerate(obj_clouds_world):
+                tracking_id = tracking_ids[i]
+                class_id = class_ids[i]
+                yolo_conf = confs[i]
+                bounding_box = bounding_boxes[i] # DSHONG
+
+                if obj_cloud.shape[0] < 5:
+                    filtered1_num += 1
+                    self.missing_detections.append({
+                        "id": tracking_id,
+                        "class_id": class_id,
+                        "class_name": self.obj_classes[class_id],
+                        "yolo_conf": yolo_conf,
+                        "bbox": bounding_box,
+                    })
+                    continue
+
+                obj_cloud = cluster_dbscan(obj_cloud, eps=0.1)
+                if obj_cloud.shape[0] < 10:
+                    filtered2_num += 1
+                    self.missing_detections.append({
+                        "id": tracking_id,
+                        "class_id": class_id,
+                        "class_name": self.obj_classes[class_id],
+                        "yolo_conf": yolo_conf,
+                        "bbox": bounding_box,
+                    })
+                    continue
+
+                # test2 = time.time()
+                # mask_np = masks_np[i]  # (H, W)
+                # masked_image = image.copy()
+                # masked_image[mask_np == 0] = 0  # 배경 제거
+                # pil_masked_image = PILImage.fromarray(masked_image)
+                # test21 = time.time()
+                # processed = (
+                # self.clip_preprocess(pil_masked_image).unsqueeze(0).to("cuda")
+                # )
+                # test22 = time.time()
+                # with torch.no_grad():
+                #     feature = self.clip_model.encode_image(processed)
+                #     feature = feature.cpu().numpy()  # shape: (1, 768)
+                # test3 = time.time()
+                # print(f"{i} mask time: {test21 - test2:.3f}, {test22 - test21:.3f}, {test3 - test22:.3f} -> {test3 - test2:.3f} sec")
+
+                min_pt = np.min(obj_cloud, axis=0)
+                max_pt = np.max(obj_cloud, axis=0)
+                center = np.mean(obj_cloud, axis=0)
+                size = np.prod(max_pt - min_pt)
+                size_conf = 1/(size+1e-6)
+
+                if np.any(max_pt - min_pt < 0.01):
+                    filtered3_num += 1
+                    self.missing_detections.append({
+                        "id": tracking_id,
+                        "class_id": class_id,
+                        "class_name": self.obj_classes[class_id],
+                        "yolo_conf": yolo_conf,
+                        "bbox": bounding_box,
+                    })
+                    continue
+
+                if tracking_id in self.id_remap:
+                    final_id = self.id_remap[tracking_id]
+                    # print(f"ID remap: {tracking_id} -> {final_id}")
+                elif tracking_id in self.objects:
+                    final_id = tracking_id
+                else:
+                    final_id = None
+
+                # 1. MERGE 2D (merge when YOLO tracking ID is already in objects)
+                if final_id is not None and final_id in self.objects:
+                    det = self.objects[final_id]
+                    if np.linalg.norm(center - det["center"]) > 1.0:
+                        filtered4_num += 1
+                        self.missing_detections.append({
+                            "id": tracking_id,
+                            "class_id": class_id,
+                            "class_name": self.obj_classes[class_id],
+                            "yolo_conf": yolo_conf,
+                            "bbox": bounding_box,
+                        })
+                        continue
+
+                    det["yolo_conf"] = max(det["yolo_conf"], yolo_conf)
+                    det["size_conf"] = min(det["size_conf"], size_conf)
+                    det["num_detections"] += 1
+                    # det["clip_feature"] = (tracked_num * det["clip_feature"] + feature) / (tracked_num + 1)
+                    self.override_points(obj_cloud, final_id, det["yolo_conf"], det["size_conf"])
+                    tracked_num += 1
+
+                    det["class_ids"][class_id] = det["class_ids"].get(class_id, 0) + 1
+                    max_class_id = max(det["class_ids"], key=det["class_ids"].get)
+                    self.detections.append({
+                        "id": final_id,
+                        "class_ids": det["class_ids"],
+                        "class_name": self.obj_classes[max_class_id], #det["class_name"],
+                        "center": center,
+                        "bboxes": bounding_box, # DSHONG
+                    })
+                    continue
+
+                merged_to_id = None
+                reason = None
+
+                # 2. MERGE 3D (merge considering 3D bounding box overlap and distance)
+                for existing_id, det in self.objects.items():
+                    existing_class_ids_list = det["class_ids"]
+                    existing_min = det["min_bbox"]
+                    existing_max = det["max_bbox"]
+                    existing_center = det["center"]
+
+                    if class_id in existing_class_ids_list:
+                        det["class_ids"][class_id] += 1
+                        center_dist = np.linalg.norm(center - existing_center)
+                        # included = is_included(min_pt, max_pt, existing_min, existing_max)
+
+                        if center_dist < 1.5:
+                            # print(f"ID {tracking_id} close to existing ID {existing_id} (dist={center_dist:.3f})")
+                            # iou = compute_iou_3d(min_pt, max_pt, det["min_bbox"], det["max_bbox"])
+                            overlap = compute_overlap_ratio(
+                                min_pt, max_pt, existing_min, existing_max
+                            )
+                            if overlap > 0.8:
+                                merged_to_id = existing_id
+                                reason = "iou_O"
+                            elif center_dist < 0.2:
+                                merged_to_id = existing_id
+                                reason = "dist_O"
+                            # elif class_id != existing_class_id and (iou > 0.6 or center_dist < 0.2 or overlap > 0.8):
+                                # reason = "diff_O"
+                                # merged_to_id = existing_id
+                            else:
+                                reason = "X"
+
+                if merged_to_id is not None:
+                    # if reason == "diff_O":
+                        # diff_cls_num += 1
+                        # continue
+                    self.id_remap[tracking_id] = merged_to_id
+                    det = self.objects[merged_to_id]
+                    # if conf > det["conf"]:
+                        # det["class_id"] = class_id
+                        # det["class_name"] = self.obj_classes[class_id]
+                    det["yolo_conf"] = max(det["yolo_conf"], yolo_conf)
+                    det["size_conf"] = min(det["size_conf"], size_conf)
+
+                    det["num_detections"] += 1
+                    # det["clip_feature"] = (
+                    #     tracked_num * det["clip_feature"] + feature
+                    # ) / (tracked_num + 1)
+                    self.override_points(obj_cloud, merged_to_id, det["yolo_conf"], det["size_conf"])
+                    merged_num += 1
+                    # print(f"New ID {tracking_id} merged to {merged_to_id}")
+                    det["class_ids"][class_id] = det["class_ids"].get(class_id, 0) + 1
+                    max_class_id = max(det["class_ids"], key=det["class_ids"].get)
+                        
+                    self.detections.append({
+                        "id": merged_to_id,
+                        "class_ids": det["class_ids"],
+                        "class_name": self.obj_classes[max_class_id], #det["class_name"],
+                        "center": center,
+                    })
+                # 3. NEW OBJECT (create new object if not merged)
+                else:
+                    class_dict = {}
+                    class_dict[class_id] = 1
+                    self.objects[tracking_id] = {
+                        "id": tracking_id,
+                        "class_ids": class_dict,
+                        "class_name": self.obj_classes[class_id],
+                        "yolo_conf": yolo_conf,
+                        "size_conf": size_conf,
+                        "num_detections": 1,
+                        # "clip_feature": feature,
+                    }
+                    new_num += 1
+                    self.override_points(obj_cloud, tracking_id, yolo_conf, size_conf)
+                    # print(f"new ID: {tracking_id}")
+                    self.detections.append({
+                        "id": tracking_id,
+                        "class_ids": class_dict,
+                        "class_name": self.obj_classes[class_id],
+                        "center": center,
+                        "bboxes": bounding_box, # DSHONG
+                    })
+
+            # print(f"\033[94m✅ all: {all_num}, filtered: {filtered1_num}, {filtered2_num}, {filtered3_num}, {filtered4_num}, tracked: {tracked_num}, diff_cls: {diff_cls_num}, merged: {merged_num}, new: {new_num}\033[0m")
+            
+            if not self.objects:
+                continue
+
+            t5 = time.time()
+
+
+            self.object_markers = self.create_object_markers()
+            t6 = time.time()
+
+            # print(f"graph: {t21 - t1:.3f}, {t2 - t21:.3f}, model: {t3 - t2:.3f}, proj: {t4 - t3:.3f}, merge: {t5 - t4:.3f}, pub: {t6 - t5:.3f}, total: {t6 - t1:.3f} sec")
+
+            # torch cuda empty
+            torch.cuda.empty_cache()
+
+    def publish_loop(self):
+        while self.running and not rospy.is_shutdown():
+            self.publish_hash_map()
+            if self.object_markers is not None:
+                self.object_markers_pub.publish(self.object_markers)
+
+            if self.graph_markers is not None:
+                self.graph_markers_pub.publish(self.graph_markers)
+            rospy.sleep(0.01)
+
+    def publish_depth_cloud(self, stamp, points, colors):
+        header = std_msgs.msg.Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = "map"
+
+        # print(f"points shape: {points.shape}, colors shape: {colors.shape}")
+        colors = colors.reshape(-1, 3)  # Ensure colors are in shape (N, 3)
+        rgb_uint32 = (
+            (colors[:, 2].astype(np.uint32) << 16)
+            | (colors[:, 1].astype(np.uint32) << 8)
+            | (colors[:, 0].astype(np.uint32))
+        )
+        # rgb_float32 = rgb_uint32.view(np.float32).reshape(-1, 1)
+        # colored_cloud = np.hstack((points, rgb_float32))
+        points_with_colors = np.empty(points.shape[0], dtype=[
+            ('x', np.float32), ('y', np.float32), ('z', np.float32), ('rgb', np.uint32)
+        ])
+        points_with_colors['x'] = points[:, 0]
+        points_with_colors['y'] = points[:, 1]
+        points_with_colors['z'] = points[:, 2]
+        points_with_colors['rgb'] = rgb_uint32
+        colored_cloud = points_with_colors.tolist()
+
+        cloud_msg = pc2.create_cloud(header, self.fields, colored_cloud)
+        self.depth_pub.publish(cloud_msg)
+
+
+        # rospy.loginfo(f"Published point cloud with {len(points)} points at {stamp} ns")
+
+    def publish_det_clouds(self, stamp, clouds, colors):
+        header = std_msgs.msg.Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = "map"
+
+        all_points = []
+        all_colors = []
+
+        for cloud, color in zip(clouds, colors):
+            rgb_uint32 = (
+                (color[:, 2].astype(np.uint32) << 16)
+                | (color[:, 1].astype(np.uint32) << 8)
+                | (color[:, 0].astype(np.uint32))
+            )
+
+            all_points.append(cloud)
+            all_colors.append(rgb_uint32)
+
+        all_points = np.vstack(all_points)
+        all_colors = np.concatenate(all_colors)
+
+        points_with_colors = np.empty(all_points.shape[0], dtype=[
+            ('x', np.float32), ('y', np.float32), ('z', np.float32), ('rgb', np.uint32)
+        ])
+        points_with_colors['x'] = all_points[:, 0]
+        points_with_colors['y'] = all_points[:, 1]
+        points_with_colors['z'] = all_points[:, 2]
+        points_with_colors['rgb'] = all_colors
+
+        cloud_msg = pc2.create_cloud(header, self.fields, points_with_colors.tolist())
+        self.det_clouds_pub.publish(cloud_msg)
+        # rospy.loginfo(f"Published {len(obj_clouds_world)} object point clouds at {stamp} ns")
+
+    def show_yolosam_image(self, rgb, boxes, masks):
+        for box in boxes.xyxy.cpu().numpy():
+            x1, y1, x2, y2 = box
+            cv2.rectangle(rgb, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+
+        for mask in masks:
+            mask_rgb = np.zeros_like(rgb)
+            mask_rgb[mask == 1] = [0, 0, 255]
+            rgb = cv2.addWeighted(rgb, 1, mask_rgb, 0.5, 0)
+
+        cv2.imshow("YOLO + SAM Masked Image", rgb)
+        cv2.waitKey(1)
+
+    def publish_hash_map(self):
+        with self.lock:
+            hash_items = list(self.map_hash.items())
+
+        points = []
+        for key, pts in hash_items:
+            for pt in pts:
+                x, y, z, tid, yolo_conf, size_conf = pt
+                if tid != -1:
+                    rgb = self.get_cached_color(int(tid))
+                    points.append([x, y, z, rgb])
+
+        if not points:
+            return
+
+        header = std_msgs.msg.Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = "map"
+
+        pc2_msg = pc2.create_cloud(header, self.fields, points)
+        self.hash_map_pub.publish(pc2_msg)
+
+    def get_color(self, class_id):
+        if 0 <= class_id < len(self.obj_classes):
+            return self.color_map[class_id]
+        return (255, 255, 255)
+
+    def create_object_markers(self):
+        marker_array = MarkerArray()
+        for i, (object_id, obj) in enumerate(self.objects.items()):
+            if obj["center"] is None:
+                continue
+            min_pt, max_pt = obj["min_bbox"], obj["max_bbox"]
+            center = obj["center"]
+            class_ids = obj["class_ids"]
+            class_id = max(class_ids, key=class_ids.get) 
+            label = obj["class_name"]
+            object_id = obj["id"]
+            color = self.get_color(class_id)
+            num_detections = obj["num_detections"]
+            yolo_conf = obj["yolo_conf"]
+            size_conf = obj["size_conf"]
+
+            marker_array.markers.append(self.get_bbox_marker(min_pt, max_pt, i, color))
+            bubble, bubble_pos = self.get_bubble_marker(min_pt, max_pt, i, color)
+            marker_array.markers.append(bubble)
+            marker_array.markers.append(
+                self.get_connection_line_marker(min_pt, max_pt, i, color)
+            )
+            marker_array.markers.append(
+                self.get_label_marker(label, bubble_pos, object_id, yolo_conf, i, color)
+            )
+
+        return marker_array
+    
+    def get_bbox_marker(self, min_pt, max_pt, obj_id, color):
+        scale = np.array(max_pt) - np.array(min_pt)
+        center = (np.array(min_pt) + np.array(max_pt)) / 2.0
+        # center[2] += 4
+        marker = Marker()
+        marker.header.frame_id = self.frame_id
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "bbox"
+        marker.id = obj_id
+        marker.type = Marker.CUBE
+        marker.action = Marker.ADD
+        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = (
+            center.tolist()
+        )
+        (
+            marker.pose.orientation.x,
+            marker.pose.orientation.y,
+            marker.pose.orientation.z,
+            marker.pose.orientation.w,
+        ) = [0.0, 0.0, 0.0, 1.0]
+        marker.scale.x, marker.scale.y, marker.scale.z = scale.tolist()
+        marker.color.r, marker.color.g, marker.color.b = [c / 255.0 for c in color]
+        marker.color.a = 0.3
+        return marker
+
+    def get_label_marker(
+        self,
+        text,
+        pos,
+        object_id,
+        num_detections,
+        obj_id,
+        color,
+        id_offset=1000,
+        scale=0.2,
+    ):
+        marker = Marker()
+        marker.header.frame_id = self.frame_id
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "labels"
+        marker.id = obj_id + id_offset
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = (
+            pos[0],
+            pos[1],
+            pos[2] + 0.3,
+        )
+        marker.scale.z = scale
+        marker.color.r, marker.color.g, marker.color.b = [c / 255.0 for c in color]
+        marker.color.a = 1.0
+        marker.text = str(object_id) + " " + text # + f" ({num_detections:.2f})"
+        return marker
+
+    def get_bubble_marker(self, min_pt, max_pt, obj_id, color):
+        top_center = (np.array(min_pt) + np.array(max_pt)) / 2.0
+        # top_center[2] = max_pt[2] +4
+        sphere_pos = top_center + np.array([0.0, 0.0, 1.0])
+        marker = Marker()
+        marker.header.frame_id = self.frame_id
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "bubbles"
+        marker.id = obj_id + 2000
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = (
+            sphere_pos.tolist()
+        )
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = marker.scale.y = marker.scale.z = 0.1
+        marker.color.r, marker.color.g, marker.color.b = [c / 255.0 for c in color]
+        marker.color.a = 1.0
+        return marker, sphere_pos
+
+    def get_connection_line_marker(self, min_pt, max_pt, obj_id, color):
+        top_center = (np.array(min_pt) + np.array(max_pt)) / 2.0
+        # top_center[2] = max_pt[2] + 4
+        sphere_pos = top_center + np.array([0.0, 0.0, 1.0])
+        marker = Marker()
+        marker.header.frame_id = self.frame_id
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "lines"
+        marker.id = obj_id + 4000
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.scale.x = 0.02
+        marker.color.r, marker.color.g, marker.color.b = [c / 255.0 for c in color]
+        marker.color.a = 0.8
+        marker.points = [Point(*top_center), Point(*sphere_pos)]
+        return marker
+
+    def get_cached_color(self, tid):
+        tid = int(tid)
+        if tid == -1:
+            return (128 << 16) | (128 << 8) | 128
+
+        tid_wrapped = tid % (2**32)
+        if tid not in self.id_color_map:
+            np.random.seed(tid_wrapped)
+            rgb = (np.random.rand(3) * 255).astype(np.uint8)
+            self.id_color_map[tid] = (int(rgb[0]) << 16) | (int(rgb[1]) << 8) | int(rgb[2])
+        return self.id_color_map[tid]
+
+    def create_graph_markers(self):
+        with self.lock:
+            markers = MarkerArray()
+            marker_id = 0
+            frame_id = self.frame_id
+            
+            delete_all = Marker()
+            delete_all.action = Marker.DELETEALL
+            markers.markers.append(delete_all)
+            marker_id += 1
+
+            # 노드 개수 세기
+            # node_counts = {"building": 0, "room": 0, "keyframe": 0, "object": 0, "other": 0}
+            # for _, attr in self.sg_graph.nodes(data=True):
+            #     t = attr.get("type", "other")
+            #     if t in node_counts:
+            #         node_counts[t] += 1
+            #     else:
+            #         node_counts["other"] += 1
+
+            # # 엣지 개수 세기
+            # edge_counts = {"door_edge": 0, "traversable_edge": 0, "close_edge": 0, "temporary_edge": 0, "room_edge": 0, "building_edge": 0, "other": 0}
+            # for _, _, attr in self.sg_graph.edges(data=True):
+            #     etype = attr.get("type", "traversable_edge")
+            #     if etype in edge_counts:
+            #         edge_counts[etype] += 1
+            #     else:
+            #         edge_counts["other"] += 1
+
+            # print(f"Node counts: building={node_counts['building']}, room={node_counts['room']}, keyframe={node_counts['keyframe']}, object={node_counts['object']}, other={node_counts['other']}")
+            # print(f"Edge counts: door_edge={edge_counts['door_edge']}, traversable_edge={edge_counts['traversable_edge']}, close_edge={edge_counts['close_edge']}, room_edge={edge_counts['room_edge']}, building_edge={edge_counts['building_edge']}, other={edge_counts['other']}")
+
+            # 노드 표시 (Sphere)
+
+            marker = Marker()
+            marker.header.frame_id = frame_id
+            marker.header.stamp = rospy.Time.now()
+            marker.ns = f"node/building"
+            marker.id = 0
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.5
+            marker.scale.y = 0.5
+            marker.scale.z = 0.5
+            marker.color.r = 0.5
+            marker.color.g = 0.0
+            marker.color.b = 0.5
+            marker.color.a = 1.0
+            marker.pose.position.x = 0.0
+            marker.pose.position.y = 0.0
+            marker.pose.position.z = 10.0
+            markers.markers.append(marker)
+
+            for node, attr in self.sg_graph.nodes(data=True):
+                node_type = attr.get("type")
+                marker = Marker()
+                marker.header.frame_id = frame_id
+                marker.header.stamp = rospy.Time.now()
+                marker.ns = f"node/{node_type}"
+                marker.id = marker_id
+                marker.type = Marker.SPHERE
+                marker.action = Marker.ADD
+
+                
+                pos = attr.get("position", None)
+                if pos is None:
+                    continue
+                
+                if node_type == "building":
+                    pos = list(pos)
+                    pos[2] += 9.0
+                    marker.color.r = 1.0
+                    marker.color.g = 1.0
+                    marker.color.b = 0.0
+                    marker.color.a = 0.8
+                    marker.scale.x = 0.5
+                    marker.scale.y = 0.5
+                    marker.scale.z = 0.5
+                    # print(f"[INFO] Building node found at position: {pos}")
+                if node_type == "room":
+                    pos = list(pos)
+                    pos[2] += 6.0
+                    # marker.type = Marker.CYLINDER
+                    marker.color.r = 0.0
+                    marker.color.g = 0.8
+                    marker.color.b = 0.0
+                    marker.color.a = 1.0
+                    marker.scale.x = 0.3
+                    marker.scale.y = 0.3
+                    marker.scale.z = 0.3
+                # elif node_type == "keyframe":
+                #     pos = list(pos)
+                #     pos[2] -= 3.0
+                #     marker.type = Marker.CUBE
+                #     marker.color.r = 0.0
+                #     marker.color.g = 0.0
+                #     marker.color.b = 1.0
+                #     marker.color.a = 0.8
+                #     marker.scale.x = 0.3
+                #     marker.scale.y = 0.3
+                #     marker.scale.z = 0.3
+                elif node_type == "place":
+                    pos = list(pos)
+                    pos[2] += 3.0
+                    marker.type = Marker.CUBE
+                    marker.color.r = 1.0
+                    marker.color.g = 1.0
+                    marker.color.b = 0.0
+                    marker.color.a = 0.8
+                    # if attr.get("correct", True) is False:
+                    #     marker.color.r = 1.0
+                    #     marker.color.g = 0.0
+                    #     marker.color.b = 0.0
+                    #     marker.color.a = 1.0
+                    marker.scale.x = 0.2
+                    marker.scale.y = 0.2
+                    marker.scale.z = 0.2
+                elif node_type == "object":
+                    # pos = list(pos)
+                    instance_id = attr.get("instance_id", None)
+                    if instance_id is not None and instance_id in self.objects and "center" in self.objects[instance_id]:
+                        pos = self.objects[instance_id]["center"]
+                    else:
+                        continue
+                    marker.color.r = 1.0
+                    marker.color.g = 0.0
+                    marker.color.b = 0.0
+                    marker.color.a = 0.8
+                    marker.scale.x = 0.1
+                    marker.scale.y = 0.1
+                    marker.scale.z = 0.1
+                else: 
+                    continue
+                
+                marker.pose.position.x = pos[0]
+                marker.pose.position.y = pos[1]
+                marker.pose.position.z = pos[2]
+                marker.pose.orientation.w = 1.0
+
+                markers.markers.append(marker)
+                marker_id += 1
+                
+                if node_type == "place":
+                    text_marker = Marker()
+                    text_marker.header.frame_id = frame_id
+                    text_marker.header.stamp = rospy.Time.now()
+                    text_marker.ns = f"text/{node_type}"
+                    text_marker.id = marker_id
+                    text_marker.type = Marker.TEXT_VIEW_FACING
+                    text_marker.action = Marker.ADD
+
+                    text_marker.pose.position.x = pos[0]
+                    text_marker.pose.position.y = pos[1]
+                    text_marker.pose.position.z = pos[2] + 0.5
+                    text_marker.pose.orientation.w = 1.0
+
+                    place_id = node.split("_")[1]
+
+                    text_marker.scale.z = 0.3  # 글자 높이
+                    text_marker.color.r = 0.0
+                    text_marker.color.g = 1.0
+                    text_marker.color.b = 1.0
+                    text_marker.color.a = 1.0
+                    best_room = attr.get("refined_label", None)
+                    if best_room is None:
+                        best_room = attr.get("room_label", "")
+                        text_marker.color.r = 1.0
+                    if best_room is not None : #and best_room != "invalid":
+                        text_marker.text = f"{best_room}" if best_room is not None else place_id
+                        markers.markers.append(text_marker)
+                        marker_id += 1
+
+                if node_type == "room":
+                    text_marker = Marker()
+                    text_marker.header.frame_id = frame_id
+                    text_marker.header.stamp = rospy.Time.now()
+                    text_marker.ns = f"text/{node_type}"
+                    text_marker.id = marker_id
+                    text_marker.type = Marker.TEXT_VIEW_FACING
+                    text_marker.action = Marker.ADD
+
+                    text_marker.pose.position.x = pos[0]
+                    text_marker.pose.position.y = pos[1]
+                    text_marker.pose.position.z = pos[2] + 0.5
+                    text_marker.pose.orientation.w = 1.0
+
+                    room_id = node.split("_")[1]
+                    room_label = attr.get("label", "")
+                    text_marker.text = f"{room_id} {room_label}" if room_label is not None else room_id
+
+                    text_marker.scale.z = 0.2  # 글자 높이
+                    text_marker.color.r = 1.0
+                    text_marker.color.g = 1.0
+                    text_marker.color.b = 1.0
+                    text_marker.color.a = 1.0
+
+                    markers.markers.append(text_marker)
+                    marker_id += 1
+
+
+            for u, v, attr in self.sg_graph.edges(data=True):
+                if u not in self.sg_graph.nodes or v not in self.sg_graph.nodes:
+                    continue
+                etype = attr.get("type", "traversable_edge")
+
+                node_u = self.sg_graph.nodes[u]
+                node_v = self.sg_graph.nodes[v]
+
+                t_u = node_u.get("type")
+                pos_u = node_u.get("position", None)
+                if pos_u is None:
+                    continue
+                if t_u == "room":
+                    pu = [pos_u[0], pos_u[1], pos_u[2]] 
+                    pu[2] += 6.0
+                elif t_u == "keyframe":
+                    pu = [pos_u[0], pos_u[1], pos_u[2]]
+                    pu[2] -= 3.0
+                elif t_u == "place":
+                    pu = [pos_u[0], pos_u[1], pos_u[2]]
+                    pu[2] += 3.0
+                elif t_u == "building":
+                    pu = [pos_u[0], pos_u[1], pos_u[2]]
+                    pu[2] += 10.0
+                elif t_u == "object":
+                    instance_id = node_u.get("instance_id", None)
+                    if instance_id is not None and instance_id in self.objects and "center" in self.objects[instance_id]:
+                        pu = self.objects[instance_id]["center"]
+                    else:
+                        continue
+                else:
+                    continue
+
+                t_v = node_v.get("type")
+                pos_v = node_v.get("position", None)
+                if pos_v is None:
+                    continue
+                if t_v == "room":
+                    pv = [pos_v[0], pos_v[1], pos_v[2]]
+                    pv[2] += 6.0
+                elif t_v == "keyframe":
+                    pv = [pos_v[0], pos_v[1], pos_v[2]]
+                    pv[2] -= 3.0
+                elif t_v == "place":
+                    pv = [pos_v[0], pos_v[1], pos_v[2]]
+                    pv[2] += 3.0
+                elif t_v == "building":
+                    pv = [pos_v[0], pos_v[1], pos_v[2]]
+                    pv[2] += 10.0
+                elif t_v == "object":
+                    instance_id = node_v.get("instance_id", None)
+                    if instance_id is not None and instance_id in self.objects and "center" in self.objects[instance_id]:
+                        pv = self.objects[instance_id]["center"]
+                    else:
+                        continue
+                else:
+                    continue
+                
+                line_marker = Marker()
+                line_marker.header.frame_id = frame_id
+                line_marker.header.stamp = rospy.Time.now()
+                line_marker.ns = f"edge/{etype}"
+                line_marker.id = marker_id
+                line_marker.type = Marker.LINE_STRIP
+                line_marker.action = Marker.ADD
+                line_marker.scale.x = 0.05
+                
+                p0 = Point()
+                p0.x, p0.y, p0.z = pu[0], pu[1], pu[2]
+                p1 = Point()
+                p1.x, p1.y, p1.z = pv[0], pv[1], pv[2]
+                line_marker.points = [p0, p1]
+
+                if etype == "door_edge":
+                    line_marker.color.r = 1.0
+                    line_marker.color.g = 0.5
+                    line_marker.color.b = 0.0
+                    line_marker.color.a = 0.7
+                    line_marker.scale.x = 0.04
+                # elif etype == "traversable_edge":
+                #     line_marker.color.r = 0.0
+                #     line_marker.color.g = 0.7
+                #     line_marker.color.b = 1.0
+                #     line_marker.color.a = 0.7
+                #     line_marker.scale.x = 0.02
+                # elif etype == "close_edge":
+                #     line_marker.color.r = 1.0
+                #     line_marker.color.g = 0.0
+                #     line_marker.color.b = 0.0
+                #     line_marker.color.a = 0.2
+                #     line_marker.scale.x = 0.02
+                # elif etype == "temporary_edge":
+                #     line_marker.color.r = 0.5
+                #     line_marker.color.g = 0.5
+                #     line_marker.color.b = 0.0
+                #     line_marker.color.a = 0.2
+                #     line_marker.scale.x = 0.02
+                elif etype == "room_edge":
+                    line_marker.color.r = 0.0
+                    line_marker.color.g = 0.5
+                    line_marker.color.b = 0.0
+                    line_marker.color.a = 0.4
+                    line_marker.scale.x = 0.02
+                # elif etype == "keyframe_edge":
+                #     line_marker.color.r = 1.0
+                #     line_marker.color.g = 1.0
+                #     line_marker.color.b = 0.0
+                #     line_marker.color.a = 0.7
+                # elif etype == "building_edge":
+                #     line_marker.color.r = 0.5
+                #     line_marker.color.g = 0.0
+                #     line_marker.color.b = 0.5
+                #     line_marker.color.a = 0.4
+                #     line_marker.scale.x = 0.02
+                # elif etype == "near_edge":
+                #     line_marker.color.r = 0.0
+                #     line_marker.color.g = 0.0
+                #     line_marker.color.b = 1.0
+                #     line_marker.color.a = 1.0
+                # elif etype == "near1_edge":
+                #     line_marker.color.r = 0.0
+                #     line_marker.color.g = 0.5
+                #     line_marker.color.b = 0.0
+                #     line_marker.color.a = 0.4
+                #     line_marker.scale.x = 0.02
+
+                # if attr.get("correct", True) is False:
+                #     line_marker.color.r = 1.0
+                #     line_marker.color.g = 0.0
+                #     line_marker.color.b = 0.0
+                #     line_marker.color.a = 1.0
+                
+                markers.markers.append(line_marker)
+                marker_id += 1
+
+            return markers
+
+    def handle_save_data(self, req):
+
+        def convert_numpy_types(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()  # Convert numpy arrays to lists
+            elif isinstance(obj, np.float32):
+                return float(obj)  # Convert numpy float32 to native Python float
+            elif isinstance(obj, np.int32):
+                return int(obj)  # Convert numpy int32 to native Python int
+            elif isinstance(obj, dict):
+                return {key: convert_numpy_types(value) for key, value in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(item) for item in obj]
+            else:
+                return obj
+
+        base_dir = '/workspace/vla_ws/CMU-VLA-Challenge/ai_module/offline_map' #'/ws/external/offline_map'
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = os.path.join(base_dir, timestamp)
+        os.makedirs(save_dir, exist_ok=True)
+        with self.lock:
+            pcd_path = os.path.join(save_dir, 'hash_pointcloud.pcd')
+            obj_path = os.path.join(save_dir, 'objects.json')
+            graph_path = os.path.join(save_dir, 'scene_graph.json')
+
+            # Save point cloud data
+            pts_list = []
+            for pts in self.map_hash.values():
+                for pt in pts:
+                    pts_list.append(pt[:3])
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(np.array(pts_list, dtype=np.float32))
+            o3d.io.write_point_cloud(pcd_path, pcd)
+
+            # Prepare objects data
+            serializable_objects = {}
+            hash_keys_per_id = {}
+            for key, pts in self.map_hash.items():
+                for pt in pts:
+                    oid = int(pt[3])
+                    hash_keys_per_id.setdefault(oid, []).append(int(key))
+
+            for oid, info in self.objects.items():
+                serializable_objects[int(oid)] = {
+                    'instance_id':  int(info['id']),
+                    'class_ids':    info['class_ids'],
+                    'class_name':   info['class_name'],
+                    'n_points':     int(info['n_points']),
+                    'center':       info['center'].tolist(),
+                    'min_bbox':     info['min_bbox'].tolist(),
+                    'max_bbox':     info['max_bbox'].tolist(),
+                    # 'clip_feature': info['clip_feature'].tolist() if isinstance(info['clip_feature'], np.ndarray) else info['clip_feature'],
+                    'point_hash_key': hash_keys_per_id.get(int(oid), [])
+                }
+
+            for oid, info in self.missing_objects.items():
+                if int(oid) in serializable_objects and info['class_id'] in serializable_objects[oid]["class_ids"]:
+                    print("self.missing_objects {oid} already existing")
+                    continue
+                serializable_objects[int(oid)] = {
+                    'instance_id':  int(info['id']),
+                    "class_id":     info["class_id"],
+                    'class_name':   info['class_name'],
+                    'yolo_conf':    info['yolo_conf'],
+                    'bbox':         info['bbox'].tolist(),
+                }
+            # Convert numpy types and save the objects JSON
+            json_objects = convert_numpy_types(serializable_objects)
+            with open(obj_path, 'w') as f:
+                json.dump(json_objects, f, indent=2)
+
+            shm_obj_name = "object_shm"
+            json_str = json.dumps(json_objects)
+            encoded = json_str.encode("utf-8")
+            size = len(encoded)
+            try:
+                existing_shm = shared_memory.SharedMemory(name=shm_obj_name)
+                existing_shm.close()
+                existing_shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            shm = shared_memory.SharedMemory(create=True, size=size, name=shm_obj_name)
+            shm.buf[:size] = encoded
+            shm.close()
+            shm.unlink() 
+            print(f"Saved objects to shared memory '{shm_obj_name}' ({size} bytes)")
+            ########
+
+            # Prepare graph data
+            for _, attr in self.sg_graph.nodes(data=True):
+                pos = attr.get('position')
+                if hasattr(pos, 'tolist'):
+                    attr['position'] = pos.tolist()
+            
+            graph_data = node_link_data(self.sg_graph)
+            
+            # Convert numpy types and save the graph JSON
+            json_graph = convert_numpy_types(graph_data)
+            with open(graph_path, 'w') as f:
+                json.dump(json_graph, f, indent=2)
+
+            shm_graph_name = "scene_graph_shm"
+            json_str = json.dumps(json_graph)
+            encoded = json_str.encode("utf-8")
+            size = len(encoded)
+            try:
+                existing_shm = shared_memory.SharedMemory(name=shm_graph_name)
+                existing_shm.close()
+                existing_shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            shm = shared_memory.SharedMemory(create=True, size=size, name=shm_graph_name)
+            shm.buf[:size] = encoded
+            shm.close()
+            shm.unlink() 
+            print(f"Saved graph to shared memory '{shm_graph_name}' ({size} bytes)")
+
+        rospy.loginfo(f'Saved files: {pcd_path}, {obj_path}, {graph_path}')
+        return EmptyResponse()
+
+    def save_graph_to_shared_memory(self, graph: nx.Graph, shm_name="scene_graph_shm"):
+        data = json_graph.node_link_data(graph)
+        graph_json = json.dumps(data)
+
+        encoded = graph_json.encode("utf-8")
+        size = len(encoded)
+
+        # 기존 shm이 존재하면 제거
+        try:
+            existing_shm = shared_memory.SharedMemory(name=shm_name)
+            existing_shm.close()
+            existing_shm.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+        shm = shared_memory.SharedMemory(create=True, size=size, name=shm_name)
+        shm.buf[:size] = encoded
+        shm.close()
+        print(f"Saved graph to shared memory '{shm_name}' ({size} bytes)")
+
+
+    def publish_pointcloud(self, obj_clouds_world, colors_list, semantic_labels, image_stamp):
+        new_points = []
+        for i, obj_cloud in enumerate(obj_clouds_world):
+            semantic_label = semantic_labels[i]
+            if np.isnan(colors_list[i]).any():
+                colors_list[i] =[0,0,0]
+            rgb = (int(colors_list[i][0]) << 16) | (int(colors_list[i][1]) << 8) | int(colors_list[i][2])
+
+            for j in range(obj_cloud.shape[0]):
+                x, y, z = obj_cloud[j]
+                new_points.append([x, y, z, rgb, semantic_label])
+
+        seconds = int(image_stamp // 1e9)
+        nanoseconds = int(image_stamp % 1e9)
+        stamp_time = rospy.Time(secs=seconds, nsecs=nanoseconds)
+
+        # Create PointCloud2 message
+        header = std_msgs.msg.Header()
+        header.stamp = stamp_time
+        header.frame_id = 'map'
+
+        fields = [
+            pc2.PointField('x', 0, pc2.PointField.FLOAT32, 1),
+            pc2.PointField('y', 4, pc2.PointField.FLOAT32, 1),
+            pc2.PointField('z', 8, pc2.PointField.FLOAT32, 1),
+            pc2.PointField('rgb', 12, pc2.PointField.UINT32, 1),
+            pc2.PointField('semantic_label', 16, pc2.PointField.UINT32, 1),
+        ]
+
+        self.xyzrgbl_points.extend(new_points)
+        # Create the PointCloud2 message
+        pointcloud2_msg = pc2.create_cloud(header, fields, self.xyzrgbl_points)
+        self.xyzrgbl_pub.publish(pointcloud2_msg)
+
+    def shutdown(self):
+        self.running = False
+        self.publish_thread.join()
+        self.main_thread.join()
+
+
+if __name__ == "__main__":
+    rospy.init_node("scene_graph_processor")
+    processor = SceneGraphProcessor()
+    rospy.spin()

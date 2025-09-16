@@ -1,0 +1,6 @@
+float64[2] min_bbox    # [x, y]
+float64[2] max_bbox
+float64   inflation    # [m], expanding
+---
+bool success
+string message

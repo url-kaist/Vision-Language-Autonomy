@@ -1,0 +1,17 @@
+<launch>
+    <arg name='quiet' default='false' />
+    <arg name="run_theta_driver" default="false" />
+    <node pkg="sem" type="semantic_seg_node" name="type"
+            output="screen"
+            required="true">
+        <param name='quiet' value="$(arg quiet)"/>
+    </node>
+
+    <node pkg="theta_driver" type="theta_driver_node" name="theta_driver_node" output="screen" 
+          if="$(arg run_theta_driver)">
+    </node>
+
+
+    <node pkg="rviz" type="rviz" name="rvizSG" args="-d $(find sem)/rviz/cmu.rviz" respawn="true"/>
+
+</launch>

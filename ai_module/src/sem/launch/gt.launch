@@ -1,0 +1,22 @@
+<launch>
+    <arg name='quiet' default='false' />
+    <arg name="debug" default="false"/>
+    <arg name="real_world" default="false"/>
+    
+    <arg name="config" default="/ws/external/ai_module/src/sem/config/simulation_gt.json"/>
+
+        <node name="traversable_authority" pkg="traversable_authority" type="traversable_authority_node.py" output="screen">
+            <param name="quiet" value="$(arg quiet)"/>
+            <param name="real_world" value="$(arg real_world)"/>
+        </node>
+    <node pkg="sem" type="gt_graph_node" name="gt_graph_node"
+            output="screen"
+            required="true">
+        <param name='quiet' value="$(arg quiet)"/>
+        <param name="config" value="$(arg config)"/>
+    </node>
+
+
+    <node pkg="rviz" type="rviz" name="rvizSG" args="-d $(find sem)/rviz/scene_graph.rviz" respawn="true"/>
+
+</launch>

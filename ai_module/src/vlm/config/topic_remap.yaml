@@ -1,0 +1,25 @@
+# Topic Remapping Configuration for Real-World Deployment
+# Edit these values to match your real robot's topic names
+
+# LiDAR/3D Sensor Topics
+sensor_scan_topic: "/sensor_scan"
+registered_scan_topic: "/registered_scan"
+
+# Camera Topics  
+camera_image_topic: "/camera/image"
+camera_semantic_topic: "/camera/semantic_image"
+camera_depth_topic: "/camera/depth_image"
+
+# Robot State Topics
+odom_topic: "/state_estimation"
+robot_pose_topic: "/state_estimation_pose_at_scan"
+
+# Navigation Topics
+navigation_goal_topic: "/way_point_with_heading"
+
+# Robot Control Topics
+cmd_vel_topic: "/UGV2/jackal_velocity_controller/cmd_vel"
+
+# Deployment Settings
+robot_type: "jackal"
+environment: "real_world" 

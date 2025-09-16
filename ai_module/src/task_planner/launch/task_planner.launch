@@ -1,0 +1,8 @@
+<launch>
+    <arg name="quiet" default="false"/>
+
+    <node name="task_planner_server" pkg="task_planner" type="task_planner_server.py" output="screen">
+        <param name="quiet" value="$(arg quiet)"/>
+    </node>
+
+</launch>

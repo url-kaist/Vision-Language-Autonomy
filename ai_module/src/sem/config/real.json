@@ -1,0 +1,23 @@
+{
+  "object_classes": [
+    "person", "table", "sign", "chair", "fridge", "trash can", "water machine"
+  ],
+  "color_map": [
+      [255, 0, 0],         
+      [0, 0, 255],         
+      [255, 165, 0],       
+      [0, 255, 0],         
+      [0, 255, 255],       
+      [0, 0, 0],           
+      [0, 191, 255]       
+  ],
+  "color_map_with_names": {
+    "person": [255, 0, 0],
+    "table": [0, 0, 255],
+    "sign": [255, 165, 0],
+    "chair": [0, 255, 0],
+    "fridge": [0, 255, 255],
+    "trash can": [0, 0, 0],
+    "water machine": [0, 191, 255]
+  }
+}

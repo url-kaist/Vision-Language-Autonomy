@@ -1,0 +1,29 @@
+<launch>
+    <arg name="quiet" default="false"/>
+    <arg name="debug" default="false"/>
+
+<!-- Manager -->
+    <node name="VLM" type="manager" pkg="vlm" output="screen" required="true">
+        <param name="quiet" value="$(arg quiet)"/>
+    </node>
+
+<!-- Task Planner -->
+    <node name="task_planner_server" pkg="task_planner" type="task_planner_server.py" output="screen">
+        <param name="quiet" value="$(arg quiet)"/>
+    </node>
+
+<!-- Traversable Authority -->
+    <!-- <node name="traversable_authority" pkg="traversable_authority" type="traversable_authority_node.py" output="screen">
+        <param name="quiet" value="$(arg quiet)"/>
+    </node> -->
+
+<!-- User Interface -->
+    <node name="user_interface" type="user_interface" pkg="user_interface" output="screen">
+        <param name="debug" value="$(arg debug)"/>
+    </node>
+
+</launch>
+
+
+
+

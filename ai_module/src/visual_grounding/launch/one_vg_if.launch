@@ -1,0 +1,12 @@
+<launch>
+    <arg name="quiet" default="false"/>
+    <arg name="real_world" default="false"/>
+    <arg name="debug" default="false"/>
+    <arg name="vg_index" default="0"/>
+    
+    <node name="visual_grounding_$(arg vg_index)" pkg="visual_grounding" type="visual_follower.py" output="screen">
+        <param name="quiet" value="$(arg quiet)"/>
+        <param name="real_world" value="$(arg real_world)"/>
+        <param name="debug" value="$(arg debug)"/>
+    </node>
+</launch>

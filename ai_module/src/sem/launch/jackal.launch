@@ -1,0 +1,12 @@
+<launch>
+    <arg name='quiet' default='false' />
+    <node pkg="sem" type="jackal_sg_node" name="scene_graph_node"
+            output="screen"
+            required="true">
+        <param name='quiet' value="$(arg quiet)"/>
+    </node>
+
+
+    <node pkg="rviz" type="rviz" name="rvizSG" args="-d $(find sem)/rviz/sg.rviz" respawn="true"/>
+
+</launch>

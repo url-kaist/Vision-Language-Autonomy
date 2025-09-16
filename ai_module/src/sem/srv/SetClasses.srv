@@ -1,0 +1,5 @@
+string[] classnames
+string template_str
+---
+bool success
+string message

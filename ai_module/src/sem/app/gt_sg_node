@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+
+import rospy
+from sensor_msgs.msg import Image, PointCloud2
+from geometry_msgs.msg import Point
+from nav_msgs.msg import Odometry
+import std_msgs.msg
+import sensor_msgs.point_cloud2 as pc2
+from sensor_msgs.msg import PointField
+from visualization_msgs.msg import Marker, MarkerArray
+from std_srvs.srv import Empty, EmptyResponse
+from message_filters import Subscriber, ApproximateTimeSynchronizer
+
+import random
+import time
+import threading
+import numpy as np
+from collections import deque
+import json
+import tf
+import cv2
+import math
+from cv_bridge import CvBridge
+from PIL import Image as PILImage
+import networkx as nx
+import os
+import shutil
+from datetime import datetime
+from networkx.readwrite.json_graph.node_link import node_link_data
+import open3d as o3d
+from scipy.spatial.transform import Rotation, Slerp
+from collections import defaultdict
+import sys
+from multiprocessing import shared_memory
+
+
+from utils import (
+    load_depth_intrinsics,
+    compute_iou_3d,
+    generate_random_position,
+    convert_pointcloud2_to_xyz,
+    compute_overlap_ratio,
+    cluster_dbscan,
+    voxel_downsample,
+    get_distance_between_poses,
+    get_angle_between_poses,
+)
+
+from bg_process import BGProcessor
+
+import sys
+sys.path.append("/ws/external/ai_module/src/")
+# from sem.srv import SetClasses, SetClassesResponse
+
+import torch
+
+OBJECTS_TO_FOUND = ["sofa", "pillow"]
+
+
+class SceneGraphProcessor:
+    def __init__(self):
+        self.image_save_dir = "/ws/external/keyframes"
+        if os.path.exists(self.image_save_dir) and os.path.isdir(self.image_save_dir):
+            shutil.rmtree(self.image_save_dir)
+        os.makedirs(self.image_save_dir, exist_ok=True)
+        self.image_path = self.image_save_dir + "/{}.jpg"
+
+        self.bridge = CvBridge()
+        self.lock = threading.Lock()
+        self.running = True
+
+        self.bg_processor = BGProcessor(voxel_size=0.1, grid_size=0.1)
+
+        # data
+
+
+
+        # queues
+        self.cloud_queue = deque(maxlen=1000)
+        self.synced_image_queue = deque(maxlen=1000)
+        self.gt_timestamps_to_process = deque(maxlen=1000)
+        self.gt_objects = {} # {obj_id: {"stamps": set(), "class_name": str, "position": dict, "orientation": dict}}
+        self.keyframes = defaultdict(list)  # {obj_id: [image_timestamp1, ...]}
+
+
+        # ROS I/O
+        self.image_sub = Subscriber(
+            "/camera/image", Image, queue_size=1
+        )
+        self.odom_sub = Subscriber(
+            "/state_estimation", Odometry, queue_size=1
+        )
+        self.sync_sub = ApproximateTimeSynchronizer(
+            [self.image_sub, self.odom_sub],
+            queue_size=10,
+            slop=0.01,
+        )
+        self.sync_sub.registerCallback(self.sync_callback)
+        self.cloud_sub = rospy.Subscriber(
+            "/registered_scan", PointCloud2, self.cloud_callback, queue_size=10
+        )
+
+        self.gt_objects_sub = rospy.Subscriber(
+            "/object_markers", MarkerArray, self.gt_objects_callback, queue_size=1
+        )
+
+        self.save_srv = rospy.Service('/save_data', Empty, self.handle_save_data)
+        print("SceneGraphProcessor initialized")
+        # self.add_classes_srv = rospy.Service('/scene_graph/add_classes', SetClasses, self.handle_add_classes) # DSHONG
+
+        # Start publish thread
+        # self.publish_thread = threading.Thread(target=self.publish_loop)
+        # self.publish_thread.start()
+
+        # Start sync thread
+        self.main_thread = threading.Thread(target=self.run)
+        self.main_thread.start()
+        rospy.on_shutdown(self.shutdown)
+
+    # def handle_add_classes(self, req): # DSHONG
+    #     try:
+    #         template = req.template_str if req.template_str else "{}"
+    #         classnames_old = self.classnames
+    #         classnames_new = [template.format(name.replace("_", " ")) for name in req.classnames]
+    #         self.classnames = list(set(classnames_old + classnames_new))
+    #         self.yolo_model.set_classes(self.classnames)
+
+    #         self.obj_classes = self.classnames
+    #         self.color_map = {
+    #             idx: tuple(random.randint(0, 255) for _ in range(3))
+    #             for idx in range(len(self.classnames))
+    #         }
+    #         return SetClassesResponse(success=True, message="YOLO classes updated.")
+    #     except Exception as e:
+    #         return SetClassesResponse(success=False, message=str(e))
+
+    def gt_objects_callback(self, msg):
+        
+        for marker in msg.markers:
+            # Exclude markers with specific namespaces
+            if marker.ns in ["unknown", "floor", "ceiling", "wall"]:
+                continue
+            
+            obj_id = marker.id
+            obj_class_name = marker.ns
+            obj_stamp = marker.header.stamp.to_nsec()
+            
+            with self.lock:
+                if obj_id not in self.gt_objects:
+                    self.gt_objects[obj_id] = {
+                        "stamps": set(),
+                        "class_name": obj_class_name,
+                        "position": {'x': marker.pose.position.x, 'y': marker.pose.position.y, 'z': marker.pose.position.z},
+                        "orientation": {'x': marker.pose.orientation.x, 'y': marker.pose.orientation.y, 'z': marker.pose.orientation.z, 'w': marker.pose.orientation.w},
+                        "scale": {'x': marker.scale.x, 'y': marker.scale.y, 'z': marker.scale.z}
+                    }
+                    print(f"New GT object detected: {obj_id} - {obj_class_name}")
+                
+                if obj_stamp not in self.gt_objects[obj_id]["stamps"]:
+                    self.gt_objects[obj_id]["stamps"].add(obj_stamp)
+                    if obj_class_name in OBJECTS_TO_FOUND:
+                        self.gt_timestamps_to_process.append((obj_id, obj_stamp))
+
+    def sync_callback(self, img_msg, odom_msg):
+        stamp = img_msg.header.stamp.to_nsec()
+        with self.lock:
+            self.synced_image_queue.append((stamp, img_msg))
+
+
+    # def image_callback(self, msg):
+    #     stamp = msg.header.stamp.to_nsec()
+    #     rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+
+
+    def cloud_callback(self, msg):
+        stamp = msg.header.stamp.to_nsec()
+        with self.lock:            
+            t1 = time.time()
+            cloud = None
+            cloud = convert_pointcloud2_to_xyz(msg)
+            self.cloud_queue.append((stamp, cloud))
+            self.bg_processor.process_bg_cloud(cloud)
+            t2 = time.time()
+            self.bg_time = t2 - t1
+        # print(f"Cloud received at {stamp}, {len(self.cloud_queue)} clouds in queue, bg processing took {self.bg_time:.3f} sec")
+
+    # def odom_callback(self, msg):
+    #     stamp = msg.header.stamp.to_nsec()
+    #     position = msg.pose.pose.position
+    #     orientation = msg.pose.pose.orientation
+    #     linear_velocity = msg.twist.twist.linear
+    #     odom_data = {
+    #         "position": np.array([position.x, position.y, position.z]),
+    #         "orientation": np.array(
+    #             [orientation.x, orientation.y, orientation.z, orientation.w]
+    #         ),
+    #         "linear_velocity": np.array(
+    #             [linear_velocity.x, linear_velocity.y, linear_velocity.z]
+    #         ),
+    #     }
+    #     with self.lock:
+    #         self.odom_queue.append((stamp, odom_data))
+    #     # print(f"Odometry received at {stamp}, {len(self.odom_queue)} odometry in queue")
+
+    def get_neighboring_timestamps(self, target_timestamp, all_timestamps):
+        preceding = None
+        succeeding = None
+        
+        sorted_timestamps = sorted(all_timestamps)
+        
+        for t in sorted_timestamps:
+            if t < target_timestamp:
+                preceding = t
+            elif t > target_timestamp:
+                succeeding = t
+                break
+        
+        return preceding, succeeding
+
+    def run(self):
+        while self.running and not rospy.is_shutdown():
+            if not self.gt_timestamps_to_process or not self.synced_image_queue:
+                rospy.sleep(0.01)
+                continue
+
+            with self.lock:
+                all_image_data = list(self.synced_image_queue)
+                all_image_timestamps = [item[0] for item in all_image_data]
+                
+                while self.gt_timestamps_to_process:
+                    obj_id, gt_stamp = self.gt_timestamps_to_process.popleft()
+                    print(f"Processing object {obj_id}")
+                    
+                    preceding, succeeding = self.get_neighboring_timestamps(gt_stamp, all_image_timestamps)
+
+                    if preceding and preceding not in self.keyframes[obj_id]:
+                        # Find the corresponding image message
+                        image_msg = next((msg for stamp, msg in all_image_data if stamp == preceding), None)
+                        if image_msg:
+                            file_name = f"obj_{obj_id}_preceding_{preceding}.jpg"
+                            file_path = os.path.join(self.image_save_dir, file_name)
+                            try:
+                                cv_image = self.bridge.imgmsg_to_cv2(image_msg, "bgr8")
+                                cv2.imwrite(file_path, cv_image)
+                                self.keyframes[obj_id].append(preceding)
+                                print(f"Saved image for object {self.gt_objects[obj_id]['class_name']} at path {file_path}")
+                            except Exception as e:
+                                print(f"Error saving image: {e}")
+                    
+                    # Get image data for succeeding timestamp and save
+                    if succeeding and succeeding not in self.keyframes[obj_id]:
+                        image_msg = next((msg for stamp, msg in all_image_data if stamp == succeeding), None)
+                        if image_msg:
+                            file_name = f"obj_{obj_id}_succeeding_{succeeding}.jpg"
+                            file_path = os.path.join(self.image_save_dir, file_name)
+                            try:
+                                cv_image = self.bridge.imgmsg_to_cv2(image_msg, "bgr8")
+                                cv2.imwrite(file_path, cv_image)
+                                self.keyframes[obj_id].append(succeeding)
+                                print(f"Saved image for object {self.gt_objects[obj_id]['class_name']} {obj_id} at path {file_path}")
+                            except Exception as e:
+                                print(f"Error saving image: {e}")
+            
+            rospy.sleep(0.01)
+
+
+    def handle_save_data(self, req):
+        from copy import deepcopy
+        def convert_numpy_types(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()  # Convert numpy arrays to lists
+            elif isinstance(obj, np.float32):
+                return float(obj)  # Convert numpy float32 to native Python float
+            elif isinstance(obj, np.int32):
+                return int(obj)  # Convert numpy int32 to native Python int
+            elif isinstance(obj, dict):
+                return {key: convert_numpy_types(value) for key, value in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(item) for item in obj]
+            else:
+                return obj
+
+        base_dir = '/ws/external/offline_map'
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = os.path.join(base_dir, timestamp)
+        os.makedirs(save_dir, exist_ok=True)
+        with self.lock:
+            objects_json_path = os.path.join(save_dir, "gt_objects.json")
+            keyframes_json_path = os.path.join(save_dir, "keyframes.json")
+            
+            # 1. Save gt_objects to a JSON file and shared memory
+            gt_objects_serializable = {}
+            for obj_id, obj_data in self.gt_objects.items():
+                gt_objects_serializable[obj_id] = {
+                    "stamps": list(obj_data["stamps"]),
+                    "class_name": obj_data["class_name"],
+                    "position": obj_data["position"],
+                    "orientation": obj_data["orientation"],
+                    "scale": obj_data["scale"]
+                }
+
+            json_objects = convert_numpy_types(gt_objects_serializable)
+            with open(objects_json_path, 'w') as f:
+                json.dump(json_objects, f, indent=2)
+            
+            shm_obj_name = "gt_object_shm"
+            json_str = json.dumps(json_objects)
+            encoded = json_str.encode("utf-8")
+            size = len(encoded)
+            try:
+                existing_shm = shared_memory.SharedMemory(name=shm_obj_name)
+                existing_shm.close()
+                existing_shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            shm = shared_memory.SharedMemory(create=True, size=size, name=shm_obj_name)
+            shm.buf[:size] = encoded
+            shm.close()
+            shm.unlink() 
+            print(f"Saved gt_objects to shared memory '{shm_obj_name}' ({size} bytes)")
+
+            # 2. Save keyframes to a separate JSON file and shared memory
+            keyframes_serializable = {obj_id: list(timestamps) for obj_id, timestamps in self.keyframes.items()}
+            json_keyframes = convert_numpy_types(keyframes_serializable)
+            with open(keyframes_json_path, 'w') as f:
+                json.dump(json_keyframes, f, indent=2)  
+            shm_keyframes_name = "keyframes_shm"
+            json_keyframes_str = json.dumps(json_keyframes)
+            encoded_keyframes = json_keyframes_str.encode("utf-8")
+            size_keyframes = len(encoded_keyframes)
+            try:
+                existing_shm_keyframes = shared_memory.SharedMemory(name=shm_keyframes_name)
+                existing_shm_keyframes.close()
+                existing_shm_keyframes.unlink()
+            except FileNotFoundError:
+                pass    
+            except Exception:
+                pass
+            shm_keyframes = shared_memory.SharedMemory(create=True, size=size_keyframes, name=shm_keyframes_name)
+            shm_keyframes.buf[:size_keyframes] = encoded_keyframes
+            shm_keyframes.close()
+            shm_keyframes.unlink()
+            print(f"Saved keyframes to shared memory '{shm_keyframes_name}' ({size_keyframes} bytes)")
+
+            rospy.loginfo(f'Saved files: {objects_json_path}, {keyframes_json_path}')
+            return EmptyResponse()
+
+
+    def shutdown(self):
+        self.running = False
+        # self.publish_thread.join()
+        self.main_thread.join()
+
+
+if __name__ == "__main__":
+    rospy.init_node("scene_graph_processor")
+    processor = SceneGraphProcessor()
+    rospy.spin()

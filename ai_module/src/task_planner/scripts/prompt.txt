@@ -1,0 +1,159 @@
+# Complete the create_subtasks_by_LLM function.
+
+# Input: A natural language instruction that may include actions like 'goto', 'find', 'count', or 'avoid', along with spatial relations and object descriptions.
+
+# Output: A Plan object containing:
+# - A list of Task objects (plan.steps), representing ordered robot navigation actions
+# - A list of Task objects (plan.constraints), representing global constraints like avoid zones
+
+# Spatial relation examples: 'on', 'under', 'between', 'near', 'above', 'below', 'inside', 'behind', 'next to', 'in front of', 'close to', 'far from', etc.
+
+# Rules to follow:
+# 1. Each occurrence of an entity must be treated as a separate instance with a unique ID, even if the name is the same.
+#    - Example: If "TV" appears twice in the sentence, they must have different Node IDs unless clearly the same physical object.
+# 2. Use compound nouns as whole Node names.
+#    - Example: "coffee table", "potted plant", and "folding screen" should be stored as name='coffee table', not name='table' with attr='coffee'.
+# 3. Use a globally unique incremental integer ID (starting from 0) for each new Node.
+# 4. Node attributes (color, size, shape, subject, etc.) must be stored as a Python dictionary of string keys and list-of-string values under `attr`.
+#    - Example: attr={'color': ['red'], 'shape': ['round']}
+#    - Never use a plain string like attr="red" or attr="blue chair"
+# 5. If the object has negated attributes (e.g., "not red"), use `exclude_attr` as a dictionary of list-of-string values.
+#    - Example: exclude_attr={'color': ['red']} means "not red"
+# 6. Relations must be encoded as Edge(name=<relation>, source_id=<from>, target_ids=[<to1>, <to2>, ...]).
+#    - Example: "folder on the cabinet" → folder →on→ cabinet
+# 7. If a sentence includes 'avoid', add that entity to plan.constraints instead of plan.steps.
+# 8. NEVER pass a string as `entity` when creating a Task. You must always create an Entity object and assign it to `entity`.
+
+# Do not skip or merge any objects. Preserve all objects and relations mentioned in the input.
+
+class Node:
+    def __init__(self, id: int, name: str, is_target: bool = False, attr: dict = None, exclude_attr: dict = None):
+        self.id = id                            # unique id
+        self.name = name                        # example: 'bed', 'picture'
+        self.is_target = is_target              # True or False
+        self.attr = attr or {}                  # example: {'color': ['red'], 'shape': ['round'], 'subject': ['butterfly']}
+        self.exclude_attr = exclude_attr or {}
+
+class Edge:
+    def __init__(self, name: str, source_id: int, target_ids: list[int]):
+        self.name = name                # 'under'
+        self.source_id = source_id      # unique id of source node
+        self.target_ids = target_ids    # list of target ids
+
+class Graph:
+    def __init__(self):
+        self.nodes = []
+        self.edges = []
+
+class Entity:
+    def __init__(self, target_name: str):
+        self.target_name = target_name  # example: 'the bed under the butterfly picture'
+        self.relation_graph = Graph()
+
+    def add_node(self, node: Node):
+        self.relation_graph.nodes.append(node)
+
+    def add_edge(self, edge: Edge):
+        self.relation_graph.edges.append(edge)
+
+class Task:
+    def __init__(self, action: str, entity: Entity):
+        assert action in ['find', 'count', 'goto', 'avoid', 'stop']
+        self.action = action    # action
+        self.entity = entity    # entity
+
+class Plan:
+    def __init__(self):
+        self.constraints = []    # always-valid constraints (e.g., avoid zones)
+        self.steps = []         # ordered list of executable tasks (goto, find, count, etc.)
+        self.type = 0           # 0: find, 1: count 2: instruction following
+
+def example1():
+    question = "Take the path between the TV and the coffee table and move toward the kettle on the dining table, then go to the white potted plant between the curtain and the TV"
+
+    plan = Plan()
+
+    entity1 = Entity(target_name="the path between the TV and the coffee table")
+    entity1.add_node(Node(id=0, name='path', is_target=True))
+    entity1.add_node(Node(id=1, name='TV'))
+    entity1.add_node(Node(id=2, name='coffee table'))
+    entity1.add_edge(Edge(name='between', source_id=0, target_ids=[1, 2]))
+    plan.steps.append(Task(action='goto', entity=entity1))
+
+    entity2 = Entity(target_name="the kettle on the dining table")
+    entity2.add_node(Node(id=3, name='kettle', is_target=True))
+    entity2.add_node(Node(id=4, name='dining table'))
+    entity2.add_edge(Edge(name='on', source_id=3, target_ids=[4]))
+    plan.steps.append(Task(action='goto', entity=entity2))
+
+    entity3 = Entity(target_name="the white potted plant between the curtain and the TV")
+    entity3.add_node(Node(id=5, name='potted plant', is_target=True, attr={'color': ['white']}))
+    entity3.add_node(Node(id=6, name='curtain'))
+    entity3.add_node(Node(id=7, name='TV'))
+    entity3.add_edge(Edge(name='between', source_id=5, target_ids=[6, 7]))
+    plan.steps.append(Task(action='goto', entity=entity3))
+
+    plan.type = 2
+
+    return plan
+
+def example2():
+    question = "First, go near the tea table with the elephant figurine on it, then stop at the red tea table with the horse figurine on it, avoiding between the big chair and the folding screen."
+
+    plan = Plan()
+
+    entity1 = Entity(target_name="the tea table with the elephant figurine on it")
+    entity1.add_node(Node(id=0, name='tea table', is_target=True))
+    entity1.add_node(Node(id=1, name='figurine', attr={'shape': ['elephant']}))
+    entity1.add_edge(Edge(name='on', source_id=1, target_ids=[0]))
+    plan.steps.append(Task(action='goto', entity=entity1))
+
+    entity2 = Entity(target_name="the red tea table with the horse figurine on it")
+    entity2.add_node(Node(id=2, name='tea table', is_target=True, attr={'color': ['red']}))
+    entity2.add_node(Node(id=3, name='figurine', attr={'shape': ['horse']}))
+    entity2.add_edge(Edge(name='on', source_id=3, target_ids=[2]))
+    plan.steps.append(Task(action='stop', entity=entity2))
+
+    entity3 = Entity(target_name="the path between the big chair and the folding screen")
+    entity3.add_node(Node(id=4, name='path', is_target=True))
+    entity3.add_node(Node(id=5, name='chair', attr={'size': ['big']}))
+    entity3.add_node(Node(id=6, name='folding screen'))
+    entity3.add_edge(Edge(name='between', source_id=4, target_ids=[5, 6]))
+    plan.constraints.append(Task(action='avoid', entity=entity3))
+
+    plan.type = 2
+
+    return plan
+
+def example3():
+    question = "How many blue chairs are between the table and the wall?"
+
+    plan = Plan()
+
+    entity1 = Entity(target_name="blue chairs between the table and the wall")
+    entity1.add_node(Node(id=0, name='chair', is_target=True))
+    entity1.add_node(Node(id=1, name='table'))
+    entity1.add_node(Node(id=2, name='wall'))
+    entity1.add_edge(Edge(name='between', source_id=0, target_ids=[1, 2]))
+    plan.steps.append(Task(action='count', entity=entity1))
+
+    plan.type = 1
+
+    return plan
+
+def example4():
+    question = "Find the potted plant on the kitchen island that is closest to the fridge."
+
+    plan = Plan()
+
+    entity1 = Entity(target_name="the potted plant on the kitchen island that is closest to the fridge")
+    entity1.add_node(Node(id=0, name='potted plant', is_target=True))
+    entity1.add_node(Node(id=1, name='kitchen island'))
+    entity1.add_node(Node(id=2, name='fridge'))
+    entity1.add_edge(Edge(name='on', source_id=0, target_ids=[1]))
+    entity1.add_edge(Edge(name='closest', source_id=1, target_ids=[2]))
+    plan.steps.append(Task(action='find', entity=entity1))
+
+    plan.type = 0
+
+    return plan

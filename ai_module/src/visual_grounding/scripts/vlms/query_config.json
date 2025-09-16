@@ -1,0 +1,45 @@
+{
+  "default_timeout": 30.0,
+  "default_priority": 0,
+  "max_queue_size": 50,
+  "max_workers": 3,
+  "query_types": {
+    "inference_query": {
+      "timeout": 30.0,
+      "priority": 0,
+      "description": "Visual inference query",
+      "required_fields": ["keyframes", "options", "target_name", "candidate_object_ids"],
+      "optional_fields": []
+    },
+    "validation_query": {
+      "timeout": 30.0,
+      "priority": 1,
+      "description": "Validation query",
+      "required_fields": ["keyframes", "options", "target_name", "candidate_object_ids"],
+      "optional_fields": []
+    },
+    "path_generation_query": {
+      "timeout": 30.0,
+      "priority": 1,
+      "description": "Path generation query",
+      "required_fields": ["keyframes", "options", "target_name"],
+      "optional_fields": []
+    },
+    "path_evaluation_query": {
+      "timeout": 15.0,
+      "priority": 1,
+      "description": "Path evaluation query",
+      "required_fields": ["keyframes", "options", "target_name"],
+      "optional_fields": []
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  },
+  "monitoring": {
+    "enable_stats": true,
+    "stats_interval": 5.0,
+    "max_response_history": 1000
+  }
+}
