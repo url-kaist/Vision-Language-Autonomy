@@ -1,0 +1,30 @@
+<launch>
+  <arg name="quiet" default="false"/>
+
+  <node pkg="exploration" type="360_clip.py" name="clip_node" output="screen">
+    <param name="use_sim_time" value="false" />
+    <param name="quiet" value="$(arg quiet)"/>
+  </node>
+  <node pkg="exploration" type="filter_scan.py" name="filter_scan_node" output="screen">
+    <param name="use_sim_time" value="false" />
+    <param name="quiet" value="$(arg quiet)"/>
+  </node>
+  <node pkg="exploration" type="frontier_mapping.py" name="frontier_mapping_node" output="screen">
+    <param name="use_sim_time" value="false" />
+  </node>
+  <node pkg="exploration" type="object_navigation.py" name="object_navigation_node" output="screen">
+    <param name="use_sim_time" value="false" />
+    <param name="quiet" value="$(arg quiet)"/>
+  </node>
+
+  <node pkg="exploration" type="astar_planner_py.py" name="astar_planner_node" output="screen">
+    <param name="use_sim_time" value="false" />
+    <param name="quiet" value="$(arg quiet)"/>
+  </node>
+  <!-- <node pkg="exploration" type="path_follower.py" name="path_follower" output="screen">
+  </node> -->
+  
+</launch>
+<!--<node pkg="exploration" type="Keyframe.py" name="Keyframe_node" output="screen">
+    <param name="use_sim_time" value="false" />
+</node> -->

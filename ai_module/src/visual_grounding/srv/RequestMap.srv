@@ -1,0 +1,7 @@
+# Request
+string message
+---
+# Response
+bool success
+string message
+sensor_msgs/PointCloud2 point_cloud

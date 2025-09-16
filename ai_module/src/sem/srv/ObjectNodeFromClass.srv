@@ -1,0 +1,6 @@
+# ObjectNodeFromClass.srv
+
+string object_name
+---
+int32 num_objects
+ObjectNode[] objects

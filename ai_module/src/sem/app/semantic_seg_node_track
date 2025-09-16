@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+
+import rospy
+from sensor_msgs.msg import Image, PointCloud2
+from nav_msgs.msg import Odometry
+from collections import deque
+import threading
+from cv_bridge import CvBridge
+import numpy as np
+import time
+import json
+import torch
+
+# from joblib import Parallel, delayed
+
+# from transformers import CLIPProcessor, CLIPModel
+# import open_clip
+from slam_classes import MapEdgeMapping, MapObjectList, DetectionList
+from mapping import compute_spatial_similarities
+
+from sensor_sync import SensorSyncManager
+from object_detect import ObjectDetector
+from generate_seg_cloud import generate_seg_cloud, generate_color_cloud
+from object_merge import ObjectMerger
+from bg_process import BGProcessor
+from visualize import ROSVisualizer
+
+# from object_node_service import ObjectNodeService
+from utils import (
+    convert_pointcloud2_to_xyz,
+    transform_to_body,
+    cluster_dbscan,
+    voxel_downsample,
+)
+
+scene = "homebuilding2"  # "homebuilding2" #livingroom1 #real
+data_dir = "/ws/external/ai_module/src/sem/config/" + scene + ".json"
+with open(data_dir, "r") as f:
+    data = json.load(f)
+
+from ultralytics import YOLO, SAM
+import cv2
+from visualization_msgs.msg import Marker, MarkerArray
+
+class SceneGraphProcessor:
+    def __init__(self):
+        self.bridge = CvBridge()
+        self.lock = threading.Lock()
+        self.running = True
+
+        # load class/color
+        self.obj_classes = data["object_classes"]
+        self.color_map = data["color_map"]
+        
+        self.model = YOLO("yolov8l-world.pt").to("cuda")
+        self.model.eval()
+        template = "{}"
+        self.classnames = [
+            template.format(name.replace("_", " ")) for name in self.obj_classes
+        ]
+        self.model.set_classes(self.classnames)
+        self.sam_model = SAM("mobile_sam.pt").to("cuda")
+        self.sam_model.eval()
+
+        # queues
+        self.image_queue = deque(maxlen=100)
+        self.cloud_queue = deque(maxlen=100)
+        self.odom_queue = deque(maxlen=200)
+
+        # Modules
+        self.sync_manager = SensorSyncManager(
+            self.image_queue, self.cloud_queue, self.odom_queue
+        )
+        self.detector = ObjectDetector(self.obj_classes, device="cuda")
+        self.merger = ObjectMerger(
+            voxel_downsample_func=voxel_downsample, color_getter=self.get_color
+        )
+        self.bg_processor = BGProcessor(voxel_size=0.1, grid_size=0.1)
+        self.visualizer = ROSVisualizer(get_color_func=self.get_color)
+        
+        # Data
+        self.objects = MapObjectList()
+        # self.detections = DetectionList()
+        self.yolo_results = {}
+        self.detections = {}
+        self.id_remap = {}
+        self.colored_cloud = np.empty((0, 6), dtype=np.float32)
+
+        # Parameters
+        self.iter = 0
+        self.prev_image_stamp = 0
+        self.bg_time = 0.0
+
+        # ROS I/O
+        self.image_sub = rospy.Subscriber(
+            "/camera/image", Image, self.image_callback, queue_size=1
+        )
+        self.cloud_sub = rospy.Subscriber(
+            "/registered_scan", PointCloud2, self.cloud_callback, queue_size=10
+        )
+        self.odom_sub = rospy.Subscriber(
+            "/state_estimation", Odometry, self.odom_callback, queue_size=10
+        )
+
+        # self.object_node_manager = ObjectNodeService(self.objects)
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        print("SceneGraphProcessor initialized....")
+
+        # Start publish thread
+        self.debug_markers = MarkerArray()
+        self.publish_queue = deque(maxlen=100)
+        self.publish_thread = threading.Thread(target=self.publish_loop)
+        self.publish_thread.start()
+
+        # Start sync thread
+        self.sync_thread = threading.Thread(target=self.run)
+        self.sync_thread.start()
+        rospy.on_shutdown(self.shutdown)
+
+    def get_color(self, class_id):
+        if 0 <= class_id < len(self.obj_classes):
+            return self.color_map[class_id]
+        return (255, 255, 255)
+
+    def filter_objects(self, min_detections):
+        for i, obj in enumerate(self.objects):
+            if obj["num_detections"] < min_detections:
+                print(f"❌ Object {obj['id']} removed")
+                self.objects.pop(i)
+
+    def image_callback(self, msg):
+        stamp = msg.header.stamp.to_nsec()
+        image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        results = self.model.track(image, conf=0.5, persist=True)
+        result = results[0]
+        boxes = result.boxes
+        self.yolo_results[stamp] = boxes
+        # new
+        # ids = boxes.id.int().tolist()
+        # classes = boxes.cls.int().tolist()
+        # confs = boxes.conf.cpu().tolist()
+        # print(f"results dir: {result.new}")
+        annotated_frame = result.plot()
+        cv2.imshow("YOLO11 Tracking", annotated_frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            cv2.destroyAllWindows()
+
+        # for id, cls, conf in zip(ids, classes, confs):
+        #     if id not in self.detections:
+        #         self.detections[id] = {
+        #             "id": id,
+        #             "image_stamp": [stamp],
+        #             "class_id": cls,
+        #             "class_name": self.obj_classes[cls],
+        #             "conf": conf,
+        #             "num_detections": 1,
+        #         }
+        #     else:
+        #         det = self.detections[id]
+        #         det["image_stamp"].append(stamp)
+        #         det["conf"] = max(det["conf"], conf)
+        #         det["num_detections"] += 1
+
+        # t6 = time.time()
+
+        # if not self.detections:
+        #     continue
+
+        # if not self.objects:
+        #     self.objects.extend(self.detections)
+        #     continue
+
+        with self.lock:
+            self.image_queue.append((stamp, image))
+
+    def cloud_callback(self, msg):
+        stamp = msg.header.stamp.to_nsec()
+        with self.lock:
+            self.cloud_queue.append((stamp, msg))
+            t1 = time.time()
+            cloud = convert_pointcloud2_to_xyz(msg)
+            # t15 = time.time()
+            self.bg_processor.process_bg_cloud(cloud)
+            t2 = time.time()
+            self.bg_time = t2 - t1
+
+    def odom_callback(self, msg):
+        stamp = msg.header.stamp.to_nsec()
+        position = msg.pose.pose.position
+        orientation = msg.pose.pose.orientation
+        linear_velocity = msg.twist.twist.linear
+        odom_data = {
+            "position": np.array([position.x, position.y, position.z]),
+            "orientation": np.array(
+                [orientation.x, orientation.y, orientation.z, orientation.w]
+            ),
+            "linear_velocity": np.array(
+                [linear_velocity.x, linear_velocity.y, linear_velocity.z]
+            ),
+        }
+        with self.lock:
+            self.odom_queue.append((stamp, odom_data))
+
+    def publish_loop(self):
+        while self.running and not rospy.is_shutdown():
+            if self.publish_queue:
+                marker_array, image_vis, obj_clouds, obj_labels, obj_clouds_color = (
+                    self.publish_queue.popleft()
+                )
+                self.visualizer.obj_marker_pub.publish(marker_array)
+                self.visualizer.publish_debug_markers(self.debug_markers)
+                door_markers = self.visualizer.create_door_markers(self.objects)
+                self.visualizer.door_markers_pub.publish(door_markers)
+                self.visualizer.publish_image(image_vis, self.visualizer.image_pub)
+                self.visualizer.publish_object_cloud(obj_clouds, obj_labels)
+                self.visualizer.publish_bg_cloud(
+                    self.bg_processor.floor_cloud, self.bg_processor.wall_cloud
+                )
+                self.visualizer.publish_object_nodes(self.objects)
+                # self.visualizer.publish_door_nodes(self.objects)
+            rospy.sleep(0.01)
+            
+
+    def run(self):
+        id = 0
+        while self.running and not rospy.is_shutdown():
+            print("\n\n==========================")
+            print(f"----- iter: {self.iter} ----")
+
+            with self.lock:
+                start = time.time()
+                synced = self.sync_manager.get_synced_data()
+                t0 = time.time()
+            if not synced:
+                # if (self.iter != 0) and (not self.image_queue or not self.cloud_queue):
+                # print("Data Finish. Exiting...")
+                # break
+
+                rospy.sleep(0.01)
+                continue
+            # else:
+            # print(f"sync image_stamp: {synced['image_stamp']}")
+
+            # self.sync_manager.clear_old_data(synced["t0"], synced["image_stamp"])
+
+            # if (self.iter != 0) and abs(
+            # synced["image_stamp"] - self.prev_image_stamp
+            # ) < 0.001:
+            # self.filter_objects(20)
+            # print("Data Finish. Exiting...")
+            # rospy.sleep(0.01)
+            # continue
+            # pass
+            self.prev_image_stamp = synced["image_stamp"]
+            self.iter += 1
+            # if self.iter % 5 == 0:
+                # print("==== iter: x5 ====")
+                # self.filter_objects(2)
+            # if self.iter % 11 == 0:
+            #     print("==== iter: x11 ====")
+            #     self.filter_objects(5)
+            # if self.iter % 29 == 0:
+            #     print("==== iter: x29 ====")
+            #     self.filter_objects(6)
+            # if self.iter % 53 == 0:
+            #     print("==== iter: x53 ====")
+            #     self.filter_objects(8)
+
+            t1 = time.time()
+
+            image = synced["image"]
+            image_stamp = synced["image_stamp"]
+            cloud_msg = synced["cloud_msg"]
+            pose = synced["pose"]
+
+            cloud_np = convert_pointcloud2_to_xyz(cloud_msg)
+            cloud = cloud_np[cloud_np[:, 2] > -0.5]
+            R_w2b = pose["rotation"].T
+            t_w2b = -R_w2b @ pose["position"]
+            cloud_body = cloud @ R_w2b.T + t_w2b
+            cloud_body = cloud_body[np.linalg.norm(cloud_body, axis=1) < 5.0]
+
+            t2 = time.time()
+            
+            boxes = self.yolo_results.get(image_stamp, None)
+            if boxes is None or boxes.id is None or boxes.xyxy is None or len(boxes.xyxy) == 0:
+                continue
+            tracking_ids = boxes.id.int().tolist()
+            confs = boxes.conf.cpu().tolist()
+            class_ids = boxes.cls.int().tolist()
+            labels = np.array(class_ids)
+            
+            sam_results = self.sam_model.predict(image.copy(), bboxes=boxes.xyxy.cpu().numpy())
+            masks = sam_results[0].masks.data
+            boxes = []
+            def mask_to_bbox(mask: torch.Tensor):
+                y_indices, x_indices = torch.where(mask)
+                if len(x_indices) == 0 or len(y_indices) == 0:
+                    return None
+                x1, y1 = x_indices.min().item(), y_indices.min().item()
+                x2, y2 = x_indices.max().item(), y_indices.max().item()
+                return [x1, y1, x2, y2]
+            for mask in masks:
+                box = mask_to_bbox(mask)
+                if box:
+                    boxes.append(box)
+
+                
+            # class_ids, boxes, confs, masks = self.detector.infer(image)
+            # if not class_ids:
+            #     continue
+
+            t3 = time.time()
+
+            masks_np = [mask.cpu().numpy() for mask in masks]
+            # labels = np.array(class_ids)
+            projected_image = image.copy()
+            # projected_image1 = image.copy()
+            obj_clouds_world, obj_clouds_color = generate_seg_cloud(
+                cloud_body,
+                masks_np,
+                labels,
+                pose["rotation"],
+                pose["position"],
+                image_src=projected_image,
+                platform="wheelchair",
+            )
+            print(f"obj_clouds_world: {len(obj_clouds_world)}")
+            # cloud_world, cloud_color = generate_color_cloud(
+            #     cloud_body,
+            #     pose["rotation"],
+            #     pose["position"],
+            #     image_src=projected_image1,
+            #     platform="wheelchair",
+            # )
+
+            t5 = time.time()
+
+            # # self.visualizer.publish_colored_point_cloud(cloud_world, cloud_color)
+
+            # self.detections.clear()
+            for i, obj_cloud in enumerate(obj_clouds_world):
+                if obj_cloud.shape[0] < 10:
+                    continue
+                
+                obj_cloud = cluster_dbscan(obj_cloud)
+
+                if obj_cloud.shape[0] < 10:
+                    continue
+                
+                min_pt = np.min(obj_cloud, axis=0)
+                max_pt = np.max(obj_cloud, axis=0)
+                center = np.mean(obj_cloud, axis=0)
+                bbox = np.stack([min_pt, max_pt], axis=0)
+                
+                tracking_id = tracking_ids[i]
+                class_id = class_ids[i]
+                conf = confs[i]
+                iter_num = self.iter
+
+                if tracking_id in self.id_remap:
+                    final_id = self.id_remap[tracking_id]
+                elif tracking_id in self.detections:
+                    final_id = tracking_id
+                else:
+                    final_id = None
+
+                if final_id is not None:
+                    det = self.detections[final_id]
+                    det["image_idx"].append(iter_num)
+                    det["conf"] = max(det["conf"], conf)
+                    det["num_detections"] += 1
+                    det["points"] = np.concatenate((det["points"], obj_cloud), axis=0)
+                    det["center"] = np.mean(det["points"], axis=0)
+                    det["min_bbox"] = np.min(det["points"], axis=0)
+                    det["max_bbox"] = np.max(det["points"], axis=0)
+                    det["bbox"] = np.stack([det["min_bbox"], det["max_bbox"]], axis=0)
+                    det["n_points"] = det["points"].shape[0]
+                    break
+
+                merged_to_id = None
+                for existing_id, det in self.detections.items():
+                    existing_class_id = det["class_id"]
+                    existing_min = det["min_bbox"]
+                    existing_max = det["max_bbox"]
+                    existing_center = det["center"]
+
+                    iou = self.compute_iou_3d(min_pt, max_pt, det["min_bbox"], det["max_bbox"])
+                    center_dist = np.linalg.norm(center - det["center"])
+                    included = self.is_included(min_pt, max_pt, existing_min, existing_max)
+                    
+                    if center_dist < 0.5:
+
+                        if class_id == existing_class_id and iou > 0.3:
+                            merged_to_id = existing_id
+                            reason = "matched_iou"
+                            break
+                        elif class_id == existing_class_id and center_dist < 0.1:
+                            merged_to_id = existing_id
+                            reason = "matched_center"
+                            break
+                        elif class_id == existing_class_id and included:
+                            reason = "matched_include"
+                            merged_to_id = existing_id
+                            break
+                        elif class_id != existing_class_id and iou > 0.8:
+                            reason = "matched_iou_diff"
+                            merged_to_id = existing_id
+                            break
+                        else:
+                            reason = "not_matched"
+                            
+                        markers = self.visualizer.create_merge_debug_markers(
+                            det1={"id": tracking_id, "center": center},
+                            det2={"id": existing_id, "center": det["center"]},
+                            iou=iou, center_dist=center_dist, included=included,
+                            reason=reason
+                        )
+                        self.debug_markers.markers.extend(markers)
+                    
+                if merged_to_id is not None:
+                    self.id_remap[tracking_id] = merged_to_id
+                    det = self.detections[merged_to_id]
+                    det["image_idx"].append(iter_num)
+                    det["conf"] = max(det["conf"], conf)
+                    det["num_detections"] += 1
+                    det["points"] = np.concatenate((det["points"], obj_cloud), axis=0)
+                    det["center"] = np.mean(det["points"], axis=0)
+                    det["min_bbox"] = np.min(det["points"], axis=0)
+                    det["max_bbox"] = np.max(det["points"], axis=0)
+                    det["bbox"] = np.stack([det["min_bbox"], det["max_bbox"]], axis=0)
+                    det["n_points"] = det["points"].shape[0]
+                else:
+                    self.detections[tracking_id] = {
+                        "id": tracking_id,
+                        "image_idx": [iter_num],
+                        "class_id": class_id,
+                        "class_name": self.obj_classes[class_id],
+                        "points": obj_cloud,
+                        "conf": conf,
+                        "num_detections": 1,
+                        "center": center,
+                        "bbox": bbox,
+                        "min_bbox": min_pt,
+                        "max_bbox": max_pt,
+                        "n_points": obj_cloud.shape[0],
+                    }
+        
+            t6 = time.time()
+
+            if not self.detections:
+                continue
+
+            # if not self.objects:
+                # self.objects.extend(self.detections)
+                # continue
+
+            # if not isinstance(self.objects, MapObjectList):  # todo logically not needed
+                # self.objects = MapObjectList(self.objects)
+
+            # spatial_edges = compute_spatial_similarities(self.detections, self.objects)
+            # self.objects = self.merger.merge(
+            #     self.detections, self.objects, spatial_edges, 0.1, 0.3, 0.1
+            # )
+
+            # t8 = time.time()
+
+            # # Visualization
+            marker_array = self.visualizer.create_markers(self.detections)
+            image_vis = self.visualizer.draw_annotated_image(
+                projected_image.copy(),
+                masks_np,
+                boxes,
+                confs,
+                class_ids,
+                self.obj_classes,
+            )
+            # image_vis = projected_image.copy()
+
+            obj_clouds = []
+            obj_labels = []
+
+            # for obj in self.objects:
+                # if obj["num_detections"] < 5:
+                    # continue
+                # obj_clouds.append(obj["points"])
+                # obj_labels.append(obj["class_id"])
+                
+            # for det in self.detections.values():
+                # if det["num_detections"] < 5:
+                    # continue
+                # obj_clouds.append(det["points"])
+                # obj_labels.append(det["class_id"])
+
+            self.publish_queue.append(
+                (marker_array, image_vis, obj_clouds, obj_labels, obj_clouds_color)
+            )
+
+            t9 = time.time()
+            
+            self.sync_manager.clear_queues()
+            
+            print(f"0. BG: {self.bg_time:.3f} sec")
+            print(f"1. SYNC: {t0 - start:.3f} sec")
+            print(f"2. FILTER: {t1 - start:.3f} sec")
+            print(f"3. TF: {t2 - t1:.3f} sec")
+            print(f"4. YOLOSAM: {t3 - t2:.3f} sec")
+            print(f"5. PROJ: {t5 - t3:.3f} sec")
+            print(f"6. DETECT: {t6 - t5:.3f} sec")
+            # print(f"7. MERGE: {t8 - t6:.3f} sec")
+            print(f"8. PUBLISH: {t9 - t6:.3f} sec")
+            print(f"\033[93m9. TOTAL: {t9 - start:.3f} sec\033[0m")
+            
+    def compute_iou_3d(self, min1, max1, min2, max2):
+        inter_min = np.maximum(min1, min2)
+        inter_max = np.minimum(max1, max2)
+        inter_size = np.clip(inter_max - inter_min, a_min=0, a_max=None)
+        inter_vol = np.prod(inter_size)
+
+        vol1 = np.prod(max1 - min1)
+        vol2 = np.prod(max2 - min2)
+        union_vol = vol1 + vol2 - inter_vol
+
+        if union_vol <= 0:
+            return 0.0
+        return inter_vol / union_vol
+    
+    def is_included(self, min1, max1, min2, max2):
+        return (
+            np.all(min1 >= min2) and np.all(max1 <= max2)
+        ) or (
+            np.all(min2 >= min1) and np.all(max2 <= max1)
+        )
+
+
+    def shutdown(self):
+        self.running = False
+        self.publish_thread.join()
+        self.sync_thread.join()
+
+
+if __name__ == "__main__":
+    rospy.init_node("scene_graph_node")
+    processor = SceneGraphProcessor()
+    rospy.spin()

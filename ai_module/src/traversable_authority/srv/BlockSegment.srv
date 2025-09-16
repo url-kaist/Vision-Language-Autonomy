@@ -1,0 +1,6 @@
+float64[2] center1     # [x, y]
+float64[2] center2     # [x, y]
+float64   radius       # [m]
+---
+bool success
+string message

@@ -1,0 +1,37 @@
+<launch>
+    <arg name="quiet" default="false"/>
+    <arg name="real_world" default="true"/>
+
+    <!-- Topic name arguments (only used if real_world=true) -->
+    <arg name="sensor_scan_topic" default="/velodyne_points"/>
+    <arg name="registered_scan_topic" default="/velodyne_points"/>
+    <arg name="camera_image_topic" default="/camera/image/compressed"/>
+    <arg name="odom_topic" default="/odom"/>
+    <arg name="robot_pose_topic" default="/robot_pose"/>
+    <arg name="navigation_goal_topic" default="/move_base_simple/goal"/>
+    <arg name="cmd_vel_topic" default="/UGV2/jackal_velocity_controller/cmd_vel"/>
+    <arg name="robot_type" default="jackal"/>
+
+    <!-- Real-world topic remapping (only if real_world=true) -->
+    <group if="$(arg real_world)">
+        <remap from="/sensor_scan" to="$(arg sensor_scan_topic)"/>
+        <remap from="/registered_scan" to="$(arg registered_scan_topic)"/>
+        <remap from="/camera/image" to="$(arg camera_image_topic)"/>
+        <remap from="/state_estimation" to="$(arg odom_topic)"/>
+        <remap from="/state_estimation_at_scan" to="/state_estimation_at_scan"/>
+        <remap from="/state_estimation_pose_at_scan" to="$(arg robot_pose_topic)"/>
+        <remap from="/way_point_with_heading" to="$(arg navigation_goal_topic)"/>
+        <remap from="/cmd_vel" to="$(arg cmd_vel_topic)"/>
+        <remap from="~cmd_vel"  to="$(arg cmd_vel_topic)"/>
+        <remap from="/cmd_vel"  to="$(arg cmd_vel_topic)"/>
+        
+        <param name="deployment/environment" value="real_world"/>
+        <param name="deployment/robot_type" value="$(arg robot_type)"/>
+
+        <arg name="quiet" default="false"/>
+
+        <node name="task_planner_server" pkg="task_planner" type="task_planner_server.py" output="screen">
+            <param name="quiet" value="$(arg quiet)"/>
+        </node>
+    </group>
+</launch>

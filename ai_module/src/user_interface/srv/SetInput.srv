@@ -1,0 +1,7 @@
+# Request
+string instructions
+time current_time
+---
+# Response
+bool success
+string message

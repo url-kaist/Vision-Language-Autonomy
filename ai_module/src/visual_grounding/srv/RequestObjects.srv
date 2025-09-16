@@ -1,0 +1,7 @@
+# Request
+string message
+---
+# Response
+bool success
+string message
+visual_grounding/DetectedObject[] objects

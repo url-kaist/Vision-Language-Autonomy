@@ -1,0 +1,12 @@
+<launch>
+<!-- Test Parameters -->
+    <arg name="scene" default="home_building_2"/>
+    <arg name="question_type" default="object_reference"/>
+    <arg name="question_id" default="0"/>
+
+    <node name="benchmark_runner" pkg="benchmark" type="benchmark_runner_node.py" output="screen">
+        <param name="scene" value="$(arg scene)"/>
+        <param name="question_type" value="$(arg question_type)"/>
+        <param name="question_id" value="$(arg question_id)"/>
+    </node>
+</launch>

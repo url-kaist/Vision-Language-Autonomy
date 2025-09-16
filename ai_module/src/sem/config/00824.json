@@ -1,0 +1,21 @@
+{
+  "object_classes": [
+    "door frame", "rug", "couch", "sofa chair", "fireplace", "shelf", "podium", "decoration", "flower vase",
+    "flower pot", "book", "picture", "lamp", "table", "step", "fan",
+    "pillow", "window", "painting", "ceiling duct", "chair", "plate",
+    "carpet", "door", "mirror", "desk", "stool", "refrigerator", "cabinet", "sink", "tray",
+    "bench", "bowl", "stove", "microwave", "oven", "towel", "kitchen extractor",
+    "dishwasher", "fire alarm", "bed", "rack", "toilet", "air conditioner", "bathtub", "shower curtain",
+    "trash can", "toilet brush", "toilet paper dispenser", "tissue box", "wardrobe"
+  ],
+  "color_map": [
+    [255, 255, 255], [0, 0, 255], [255, 255, 0], [0, 255, 0], [255, 0, 0], [128, 0, 128], [0, 255, 255], 
+    [255, 165, 0], [255, 192, 203], [255, 0, 255], [0, 128, 128], [255, 105, 180], [165, 42, 42], [139, 69, 19], 
+    [70, 130, 180], [152, 251, 152], [0, 100, 0], [85, 107, 47], [72, 61, 139], [100, 149, 237], [0, 0, 139], 
+    [60, 179, 113], [119, 136, 153], [255, 0, 0], [210, 180, 140], [218, 165, 32], [189, 183, 107], [244, 164, 96], 
+    [255, 218, 185], [205, 133, 63], [184, 134, 11], [46, 139, 87], [32, 178, 170], [135, 206, 250], [106, 90, 205], 
+    [20, 175, 20], [255, 0, 255], [255, 0, 0], [255, 165, 0], [255, 192, 203], [0, 128, 128], [186, 163, 42], 
+    [90, 168, 183], [179, 28, 28], [28, 99, 53], [136, 99, 104], [156, 149, 38], [227, 202, 7], [97, 37, 73], 
+    [83, 167, 104], [255, 31, 105]
+  ]
+}

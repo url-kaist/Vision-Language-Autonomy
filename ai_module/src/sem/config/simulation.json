@@ -1,0 +1,6 @@
+{
+  "classnames": [],
+  "image_topic": "/camera/image",
+  "lidar_topic": "/registered_scan",
+  "odom_topic": "/state_estimation"
+}

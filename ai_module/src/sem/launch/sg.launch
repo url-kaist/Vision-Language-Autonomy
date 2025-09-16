@@ -1,0 +1,42 @@
+<launch>
+    <arg name="quiet" default="false"/>
+    <arg name="debug" default="false"/>
+    <arg name="real_world" default="false"/>
+
+    <group if="$(arg real_world)">
+        <arg name="config" default="/ws/external/ai_module/src/sem/config/real_robot.json"/>
+
+        <remap from="/sensor_scan" to="/cloud_registered_body"/>
+        <remap from="/registered_scan" to="/cloud_registered_body"/>
+        <remap from="/camera/image" to="/theta_driver_node/image/compressed"/>
+        <remap from="/state_estimation" to="/Odometry"/>
+
+        <node name="traversable_authority" pkg="traversable_authority" type="traversable_authority_node.py" output="screen">
+            <param name="quiet" value="$(arg quiet)"/>
+            <param name="real_world" value="$(arg real_world)"/>
+        </node>
+        <node pkg="sem" type="scene_graph_node" name="scene_graph_node" output="screen" required="true">
+            <param name="quiet" value="$(arg quiet)"/>
+            <param name="config" value="$(arg config)"/>
+            <param name="debug" value="$(arg debug)"/>
+            <param name="real_world" value="$(arg real_world)"/>
+        </node>
+        <node pkg="rviz" type="rviz" name="rvizSG" args="-d $(find sem)/rviz/scene_graph.rviz" respawn="true"/>
+    </group>
+
+    <group unless="$(arg real_world)">
+        <arg name="config" default="/ws/external/ai_module/src/sem/config/simulation.json"/>
+
+        <node name="traversable_authority" pkg="traversable_authority" type="traversable_authority_node.py" output="screen">
+            <param name="quiet" value="$(arg quiet)"/>
+            <param name="real_world" value="$(arg real_world)"/>
+        </node>
+        <node pkg="sem" type="scene_graph_node" name="scene_graph_node" output="screen" required="true">
+            <param name="quiet" value="$(arg quiet)"/>
+            <param name="config" value="$(arg config)"/>
+            <param name="debug" value="$(arg debug)"/>
+            <param name="real_world" value="$(arg real_world)"/>
+        </node>
+        <!-- <node pkg="rviz" type="rviz" name="rvizSG" args="-d $(find sem)/rviz/scene_graph.rviz" respawn="true"/> -->
+    </group>
+</launch>
