@@ -1380,6 +1380,13 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         if self.status != Status.COMPLETED:
             self.logger.loginfo("<timeout_callback> Timeout signal received #############")
             self.answer_result = self.agg_results.best_answer
+            if self.answer_result is None:
+                if self.action == 'find':
+                    self.answer_result = random.choice(list(self.sg.get_candidate_entities('object').ids))
+                elif self.action == 'count':
+                    self.answer_result = random.randint(2, 6)
+                else:
+                    raise NotImplementedError(f"self.action must be in ['find', 'count'], but {self.action} was given.")
             self.answer_the_question(self.answer_result)
         else:
             self.answer_the_question(self.answer_result)
