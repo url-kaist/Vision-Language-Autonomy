@@ -57,6 +57,7 @@ from visual_grounding.srv import SetSubplans, SetSubplansResponse
 from std_srvs.srv import Trigger, TriggerResponse
 
 ANSWER_TYPE = {'find': Marker, 'count': Int32}
+ANSWER_TOPIC_NAME = {'find': 'selected_object_marker', 'count': '/numerical_response'}
 
 class EntityType:
     OBJECT = "object"
@@ -555,7 +556,7 @@ class BaseVisualGrounder(BaseModel):
         )
 
         action = self.action
-        self.answer_pub = rospy.Publisher('/answer', ANSWER_TYPE.get(action, String), queue_size=1)
+        self.answer_pub = rospy.Publisher(ANSWER_TOPIC_NAME.get(action, '/answer'), ANSWER_TYPE.get(action, String), queue_size=1)
 
         """ LLM Client """
         self.default_inference_options['prompt'].update({'action': action, 'rtype': 'inference'})
@@ -1382,7 +1383,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.answer_result = self.agg_results.best_answer
             if self.answer_result is None:
                 if self.action == 'find':
-                    self.answer_result = random.choice(list(self.sg.get_candidate_entities('object').ids))
+                    self.answer_result = random.choice(list(self.sg.get_candidate_entities('object', include_untracked=False).ids))
                 elif self.action == 'count':
                     self.answer_result = random.randint(2, 6)
                 else:
@@ -1513,7 +1514,9 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.logger.loginfo(f"<process.1> New EIDs are given: {eids} (GID={gid})")
         except queue.Empty:
             if self.action == 'find':
-                candidate_eids = self.sg.get_candidate_entities('object').ids  # TODO:
+                candidate_eids1 = self.sg.get_candidate_entities('object').ids
+                candidate_eids2 = self.sg.get_candidate_entities('detection', include_untracked=False).ids
+                candidate_eids = list(set(candidate_eids1 + candidate_eids2))
                 pending_eids = sorted(
                     [
                         eid for eid in candidate_eids
@@ -1735,7 +1738,9 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                         self._empty_path_since[current_gid] = now
                         self.logger.loginfo(f"<navigate.bump> Start empty-path timer for GID({current_gid})")
                     else:
-                        candidate_eids = self.sg.get_candidate_entities('object').ids  # TODO: 'object' -> 'all'
+                        candidate_eids1 = self.sg.get_candidate_entities('object').ids
+                        candidate_eids2 = self.sg.get_candidate_entities('detection').ids
+                        candidate_eids = list(set(candidate_eids1 + candidate_eids2))
                         pending_eids = sorted(
                             [
                                 eid for eid in candidate_eids
