@@ -1,0 +1,9 @@
+{
+  "NUM_CLIENTS": 1,
+  "OPENAI_API_KEY0": "INSERT YOUR API KEY",
+  "MODEL_NAME": "gpt-4o",
+  "VG_LOG_DIR": "/ws/external/vis",
+  "MAX_WORKERS": 1,
+  "YOLO_MODEL_SIZE": "x",
+  "YOLO_CONFIDENCE": 0.3
+}
