@@ -649,10 +649,10 @@ class SceneGraphProcessor:
                     reason = "close_pts"
                 else:
                     continue
-                point_i = cluster_dbscan(det_i["points"], 0.1, 3)
-                point_j = cluster_dbscan(det_j["points"], 0.1, 3)
-                merged_pts = np.vstack([point_i, point_j])
-                # merged_pts = cluster_dbscan(merged_pts, 0.2, 5)
+                #point_i = cluster_dbscan(det_i["points"], 0.1, 3)
+                #point_j = cluster_dbscan(det_j["points"], 0.1, 3)
+                merged_pts = np.vstack([det_i["points"], det_j["points"]])
+                merged_pts = cluster_dbscan(merged_pts, 0.3, 5)
 
                 merged_class_ids = dict()
                 for cid in det_i["class_ids"]:
@@ -1063,7 +1063,7 @@ class SceneGraphProcessor:
                 continue
 
             self.logger.log(f"\n--- Iteration {iter} ---")
-            self.merge_detections_every_n_iter(iter, 10)
+            self.merge_detections_every_n_iter(iter, 15)
             iter += 1
             stamp, boxes = self.get_latest_blocking(self.yolo_queue)
             with self.lock:
