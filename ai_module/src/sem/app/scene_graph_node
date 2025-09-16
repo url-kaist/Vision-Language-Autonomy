@@ -87,10 +87,6 @@ from ai_module.src.utils.logger import Logger
 MODEL_WEIGHTS_DIR = "/ws/external/ai_module/src/model_weights"
 
 scene = "scene"
-
-room_names = ["a photo of living room", "a photo of kitchen", "a photo of bedroom", "a photo of bathroom", "a photo of garage"]
-room_labels = ["living room", "kitchen", "bedroom", "bathroom", "garage"]
-
 import multiprocessing as mp
 import queue as pyqueue
 mp.set_start_method('spawn', force=True)
@@ -154,8 +150,7 @@ class SceneGraphProcessor:
         # data
         self.obj_classes = MATTERPORT_LABELS_160
         self.color_map = {i + 1: color for i, color in enumerate(MATTERPORT_COLOR_MAP_160.values())}
-        self.room_names = room_names
-        self.room_labels = room_labels
+        
         
         # perception
         try:
@@ -211,15 +206,9 @@ class SceneGraphProcessor:
         self.sg_graph = nx.DiGraph()
         self.sg_graph.add_node(scene, type="building", name=scene, position=[0, 0, 0])
 
-        self.current_room_id = 0
-        self.current_room_label = None
-        self.room_nodes = set()
-        self.room_label_seq = []
-        # self.add_room_node(self.current_room_id)
 
         self.keyframe_counter = 0
         self.place_positions = {}
-        self.place_room_map = {}
         self.last_keyframe_id = 0
         self.last_keyframe_pose = None
         
@@ -781,10 +770,19 @@ class SceneGraphProcessor:
                 [self.objects[new_id]["min_bbox"], self.objects[new_id]["max_bbox"]], axis=0)
             
         else:
-            del self.objects[new_id]
+            #self.missing_objects[new_id] = self.objects[new_id].copy()
             if f"object_{new_id}" in self.sg_graph:
+            #    det = self.sg_graph.nodes[f"object_{new_id}"]
                 self.objects.pop(f"object_{new_id}", None)
+            #    self.sg_graph.add_node(f"missing_object_{new_id}",
+            #                type="missing_object",
+            #                instance_id=new_id,
+            #                class_name=det["class_name"],
+            ##                yolo_confs=det["yolo_conf"],
+             #               bbox_by_kf=det["bbox_by_kf"],
+             #           )
                 self.sg_graph.remove_node(f"object_{new_id}")
+            del self.objects[new_id]
 
 
     def position_changed_enough(self, cur_pose, prev_pose, keyframe_dist=1.5, keyframe_deg=400.0):
@@ -816,49 +814,6 @@ class SceneGraphProcessor:
                     break
         return exist
 
-    def classify_room(self, image):
-        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        pil_img = PILImage.fromarray(img_rgb)
-        clip_input = self.clip_preprocess(pil_img).unsqueeze(0).to("cuda")  # (1, 3, H, W)
-
-        with torch.no_grad():
-            image_features = self.clip_model.encode_image(clip_input)         # (1, 512)
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
-        img_feat = image_features.cpu().squeeze(0)  # (512,)
-
-        scores = {}
-        for idx, room_label in enumerate(self.room_labels):
-            text_feat = self.room_text_embeddings[idx]  # (512,)
-            sim = torch.cosine_similarity(img_feat.unsqueeze(0), text_feat.unsqueeze(0)).item()
-            scores[room_label] = sim
-
-        best_label = max(scores, key=scores.get)
-        # if max(scores.values()) < 0.13:
-            # best_label = "unknown"
-        return {
-            "image_embedding": img_feat,
-            "scores": scores,
-            "best_label": best_label
-        }
-
-    def add_room_node(self, room_id, room_label, center_pos=[0, 0, 0]):
-        node_id = f"room_{room_id}"
-        if node_id not in self.sg_graph:
-            self.sg_graph.add_node(node_id, type="room", label=room_label, position=center_pos)
-            self.sg_graph.add_edge(scene, node_id, type="building_edge")
-            self.room_nodes.add(room_id)
-
-    def update_room_center(self, room_id):
-        node_id = f"room_{room_id}"
-        places_in_room = [place_id for place_id, rm_id in self.place_room_map.items() if rm_id == room_id]
-        if not places_in_room:
-            return
-        positions = np.array([self.place_positions[place_id] for place_id in places_in_room])
-        center = np.mean(positions, axis=0)
-        if node_id in self.sg_graph.nodes:
-            self.sg_graph.nodes[node_id]["position"] = center
-
     def get_connected_objects(self, place_id):
         place_node = f"place_{place_id}"
         connected_objects = set()
@@ -870,78 +825,6 @@ class SceneGraphProcessor:
 
         return connected_objects
 
-    def get_room_connected_objects(self, room_id):
-        room_objects = set()
-
-        for place_id, mapped_room_id in self.place_room_map.items():
-            if mapped_room_id == room_id:
-                place_objects = self.get_connected_objects(place_id)
-                room_objects.update(place_objects)
-
-        return room_objects
-
-    def check_object_overlap(self, place_id1, place_id2, min_overlap=1):
-
-        room_id1 = self.place_room_map.get(place_id1, None)
-        if room_id1 is not None:
-            objects1 = self.get_room_connected_objects(room_id1)
-            self.logger.log(f"[OVERLAP] Place {place_id1} has room {room_id1} -> using room objects ({len(objects1)} unique objects)")
-        else:
-            objects1 = self.get_connected_objects(place_id1)
-            self.logger.log(f"[OVERLAP] Place {place_id1} has no room -> using place objects ({len(objects1)} objects)")
-
-        room_id2 = self.place_room_map.get(place_id2, None)
-        if room_id2 is not None:
-            objects2 = self.get_room_connected_objects(room_id2)
-            self.logger.log(f"[OVERLAP] Place {place_id2} has room {room_id2} -> using room objects ({len(objects2)} unique objects)")
-        else:
-            objects2 = self.get_connected_objects(place_id2)
-            self.logger.log(f"[OVERLAP] Place {place_id2} has no room -> using place objects ({len(objects2)} objects)")
-
-        # if len(objects1) <= min_overlap or len(objects2) <= min_overlap:
-            # self.logger.log(f"[OVERLAP] Auto-allow: one side has ≤1 objects ({len(objects1)}, {len(objects2)})")
-            # self.logger.log(f"[OVERLAP] Overlap count: infinity (threshold: {min_overlap})")
-            # return True, float('inf')
-
-        overlapped_objects = objects1.intersection(objects2)
-        overlap_count = len(overlapped_objects)
-
-        # self.logger.log(f"[OVERLAP] Overlapped objects: {sorted(list(overlapped_objects))}")
-        self.logger.log(f"[OVERLAP] Overlap count: {overlap_count} (threshold: {min_overlap})")
-        return overlap_count >= min_overlap, overlap_count
-
-    def find_closest_same_room_place(self, place_center, current_room_label, threshold=1.0):
-        cx, cy = place_center[0], place_center[1]
-        min_dist2 = float('inf')
-        closest_place_id = None
-
-        if not self.place_positions:
-            return None
-        last_place_id = max(self.place_positions.keys()) - 1
-
-        for place_id, pos in self.place_positions.items():
-            node_name = f"place_{place_id}"
-            if node_name not in self.sg_graph.nodes:
-                continue
-            if place_id >= last_place_id:
-                continue
-
-            node = self.sg_graph.nodes[node_name]
-
-            if node.get("room_label") != current_room_label:
-                continue
-
-            x, y = pos[0], pos[1]
-            dist2 = (cx - x)**2 + (cy - y)**2
-            if dist2 == 0.0:
-                continue
-            if dist2 < min_dist2 and dist2 <= threshold**2:
-                min_dist2 = dist2
-                closest_place_id = place_id
-
-        self.logger.log(f"closest dist {min_dist2:.3f} with label {current_room_label} -> {closest_place_id is not None}")
-
-        return closest_place_id
 
     def add_keyframe_and_place_node(self, position, room_label, place_center, image=None, pose=None, detections=None):
         #REVISED_0910 (delete 1 line)
@@ -960,16 +843,9 @@ class SceneGraphProcessor:
         self.sg_graph.add_node(cur_place_node,
                                type="place",
                                position=place_center,
-                            #    room_label=room_label["best_label"],
-                            #    room_scores=room_label["scores"],
                                image_path=self.image_path.format(cur_place_node),
                                pose=pose, detections=detections, # DSHONG
                                correct=True)
-        # self.place_positions[keyframe_id] = place_center
-
-        # if self.last_keyframe_id is not None:
-        #     prev_place_node = f"place_{self.last_keyframe_id}"
-        #     self.sg_graph.add_edge(prev_place_node, cur_place_node, type="traversable_edge")
         return keyframe_id
     
     def add_current_keyframe(self, position, room_label, place_center, image=None, pose=None, detections=None): # JAY        
@@ -1038,128 +914,6 @@ class SceneGraphProcessor:
             cv2.imwrite(self.image_path.format(cur_place_node), image)
             self.logger.log(f"Saved keyframe image: {self.image_path.format(cur_place_node)}")
 
-    def connect_room_and_place(self, keyframe_id, cur_room_id, room_label, place_center):
-        cur_place_node = f"place_{keyframe_id}"
-        cur_room_node = f"room_{cur_room_id}"
-        prev_place_node = f"place_{self.last_keyframe_id}"
-        cur_room_node = f"room_{cur_room_id}"
-        new_room_id = cur_room_id
-        new_room_label = room_label["best_label"]
-
-        if new_room_label == self.current_room_label:
-            self.logger.log(f"[KF {keyframe_id}] CUR: {self.current_room_label} / SAME ROOM LABEL: {new_room_label}")
-            if self.sg_graph.nodes[cur_room_node]["label"] != new_room_label:
-                # create new room node
-                max_room_id = max(self.room_nodes) if self.room_nodes else 0
-                new_room_id = max_room_id + 1
-                self.add_room_node(new_room_id, new_room_label)
-                self.place_room_map[keyframe_id] = new_room_id
-                self.place_room_map[self.last_keyframe_id] = new_room_id
-                self.sg_graph.nodes[prev_place_node]["correct"] = True
-                new_room_node = f"room_{new_room_id}"
-                self.sg_graph.add_edge(new_room_node, prev_place_node, type="room_edge", correct=True)
-                self.sg_graph.add_edge(new_room_node, cur_place_node, type="room_edge", correct=True)
-                self.current_room_id = new_room_id
-                self.logger.log(f"[KF {keyframe_id}] CREATED new room {new_room_id} with label {new_room_label} for current and previous place)")
-
-            else:
-                self.sg_graph.add_edge(cur_room_node, cur_place_node, type="room_edge", correct=True)
-                self.place_room_map[keyframe_id] = cur_room_id
-                self.logger.log(f"[KF {keyframe_id}] CONNECTED current place to current room {cur_room_id} with label {new_room_label}")
-
-
-        else:
-            self.logger.log(f"[KF {keyframe_id}] CUR: {self.current_room_label} / DIFF ROOM LABEL: {new_room_label}")
-            self.current_room_label = new_room_label
-            self.sg_graph.nodes[cur_place_node]["correct"] = False
-
-
-        closest_place_id = self.find_closest_same_room_place(place_center, new_room_label, 2.0)
-        if closest_place_id is not None:
-            # has_overlap, overlap_count = self.check_object_overlap(keyframe_id, closest_place_id)
-
-            # if not has_overlap:
-            #     self.logger.log(f"[KF {keyframe_id}] SKIPPED connection ({overlap_count} < 1)")
-            #     self.logger.log("\n")
-            #     self.update_room_center(self.current_room_id)
-            #     return
-
-            # self.logger.log(f"[KF {keyframe_id}] Object overlap check passed ({overlap_count} >= 1)")
-
-            # current place node has room edge and closest place node has room edge but not connected -> merged
-            if self.place_room_map.get(keyframe_id, None) is not None \
-                and self.place_room_map.get(closest_place_id, None) is not None \
-                and self.place_room_map[closest_place_id] != new_room_id:
-                # merge to room node of closest place node
-                closest_room_id = self.place_room_map[closest_place_id]
-                closest_room_node = f"room_{closest_room_id}"
-                new_room_node = f"room_{new_room_id}"
-                if new_room_node in self.sg_graph:
-                    self.sg_graph.remove_node(new_room_node)
-                    self.room_nodes.discard(new_room_id)
-                    self.logger.log(f"REMOVE CUR ROOM NODE {new_room_node} with label {new_room_label}")
-
-                for pid, rid in self.place_room_map.items():
-                    if rid == new_room_id:
-                        self.place_room_map[pid] = closest_room_id
-                        self.sg_graph.add_edge(closest_room_node, f"place_{pid}", type="room_edge", correct=True)
-
-                self.current_room_id = closest_room_id
-                self.logger.log(f"[KF {keyframe_id}] MERGED to closest place {closest_place_id} in room {closest_room_id} with label {new_room_label}")
-
-            elif self.place_room_map.get(keyframe_id, None) is not None \
-                and self.place_room_map.get(closest_place_id, None) is None:
-                # connect closest place node to current room node
-                closest_place_node = f"place_{closest_place_id}"
-                self.sg_graph.add_edge(closest_place_node, cur_place_node, type="near_edge")
-
-                self.place_room_map[closest_place_id] = new_room_id
-                self.sg_graph.nodes[closest_place_node]["correct"] = True
-                self.sg_graph.add_edge(cur_room_node, closest_place_node, type="near1_edge", correct=True)
-
-                self.logger.log(f"[KF {keyframe_id}] CONNECTED closest place {closest_place_id} to current place {keyframe_id} in room {new_room_id} with label {new_room_label}")
-
-            elif self.place_room_map.get(keyframe_id, None) is None \
-                and self.place_room_map.get(closest_place_id, None) is not None:
-                # connect current place node to closest place node
-                closest_place_node = f"place_{closest_place_id}"
-                self.sg_graph.add_edge(cur_place_node, closest_place_node, type="near_edge")
-
-                closest_room_id = self.place_room_map[closest_place_id]
-                self.place_room_map[keyframe_id] = closest_room_id
-                self.sg_graph.nodes[cur_place_node]["correct"] = True
-                closest_room_node = f"room_{closest_room_id}"
-                self.sg_graph.add_edge(closest_room_node, cur_place_node, type="near1_edge", correct=True)
-
-                self.current_room_id = closest_room_id
-
-                self.logger.log(f"[KF {keyframe_id}] CONNECTED current place {keyframe_id} to closest place {closest_place_id} in room {closest_room_id} with label {new_room_label}")
-
-            elif self.place_room_map.get(keyframe_id, None) is None \
-                and self.place_room_map.get(closest_place_id, None) is None:
-                closest_place_node = f"place_{closest_place_id}"
-                self.sg_graph.add_edge(closest_place_node, cur_place_node, type="near_edge")
-
-                # create new room node
-                max_room_id = max(self.room_nodes) if self.room_nodes else 0
-                new_room_id = max_room_id + 1
-                self.add_room_node(new_room_id, new_room_label)
-                self.place_room_map[keyframe_id] = new_room_id
-                self.place_room_map[closest_place_id] = new_room_id
-                self.sg_graph.nodes[cur_place_node]["correct"] = True
-                self.sg_graph.nodes[closest_place_node]["correct"] = True
-                new_room_node = f"room_{new_room_id}"
-                self.sg_graph.add_edge(new_room_node, cur_place_node, type="near1_edge", correct=True)
-                self.sg_graph.add_edge(new_room_node, closest_place_node, type="near1_edge", correct=True)
-
-                self.current_room_id = new_room_id
-
-                self.logger.log(f"[KF {keyframe_id}] CREATED new room {new_room_id} with label {new_room_label} for current place {keyframe_id} and closest place {closest_place_id}")
-
-
-        self.logger.log("\n")
-
-        self.update_room_center(self.current_room_id)
 
     def add_object_nodes_for_place_node(self, keyframe_id, detections, missing_detections):
         place_node = f"place_{keyframe_id}"            
@@ -1245,28 +999,6 @@ class SceneGraphProcessor:
                 # self.logger.log(f"add close edge for existing object {det_id} (temp X) at {keyframe_node}")
                 continue
 
-            if dist < 3.0:
-                old_kf = node_data["closest_temp_place"]
-                if old_kf is not None and self.sg_graph.has_edge(old_kf, object_node):
-                    self.sg_graph.remove_edge(old_kf, object_node)
-                self.sg_graph.add_edge(place_node, object_node,
-                                       type="close_edge", distance=dist)
-                node_data["has_close_place"] = True
-                node_data["closest_temp_dist"] = dist
-                node_data["closest_temp_place"] = place_node
-                # self.logger.log(f"add close edge for existing object {det_id} (temp O) at {keyframe_node}")
-            else:
-                if dist < node_data["closest_temp_dist"]:
-                    old_kf = node_data["closest_temp_place"]
-                    if old_kf is not None and self.sg_graph.has_edge(old_kf, object_node):
-                        self.sg_graph.remove_edge(old_kf, object_node)
-                    self.sg_graph.add_edge(place_node, object_node,
-                                        type="temporary_edge", distance=dist)
-                    node_data["closest_temp_dist"] = dist
-                    node_data["closest_temp_place"] = place_node
-                    # self.logger.log(f"add temp edge for existing object {det_id} (temp O) at {keyframe_node}")
-
-                    # print(f"add temp edge for existing object {det_id} (temp O) at {keyframe_node}")
 
         with self.lock:
             for i, det in enumerate(missing_detections):
@@ -1435,15 +1167,7 @@ class SceneGraphProcessor:
             )
             masks = sam_results[0].masks.data
             masks_np = []
-            # for i, box in enumerate(boxes.xyxy):
-            #     kernel_width = int((box[2]-box[0])/4)
-            #     if kernel_width > 10:
-            #         kernel = np.ones((1, kernel_width), np.uint8)
-            #         eroded_mask = cv2.erode(masks[i].cpu().numpy().astype(np.uint8), kernel, iterations=1)
-            #         masks_np.append(eroded_mask)
-            #     else:
-            #         masks_np.append(masks[i].cpu().numpy())
-
+            
             sam_boxes = []
             masks_np = np.array(masks.cpu().numpy())
 
@@ -1523,21 +1247,6 @@ class SceneGraphProcessor:
             new_detected_num = 0
             track_fail_num = 0
 
-            # with self.lock:
-            #     for m in self.missing_detections:
-            #         if m["id"] < 0:
-            #             del m
-            #     for d in self.detections:
-            #         if d["id"] < 0:
-            #             del d
-                # for mid, m in self.missing_objects.items():
-                #     if mid < 0:
-                #         print(f"delete missing obj {mid}")
-                #         del m
-                # for did, d in self.objects.items():
-                #     if did < 0:
-                #         print(f"delete obj {did}")
-                #         del d
 
             # print(f"bounding_boxes {bounding_boxes}")
             for i, obj_cloud in enumerate(obj_clouds_world):
@@ -1583,7 +1292,7 @@ class SceneGraphProcessor:
                 size = np.prod(max_pt - min_pt)
                 size_conf = 1/(size+1e-6)
 
-                if max_pt[2]<0.02: #np.any(max_pt - min_pt < 0.01) or max_pt[2]<0.02:
+                if np.any(max_pt - min_pt < 0.01) : #or max_pt[2]<0.02:
                     filtered3_num += 1
                     self.missing_detections.append({
                         "id": tracking_id,
@@ -1608,14 +1317,14 @@ class SceneGraphProcessor:
                     det = self.objects[final_id]
                     if np.linalg.norm(center - det["center"]) > 1.0:
                         filtered4_num += 1
-                        self.missing_detections.append({
-                            "id": tracking_id,
-                            "class_id": class_id,
-                            "class_name": self.obj_classes[class_id],
-                            "yolo_conf": yolo_conf,
-                            "bbox": bounding_box,
-                            "points": obj_cloud,
-                        })
+                        #self.missing_detections.append({
+                        #    "id": tracking_id,
+                        #    "class_id": class_id,
+                        #    "class_name": self.obj_classes[class_id],
+                        #    "yolo_conf": yolo_conf,
+                        #    "bbox": bounding_box,
+                        #    "points": obj_cloud,
+                        #})
                         continue
                     
                     center_dist = np.linalg.norm(center - det["center"])
@@ -1625,28 +1334,29 @@ class SceneGraphProcessor:
                             min_pt, max_pt, det["min_bbox"], det["max_bbox"]
                         )
                         if not (len(obj_cloud)>5 and check_close_points(obj_cloud, det['points'], 0.1)):
-                            self.missing_detections.append({
-                                "id": tracking_id,
-                                "class_id": class_id,
-                                "class_name": self.obj_classes[class_id],
-                                "yolo_conf": yolo_conf,
-                                "bbox": bounding_box,
-                                "points": obj_cloud,
-                            })
+                            #self.missing_detections.append({
+                            #    "id": tracking_id,
+                            #    "class_id": class_id,
+                            #    "class_name": self.obj_classes[class_id],
+                            #    "yolo_conf": yolo_conf,
+                            #    "bbox": bounding_box,
+                            #    "points": obj_cloud,
+                            #    })
                             continue
+
                         if overlap > 0.1:
                             reason = "iou_O"
                         elif center_dist < 0.3:
                             reason = "dist_O"
                         else:
-                            self.missing_detections.append({
-                                "id": tracking_id,
-                                "class_id": class_id,
-                                "class_name": self.obj_classes[class_id],
-                                "yolo_conf": yolo_conf,
-                                "bbox": bounding_box,
-                                "points": obj_cloud,
-                            })
+                            #self.missing_detections.append({
+                            #    "id": tracking_id,
+                            #    "class_id": class_id,
+                            #    "class_name": self.obj_classes[class_id],
+                            #    "yolo_conf": yolo_conf,
+                            #    "bbox": bounding_box,
+                            #    "points": obj_cloud,
+                            #})
                             continue
 
                     det["yolo_conf"] = max(det["yolo_conf"], yolo_conf)
@@ -1804,7 +1514,7 @@ class SceneGraphProcessor:
                 
                 if keyframe_id>=2:
                     self.add_object_nodes_for_place_node(keyframe_id, self.detections, self.missing_detections)
-                # self.connect_room_and_place(keyframe_id, self.current_room_id, room_label, cloud_center)
+
                 self.last_keyframe_id = keyframe_id
                 self.keyframe_counter += 1 #REVISED_0910
                 self.last_keyframe_pose = cur_pose
