@@ -73,7 +73,7 @@ class Logger:
 
     def logerr(self, msg, **kwargs):
         self.log(msg, 'error', **kwargs)
-        exit(0)  # TODO: Need to remove for safety
+        # exit(0)  # TODO: Need to remove for safety
 
     def logrich(self, msg, **kwargs):
         self.log(msg, 'info', **kwargs)
