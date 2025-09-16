@@ -1089,7 +1089,10 @@ class BaseVisualGrounder(BaseModel):
                             target_ids = result.get('target_ids', [])
                             if self.action == 'count':
                                 count = len(target_ids)
-                                answer = Answer(count=count, data=result['data'])
+                                if count == 0:
+                                    answer = None
+                                else:
+                                    answer = Answer(count=count, data=result['data'])
                                 self.logger.loginfo(f"<inference_loop.4.3.{_}> Answer(count={count})")
                             elif self.action == 'find':
                                 if len(target_ids) > 1:
@@ -1792,6 +1795,8 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 exp_strategy = "geometric_frontier"
                 self.exploration_strategy_pub.publish(String(exp_strategy))
                 return
+            exp_strategy = "geometric_frontier"
+            self.exploration_strategy_pub.publish(String(exp_strategy))
             self.logger.loginfo(f"<navigate.3> current_path_points: {current_path_points.shape}")
         except Exception as e:
             self.logger.logerr(f"<navigate.3> Error occurs: {e}")
