@@ -19,11 +19,15 @@ class BaseModel:
             display_name: str=None,
             **kwargs,
     ):
-        self.logger = build_logger(logger=logger, logger_cfg=logger_cfg)
-        if self.logger.__class__.__name__ != 'Logger':
-            sys.stdout = StreamToLogger(self.logger, level="INFO")
-            sys.stderr = StreamToLogger(self.logger, level="ERROR")
-        self.logger.loginfo(f"Initialized {display_name or self.__class__.__name__}")
+        if logger is None:
+            self.logger = build_logger(logger=logger, logger_cfg=logger_cfg)
+            if self.logger.__class__.__name__ != 'Logger':
+                sys.stdout = StreamToLogger(self.logger, level="INFO")
+                sys.stderr = StreamToLogger(self.logger, level="ERROR")
+            self.logger.loginfo(f"Initialized {display_name or self.__class__.__name__}")
+        else:
+            self.logger = logger
+
         self.debug = rospy.get_param('~debug', False)
 
 

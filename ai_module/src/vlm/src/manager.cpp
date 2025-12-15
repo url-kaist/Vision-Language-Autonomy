@@ -47,6 +47,14 @@ bool Manager::startSystem() {
 
     logger_.log("Timer is created...");
     timer_ = nh_.createTimer(ros::Duration(1.0), &Manager::timerCallback, this);
+
+    // Set system start time
+    system_start_time_ = ros::Time::now();
+    rosgraph_msgs::Clock msg;
+    msg.clock = system_start_time_;
+    system_start_time_pub_.publish(msg);
+
+    logger_.log("Published /system_start_time=" + std::to_string(system_start_time_.toSec()));
     return true;
 }
 

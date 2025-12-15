@@ -28,11 +28,7 @@ ANSWER_TYPE = {'find': Int32, 'count': Marker}
 
 class ActiveGrounder(BaseActiveVisualGrounder):
     def __init__(self, logger=None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if logger is None:
-            logger = self.logger
-        self._init_all(logger=logger, *args, **kwargs)
-
+        super().__init__(logger=logger, *args, **kwargs)
 
 if __name__ == "__main__":
     rospy.init_node('visual_grounding')
