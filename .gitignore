@@ -9,3 +9,10 @@ system/unity/devel/
 .catkin_workspace
 *.pkl
 *.pth
+
+log/*
+offline_map/*
+vis/*
+keyframes/*
+ai_module/src/model_weights
+system/

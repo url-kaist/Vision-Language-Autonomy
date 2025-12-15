@@ -52,6 +52,7 @@ from nav_msgs.msg import Path
 from nav_msgs.msg import Odometry
 from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import String, Int32, Empty
+from rosgraph_msgs.msg import Clock
 from visualization_msgs.msg import Marker, MarkerArray
 from visual_grounding.srv import SetSubplans, SetSubplansResponse
 from std_srvs.srv import Trigger, TriggerResponse
@@ -221,16 +222,33 @@ class PriorityDispatcher:
 
 
 class BaseVisualGrounder(BaseModel):
-    def __init__(self, node_name=None, is_real_world=False, *args, **kwargs):
-        self._dispatcher = PriorityDispatcher(name=node_name, normal_workers=0)
-        super().__init__(*args, **kwargs)
-        self.updated_resource = False
-        self.answer = ""
-        self.ready = False
-        self.answer_result = None
-        self.node_name = node_name if node_name else rospy.get_name()
+# INIT
+    def __init__(self, node_name=None, is_real_world=False, logger=None, *args, **kwargs):
+        super().__init__(logger=logger, *args, **kwargs)
 
-        self.time_limit = rospy.Duration(600)  # (sec)
+        """ Core """
+        self.node_name = node_name if node_name else rospy.get_name()
+        self.time_limit = rospy.Duration(600)  # seconds
+        self.is_real_world = is_real_world
+        self.frame_id = "world" if self.is_real_world else "map"
+        
+        """ Scheduling """
+        self._dispatcher = PriorityDispatcher(name=node_name, normal_workers=0)
+   
+        """ Aggregation """
+        self.aggregated_results_cfg = {
+            'min_query': 5,
+            'inference_cfg': {
+                'method': 'logit_pool',
+                'prior': 0.5,
+                'keep_top_k': 4,
+            }
+        }  # TODO: Need to tune   
+        
+        """ VLM options """
+        self.max_llm_concurrency = getattr(self, "max_llm_concurrency", 2)  # 필요시 조절
+        self._llm_sema = threading.Semaphore(self.max_llm_concurrency)
+        
         self.default_options = {
             'image': {
                 'suffix': "",
@@ -255,31 +273,17 @@ class BaseVisualGrounder(BaseModel):
         }
         self.default_inference_options = copy.deepcopy(self.default_options)
         self.default_validate_options = copy.deepcopy(self.default_options)
-        self.prompt_renderer = None
-        self.system_instruction_renderer = None
-
-        """ Subtask """
-        self.subtask = None
-        rospy.Service(self.node_name + "/set_subplans", SetSubplans, self._set_task)
         
-        """ Real World """        
-        self.is_real_world = is_real_world # TODO
-        self.frame_id = "world" if self.is_real_world else "map"
-
-        """ InferenceResults """
-        self.kf_counts = {}  # {kf_id: count}
-        self.aggregated_results_cfg = {
-            'min_query': 5,
-            'inference_cfg': {
-                'method': 'logit_pool',
-                'prior': 0.5,
-                'keep_top_k': 4,
-            }
-        }  # TODO: Need to tune
-
-        """ VLM """
-        self.max_llm_concurrency = getattr(self, "max_llm_concurrency", 2)  # 필요시 조절
-        self._llm_sema = threading.Semaphore(self.max_llm_concurrency)
+        """ Prompt rendering """
+        self.prompt_renderer = None
+        self.system_instruction_renderer = None        
+        
+        """ System time """
+        self.system_start_ros = None            # from the manager (rospy.Time)
+        self.system_start_received = False
+        
+        """ Initialization """
+        self._init_all(*args, **kwargs)
 
     def _init_all(self, *args, **kwargs):
         self._init_vars(*args, **kwargs)
@@ -287,21 +291,54 @@ class BaseVisualGrounder(BaseModel):
         self._init_clients(*args, **kwargs)
         self._init_subscribers(*args, **kwargs)
         self._init_publishers(*args, **kwargs)
-        self._init_threads(*args, **kwargs)
 
     def _init_vars(self, *args, **kwargs) -> None:
-        """ Initialize variables """
+        """ High-level state """
+        self.updated_resource = False
         self.ready = False
+        
+        """ Answer """
+        self.answer = ""
+        self.answer_result = None
+        
+        """ Subtask """
+        self.subtask = None
+        
+        """ Keyframe selection """
+        self.kf_counts = {}  # {kf_id: count}
+        
+        """ Node active signal """
         self.node_active_signal = False
+        
+        """ Inference """
+        # Inference queue
         self.inference_signal_queue = queue.Queue(maxsize=3)
+        self.inference_queue = queue.Queue(maxsize=10)
+        
+        # Aggregated results
+        self.agg_results = AggregatedResult(**self.aggregated_results_cfg)
+        self.agg_results_lock = threading.Lock()
+        
+        # Events        
+        self.main_running = threading.Event()
+
+        """ Validation """
+        # Events        
+        self.validation_running = threading.Event()
+        
+        """ Time """
         self.start_time = None
-        self.node_active_signal = False
+        self.processing_start_time = 0.0
 
     def _init_services(self, *args, **kwargs) -> None:
+        """ Scene graph """
         self.sg_lock = threading.Lock()
         if not 'logger' in kwargs:
             kwargs.update({'logger': self.logger})
         self.scene_graph_clients = SceneGraphClients(**kwargs)
+        
+        """ Management services """
+        self.srv_subplans_server = rospy.Service(self.node_name + "/set_subplans", SetSubplans, self._set_task_callback)
         self.srv_reset_server = rospy.Service(self.node_name + "/reset", Trigger, self._reset_callback)
         self.srv_status_server = rospy.Service(self.node_name + "/status", Trigger, self._status_callback)
         # self.srv_node_active_signal_client = rospy.ServiceProxy(self.node_name + "/active_signal", Trigger)
@@ -325,7 +362,75 @@ class BaseVisualGrounder(BaseModel):
     def _init_subscribers(self, *args, **kwargs):
         # Subscribe to active nodes topic from manager    
         self.active_nodes_sub = rospy.Subscriber("/active_nodes", String, self._active_nodes_callback, queue_size=1)
+        
+        # Subscribe to system start time (latched)
+        self.system_start_time_sub = rospy.Subscriber(
+            "/system_start_time", Clock, self._system_start_time_callback, queue_size=1
+        )
     
+    def _init_publishers(self, use_ros=True, *args, **kwargs):
+        # Visualizer
+        if use_ros:
+            self.marker_pub = rospy.Publisher("/visual_grounding/markers", Marker, queue_size=50)
+            self.marker_pub_orig = rospy.Publisher("/visual_grounding/markers_orig", Marker, queue_size=50)
+
+# RESET
+    def _reset_vars(self):
+        self._init_vars()
+
+# CALLBACKS
+    def _set_task_callback(self, req, *args, **kwargs):
+        if self.status == Status.WAITING:
+            subtask = req.current_step
+            self.start_time = req.start_time
+            relation_graph = subtask.entity.relation_graph
+
+            related_names = []
+            candidate_names = []
+            for node in relation_graph.nodes:
+                related_names.append(node.name)
+                if node.is_target:
+                    if node.name == 'path':
+                        for edge in relation_graph.edges:
+                            if edge.source_id == node.id:
+                                target_ids = edge.target_ids
+                                for _node in relation_graph.nodes:
+                                    if _node.id in target_ids:
+                                        candidate_names.append(_node.name)
+                    candidate_names.append(node.name)
+            self.related_names = list(set(related_names))
+            self.candidate_names = list(set(candidate_names))
+            self.reference_names = list(set(related_names) - set(candidate_names))
+            self.subtask = subtask
+            self.agg_results.action = self.action
+
+            self.logger.loginfo(f"================================================")
+            self.logger.logrich(f"Instruction: \"{req.text_instruction}\"", name='instruction')
+            self.logger.logrich(f"Action: \"{subtask.action}\"", name='action')
+            self.logger.logrich(f"Target Name: \"{subtask.entity.target_name}\"", name='target_name')
+            self.logger.loginfo(f"Candidate names: {self.candidate_names}")
+            self.logger.loginfo(f"Reference names: {self.reference_names}")
+            self.logger.loginfo(f"Related names: {self.related_names}")
+            return SetSubplansResponse(success=True, message=self.status)
+        else:
+            return SetSubplansResponse(success=False, message=self.status)
+
+    def _reset_callback(self, req):
+        self._reset_vars()
+        
+        self.logger.logrich(f"Instruction: ", name='instruction')
+        self.logger.logrich(f"Action: ", name='action')
+        self.logger.logrich(f"Target Name: ", name='target_name')
+        self.logger.logrich(f"Inference: ", name='inference')
+        self.logger.log("Visual grounding node has been reset.")
+        
+        return TriggerResponse(success=True, message="Visual grounding node has been reset.")
+
+    def _status_callback(self, req):
+        status = self.status
+        # self.logger.log(f"Current status: {status}")
+        return TriggerResponse(success=True, message=status.value)
+
     def _active_nodes_callback(self, msg):
         """
         Callback for active nodes topic.
@@ -362,144 +467,17 @@ class BaseVisualGrounder(BaseModel):
             self.logger.logerr(f"Error in _active_nodes_callback: {e}")
             self.node_active_signal = False
 
-    def _init_publishers(self, use_ros=True, *args, **kwargs):
-        # Visualizer
-        if use_ros:
-            self.marker_pub = rospy.Publisher("/visual_grounding/markers", Marker, queue_size=50)
-            self.marker_pub_orig = rospy.Publisher("/visual_grounding/markers_orig", Marker, queue_size=50)
+    def _system_start_time_callback(self, msg: Clock):
+        self.system_start_ros = msg.clock
+        self.system_start_received = True
 
-    def _init_threads(self, *args, **kwargs) -> None:
-        """ Initialize threads """
-        # Inference
-        self.inference_queue = queue.Queue(maxsize=10)
-
-        # Aggregated results
-        self.agg_results = AggregatedResult(**self.aggregated_results_cfg)
-        self.agg_results_lock = threading.Lock()
-
-        # Validate
-        self.main_running = threading.Event()
-        self.validation_running = threading.Event()
-
-        # Answer
-        self.answer_result = None
-
-        # Time
-        self.processing_start_time = 0.0
-
+# PROPERTIES
     @property
     def confidence_threshold(self):
         action = self.action
         if action == 'find':    return (0.40, 0.70)
         elif action == 'count': return (0.20, 0.70)
         else: return (0.20, 0.50)
-
-    def _reset_vars(self):
-        self._init_vars()
-        self.inference_queue = queue.Queue(maxsize=10)
-        self.agg_results = AggregatedResult(**self.aggregated_results_cfg, action=self.action)
-
-        self.main_running = threading.Event()
-        self.validation_running = threading.Event()
-        self.answer = ""
-        self.answer_result = None
-        self.ready = False
-        self.subtask = None
-
-    def _set_task(self, req, *args, **kwargs):
-        if self.status == Status.WAITING:
-            subtask = req.current_step
-            self.start_time = req.start_time
-            relation_graph = subtask.entity.relation_graph
-
-            related_names = []
-            candidate_names = []
-            for node in relation_graph.nodes:
-                related_names.append(node.name)
-                if node.is_target:
-                    if node.name == 'path':
-                        for edge in relation_graph.edges:
-                            if edge.source_id == node.id:
-                                target_ids = edge.target_ids
-                                for _node in relation_graph.nodes:
-                                    if _node.id in target_ids:
-                                        candidate_names.append(_node.name)
-                    candidate_names.append(node.name)
-            self.related_names = list(set(related_names))
-            self.candidate_names = list(set(candidate_names))
-            self.reference_names = list(set(related_names) - set(candidate_names))
-            self.subtask = subtask
-            self.agg_results.action = self.action
-
-            self.logger.loginfo(f"================================================")
-            self.logger.logrich(f"Instruction: \"{req.text_instruction}\"", name='instruction')
-            self.logger.logrich(f"Action: \"{subtask.action}\"", name='action')
-            self.logger.logrich(f"Target Name: \"{subtask.entity.target_name}\"", name='target_name')
-            self.logger.loginfo(f"Candidate names: {self.candidate_names}")
-            self.logger.loginfo(f"Reference names: {self.reference_names}")
-            self.logger.loginfo(f"Related names: {self.related_names}")
-            return SetSubplansResponse(success=True, message=self.status)
-        else:
-            return SetSubplansResponse(success=False, message=self.status)
-
-    def _wait_for_keys(self, param_name, check_hz=5.0, require_non_empty=True):
-        """
-        - param_name: Expected as node private parameter (e.g., '~api_keys' → /<node_name>/api_keys)
-        - check_hz: Polling frequency
-        - require_non_empty: Continue waiting if empty list
-        """
-        r = rospy.Rate(check_hz)
-        last_log_t = rospy.Time(0)
-        log_period = rospy.Duration(2.0)
-
-        while not rospy.is_shutdown():
-            if rospy.has_param(param_name):
-                val = rospy.get_param(param_name)
-                # Allowed formats: list or comma/space separated string
-                if isinstance(val, str):
-                    # Also allow "key1,key2" or "key1 key2"
-                    parts = [p for p in val.replace(",", " ").split() if p]
-                elif isinstance(val, (list, tuple)):
-                    parts = list(val)
-                else:
-                    parts = []
-
-                parts = [str(p).strip() for p in parts if str(p).strip()]
-
-                if (not require_non_empty) or (len(parts) > 0):
-                    self.logger.loginfo(f"{param_name} loaded (n={len(parts)})")
-                    return parts
-                else:
-                    # Parameter exists but is empty → continue waiting
-                    pass
-
-            # Log periodically only to prevent log spam
-            now = rospy.Time.now()
-            if now - last_log_t > log_period:
-                self.logger.loginfo(f"Waiting for parameter {param_name} from manager...")
-                last_log_t = now
-
-            r.sleep()
-
-        # When node shuts down, reach here
-        raise rospy.ROSInterruptException("Shutdown before ~api_keys was set.")
-
-    def _reset_callback(self, req):
-        self._reset_vars()
-        
-        self.logger.logrich(f"Instruction: ", name='instruction')
-        self.logger.logrich(f"Action: ", name='action')
-        self.logger.logrich(f"Target Name: ", name='target_name')
-        self.logger.logrich(f"Inference: ", name='inference')
-        self.logger.log("Visual grounding node has been reset.")
-        
-        return TriggerResponse(success=True, message="Visual grounding node has been reset.")
-
-    def _status_callback(self, req):
-        status = self.status
-        # self.logger.log(f"Current status: {status}")
-        return TriggerResponse(success=True, message=status.value)
-
 
     @property
     def sg(self):
@@ -536,17 +514,36 @@ class BaseVisualGrounder(BaseModel):
         else:
             return ['all']
 
-    def update_resource(self, **kwargs):
-        self.scene_graph_clients.update_scene_graph(**kwargs)
+# MAIN LOOP
+    def main_loop(self):
+        rate = rospy.Rate(1.0)
+        while not rospy.is_shutdown():
+            # Check if already processing to prevent duplicate execution
+            if self.main_running.is_set():
+                self.logger.loginfo(f"<main_loop> Main is already running. Let's sleep..")
+                rate.sleep()
+                continue
 
-        styles = {
-            # 'reference': {'show': True, 'color': 'blue'},
-            'candidate': {'show': True, 'color': 'green'},
-        }
-        with self.sg_lock:
-            for etype in self.etypes:
-                self.sg.keyframes.annotate(styles, node_name=self.node_name, suffix=f"_annotated_global_{etype}", etype=etype)
-        self.updated_resource = True
+            self.logger.loginfo(f"<main_loop> Main is not running. Let's process..")
+            self.main_running.set()
+            self.spin_once(None)
+            self.main_running.clear()
+            self.logger.loginfo(f"<main_loop> Main is cleared. Let's sleep..")
+            rate.sleep()
+
+    def spin_once(self, event, **kwargs):
+        self.logger.logrich(f"Status: {self.status} | #inference_queue={len(self.inference_queue.queue)}", name='status')
+        self.logger.logrich(f"Answer: {self.answer} | MinQuery: {self.agg_results.min_query}", name='answer')
+
+        if self.status == Status.STANDBY:
+            self.standby()
+
+        if self.status == Status.PROCESSING:
+            self.logger.logrich(f"Status: {self.status} | #inference_queue={len(self.inference_queue.queue)}", name='status')
+            self.process(**kwargs)
+
+        if self.status == Status.COMPLETED:
+            self.answer_the_question(self.answer_result)
 
     def standby(self, **kwargs):
         self.scene_graph_clients.start(
@@ -568,6 +565,175 @@ class BaseVisualGrounder(BaseModel):
         self.system_instruction_renderer = SystemInstructionRenderer()
 
         self.ready = True
+
+    def update_resource(self, **kwargs):
+        self.scene_graph_clients.update_scene_graph(**kwargs)
+
+        styles = {
+            # 'reference': {'show': True, 'color': 'blue'},
+            'candidate': {'show': True, 'color': 'green'},
+        }
+        with self.sg_lock:
+            for etype in self.etypes:
+                self.sg.keyframes.annotate(styles, node_name=self.node_name, suffix=f"_annotated_global_{etype}", etype=etype)
+        self.updated_resource = True
+
+    def select_keyframes(
+            self, entity_type='object', w_cov=1.0, w_area=1.0, alpha=0.5, target_eids=None,
+            min_kfs=None, max_kfs=10, iter_margin=5, *args, **kwargs
+    ):
+        with self.sg_lock:
+            sg = self.sg
+        etype = 'all' if entity_type == 'image' else entity_type
+
+        # --- candidate ids 준비 ---
+        try:
+            if target_eids is None:
+                target_eids = set(sg.get_related_entities(etype).ids)
+            else:
+                target_eids = set(target_eids)
+            if not target_eids:
+                self.logger.logwarn(f"<select_keyframes.1> target_eids is empty.")
+                return sg.keyframes.get([])
+            self.logger.loginfo(f"<select_keyframes.1> target_eids: {target_eids}")
+        except Exception as e:
+            self.logger.logerr(f"<select_keyframes.1> Error occurs: {e}")
+
+        # --- min/max 보정 ---
+        max_kfs = max(0, int(max_kfs))
+        min_kfs = 0 if min_kfs is None else max(0, min(int(min_kfs), max_kfs))
+
+        kfs = sg.keyframes
+        # ---------- 주어진 target entities를 포함하는 keyframes를 구성: kfs_with_targets, pid2target_eids ----------
+        try:
+            eid2pids = kfs.entity_id2place_ids
+            pid2eids = kfs.place_id2entity_ids
+
+            num_places = len(kfs)
+            num_target_entities = len(target_eids)
+            use_pid2eids = num_target_entities > max(1, num_places // 8)
+
+            kfs_with_targets = {}
+            pid2target_eids = defaultdict(set)
+            available_pids = set(kfs.keys())
+            if not use_pid2eids:
+                for target_eid in target_eids:
+                    for pid_with_target in eid2pids.get(target_eid, ()):
+                        if pid_with_target not in available_pids:
+                            self.logger.logwarn(f"<select_keyframes.3> Warning occurs: PID({pid_with_target}) is not in available PIDs: {available_pids}")
+                            continue
+                        if pid_with_target not in kfs_with_targets:
+                            kfs_with_targets[pid_with_target] = kfs[pid_with_target]
+                        pid2target_eids[pid_with_target].add(target_eid)
+            else:
+                for pid in available_pids:
+                    eids_here = set(pid2eids.get(pid, ()))
+                    if not eids_here:
+                        self.logger.logwarn(f"<select_keyframes.3> Warning occurs: PID({pid}) has no any EIDs.")
+                        continue
+                    target_eids_here = eids_here & target_eids
+                    if not target_eids_here:
+                        continue
+                    kfs_with_targets[pid] = kfs[pid]
+                    pid2target_eids[pid] = target_eids_here
+            self.logger.loginfo(f"<select_keyframes.2> Target EIDs per each kf: {', '.join([f'{k}: {v}' for k, v  in pid2target_eids.items()])}")
+
+            if len(kfs_with_targets) < min_kfs:
+                self.logger.logwarn(
+                    f"<select_keyframes.2> #kfs_with_targets={len(kfs_with_targets)} < min_kfs={min_kfs}. Skip.")
+                return sg.keyframes.get([])  # Early Stop
+        except Exception as e:
+            self.logger.logerr(f"<select_keyframes.2> Error occurs: {e}")
+
+        # Cache: Area
+        target_entities = sg.get_related_entities(etype).get(target_eids)
+        per_obj_area = defaultdict(dict)  # {pid: {eid: area}, ...}
+
+        def _entity_area(kf, pid, eid):
+            d = per_obj_area[pid]
+            if eid in d:
+                return d[eid]
+            tgt_ent = target_entities.get_single(eid)
+            if tgt_ent is None:
+                d[eid] = 0.0
+                return 0.0
+            tgt_bbox = tgt_ent.get_bbox(pose=kf.pose, image_size=kf.image_size, is_real_world=kf.is_real_world, kf_id=kf.id)
+            d[eid] = float(tgt_bbox.area)
+            return d[eid]
+
+        # Select N keyframes which contains target entities (N < max_kfs)
+        try:
+            selected_pids = []
+            uncovered_target_eids = set(target_eids)
+            iter_cap = max(1, min(len(kfs_with_targets), max_kfs) + iter_margin)
+            iter_cnt = 0
+            while uncovered_target_eids and kfs_with_targets and len(selected_pids) < max_kfs:
+                iter_cnt += 1
+                if iter_cnt > iter_cap:
+                    self.logger.logwarn(f"<select_keyframes.4> iter_cap reached. Bail out.")
+                    break
+
+                num_uncovered_tgts = len(uncovered_target_eids)
+                max_area = 0.0
+                tmp_stats = {}  # {pid: (c, a, covered_eids_now), ...}
+                for pid, kf in kfs_with_targets.items():
+                    covered_eids_now = pid2target_eids.get(pid, ()) & uncovered_target_eids
+                    if not covered_eids_now:
+                        continue
+                    c = len(covered_eids_now) / num_uncovered_tgts
+                    a = 0.0
+                    for eid in covered_eids_now:
+                        a += _entity_area(kf, pid, eid)
+                    if a > max_area:
+                        max_area = a
+                    tmp_stats[pid] = (c, a, covered_eids_now)
+
+                if not tmp_stats:
+                    self.logger.logwarn(f"<select_keyframes.4> tmp_stats is None")
+                    break
+
+                best_pid, best_score = None, float("-inf")
+                for pid, (c, a, _) in tmp_stats.items():
+                    base = w_cov * c + (w_area * (a / max_area) if max_area > 0 else 0.0)
+                    cnt = self.kf_counts.get(pid, 0)  # TODO
+                    seen = 1.0 / (1.0 + alpha * cnt)
+                    score = base * seen
+                    if score > best_score:
+                        best_score, best_pid = score, pid
+
+                    if best_pid is None:
+                        self.logger.logwarn(f"<select_keyframes.4> best_pid is None")
+                        break
+
+                selected_pids.append(best_pid)
+                _, _, covered_eids_best = tmp_stats[best_pid]
+                uncovered_target_eids.difference_update(covered_eids_best)
+                self.kf_counts[best_pid] = self.kf_counts.get(best_pid, 0) + 1
+                kfs_with_targets.pop(best_pid, None)
+                pid2target_eids.pop(best_pid, None)
+
+            self.logger.loginfo(f"<select_keyframes.3> selected_pids: {selected_pids}")
+        except Exception as e:
+            self.logger.logerr(f"<select_keyframes.3> Error occurs: {e}")
+
+        # Add M keyframes which contains target entities (min_kfs < N+M)
+        try:
+            while (len(selected_pids) < min_kfs) and kfs_with_targets:
+                best_pid = max(
+                    kfs_with_targets.keys(),
+                    key=lambda pid: (-self.kf_counts.get(pid, 0), len(pid2target_eids.get(pid, ())))
+                )
+                selected_pids.append(best_pid)
+                covered_target_eids = pid2target_eids.get(best_pid, ())
+                uncovered_target_eids.difference_update(covered_target_eids)
+                self.kf_counts[best_pid] = self.kf_counts.get(best_pid, 0) + 1
+                kfs_with_targets.pop(best_pid, None)
+                pid2target_eids.pop(best_pid, None)
+            self.logger.loginfo(f"<select_keyframes.4> selected_pids: {selected_pids}")
+        except Exception as e:
+            self.logger.logerr(f"<select_keyframes.4> Error occurs: {e}")
+
+        return sg.keyframes.get(selected_pids)
 
     def process(self, **kwargs):
         self.update_resource(**kwargs)
@@ -655,36 +821,6 @@ class BaseVisualGrounder(BaseModel):
 
         self.logger.logrich(f"Selected keyframe: #object({num_kfs.get('object', 0)}), #detection({num_kfs.get('detection', 0)}), #image({num_kfs.get('image', 0)})", name="selected_keyframe")
 
-    def timer_callback(self, event, **kwargs):
-        self.logger.logrich(f"Status: {self.status} | #inference_queue={len(self.inference_queue.queue)}", name='status')
-        self.logger.logrich(f"Answer: {self.answer} | MinQuery: {self.agg_results.min_query}", name='answer')
-
-        if self.status == Status.STANDBY:
-            self.standby()
-
-        if self.status == Status.PROCESSING:
-            self.logger.logrich(f"Status: {self.status} | #inference_queue={len(self.inference_queue.queue)}", name='status')
-            self.process(**kwargs)
-
-        if self.status == Status.COMPLETED:
-            self.answer_the_question(self.answer_result)
-
-    def main_loop(self):
-        rate = rospy.Rate(1.0)
-        while not rospy.is_shutdown():
-            # Check if already processing to prevent duplicate execution
-            if self.main_running.is_set():
-                self.logger.loginfo(f"<main_loop> Main is already running. Let's sleep..")
-                rate.sleep()
-                continue
-
-            self.logger.loginfo(f"<main_loop> Main is not running. Let's process..")
-            self.main_running.set()
-            self.timer_callback(None)
-            self.main_running.clear()
-            self.logger.loginfo(f"<main_loop> Main is cleared. Let's sleep..")
-            rate.sleep()
-
     def _answer_impl(self, answer, block=False):
         if answer is None:
             self.logger.logwarb(f"<answer_the_question> answer is None")
@@ -763,6 +899,118 @@ class BaseVisualGrounder(BaseModel):
 
     def answer_the_question(self, answer, block=False):
         return self._dispatcher.submit_high(self._answer_impl, answer, block=block)
+
+# INFERENCE LOOP
+    def inference_loop(self, hz):
+        rate = rospy.Rate(hz)
+        while not rospy.is_shutdown():
+            try:
+                # Time check
+                if self.start_time:
+                    now = rospy.Time.now()
+                    elapsed = now - self.start_time
+                    remaining_time = (self.start_time + self.time_limit) - now
+                else:
+                    remaining_time = rospy.Duration(60)
+                    elapsed = rospy.Time.now()
+                self.logger.logrich(f"<inference_loop.1> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)", name='time')
+                
+                # Current status check
+                if self.status != Status.PROCESSING:
+                    rate.sleep()
+                    self.logger.loginfo(f"<inference_loop.1> Let's sleep...")
+                    continue
+                self.logger.loginfo(f"<inference_loop.1> Let's inference!!")
+            except Exception as e:
+                self.logger.logerr(f"<inference_loop.1> Error occurs: {e}")
+
+            try:
+                with self.agg_results_lock:
+                    agg_results = self.agg_results.snapshot()
+                self.logger.logrich(f"<inference_loop.2> AggResults: {self.agg_results}", name='agg_results')
+            except Exception as e:
+                self.logger.logerr(f"<inference_loop.2> Error occurs: {e}")
+
+            # Ready to answer?
+            try:
+                (thres_low, thres_high) = self.confidence_threshold
+
+                best_confidence = agg_results.get('best_confidence')
+                enough_observation = (self.exploration_status == 'no_frontier')
+
+                ready_to_answer = (((best_confidence > thres_high) and enough_observation)
+                                   or (remaining_time <= rospy.Duration(30)))  # (sec)
+                self.logger.logrich(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status}", name='time')
+
+                if ready_to_answer:
+                    self.answer_result = self.agg_results.best_answer  # TODO
+                    self.answer_the_question(self.answer_result)
+                    self.logger.loginfo(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} >= {thres_high}.")
+                    return
+                else:
+                    self.logger.loginfo(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} < {thres_high}.")
+            except Exception as e:
+                self.logger.logerr(f"<inference_loop.3.1&2> Error occurs: {e}")
+
+            # Inference
+            try:
+                for _ in range(self.inference_queue.qsize()):
+                    try:
+                        jobs = self.inference_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    for item, result in self.run_parallel(self.inference, jobs, max_workers=self.max_workers):
+                        gid = item.get('gid')
+                        if result is None:
+                            self.logger.loginfo(f"<inference_loop.4.2.{_}> result is None.")
+                            continue
+
+                        try:
+                            etype = result.get('entity_type')
+                            target_ids = result.get('target_ids', [])
+                            if self.action == 'count':
+                                count = len(target_ids)
+                                if count == 0:
+                                    answer = None
+                                else:
+                                    answer = Answer(count=count, data=result['data'])
+                                self.logger.loginfo(f"<inference_loop.4.3.{_}> Answer(count={count})")
+                            elif self.action == 'find':
+                                if len(target_ids) > 1:
+                                    self.logger.logwarn(f"<inference_loop.4.3.{_}> #target_ids={len(target_ids)} > 1")
+                                elif len(target_ids) == 0:
+                                    answer = None
+                                    self.logger.loginfo(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: X")
+                                else:
+                                    target_id = int(target_ids[0])
+                                    # candidate_entities = self.sg.get_candidate_entities('all')
+                                    target_entity = self.sg.entities.get_single(target_id)
+                                    answer = Answer(object=target_entity, data=result['data'])
+                                    self.logger.loginfo(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {target_entity}")
+                            else:
+                                raise NotImplementedError(f"action must be in ['count'], but {self.action} was given.")
+                        except Exception as e:
+                            self.logger.logerr(f"<inference_loop.4.3.{_}> Error occurs: {e}")
+
+                        try:
+                            if answer is not None:
+                                self.agg_results.update(gid=gid, answer=answer, confidence=get_confidence(etype))
+                                self.logger.loginfo(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
+                            else:
+                                self.logger.loginfo(f"<inference_loop.4.4.{_}> No updated agg_results")
+                        except Exception as e:
+                            self.logger.logerr(f"<inference_loop.4.4.{_}> Error occurs: {e}")
+                        finally:
+                            # --- 예약 해제 (성공/실패 무관 1건) ---
+                            if (gid is not None) and (answer is not None): # TODO: fix error case
+                                self.agg_results.release(gid, 1, eids=answer.eids)
+                                self.agg_results.inc_queries(gid, 1, eids=answer.eids)
+                            self.logger.loginfo(f"<inference_loop.4.4.{_}> Release group({gid})")
+                            self.logger.logrich(f"<inference_loop.4.5.{_}> AggResults: {self.agg_results}", name='agg_results')
+
+            except Exception as e:
+                self.logger.logerr(f"<inference_loop.4> Error occurs: {e}")
+            rate.sleep()
 
     def load_and_preprocess_image(self, image_path, preprocess=None):
         image = Image.open(image_path)
@@ -1020,327 +1268,71 @@ class BaseVisualGrounder(BaseModel):
             self.logger.logerr(f"<inference.4> Error occurs: {e}")
         return output
 
-    def inference_loop(self, hz):
-        rate = rospy.Rate(hz)
+# OTHERS
+    def _wait_for_keys(self, param_name, check_hz=5.0, require_non_empty=True):
+        """
+        - param_name: Expected as node private parameter (e.g., '~api_keys' → /<node_name>/api_keys)
+        - check_hz: Polling frequency
+        - require_non_empty: Continue waiting if empty list
+        """
+        r = rospy.Rate(check_hz)
+        last_log_t = rospy.Time(0)
+        log_period = rospy.Duration(2.0)
+
         while not rospy.is_shutdown():
-            try:
-                if self.start_time:
-                    now = rospy.Time.now()
-                    elapsed = now - self.start_time
-                    remaining_time = (self.start_time + self.time_limit) - now
+            if rospy.has_param(param_name):
+                val = rospy.get_param(param_name)
+                # Allowed formats: list or comma/space separated string
+                if isinstance(val, str):
+                    # Also allow "key1,key2" or "key1 key2"
+                    parts = [p for p in val.replace(",", " ").split() if p]
+                elif isinstance(val, (list, tuple)):
+                    parts = list(val)
                 else:
-                    remaining_time = rospy.Duration(60)
-                    elapsed = rospy.Time.now()
-                self.logger.logrich(f"<inference_loop.1> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)", name='time')
-                if self.status != Status.PROCESSING:
-                    rate.sleep()
-                    self.logger.loginfo(f"<inference_loop.1> Let's sleep...")
-                    continue
-                self.logger.loginfo(f"<inference_loop.1> Let's inference!!")
-            except Exception as e:
-                self.logger.logerr(f"<inference_loop.1> Error occurs: {e}")
+                    parts = []
 
-            try:
-                with self.agg_results_lock:
-                    agg_results = self.agg_results.snapshot()
-                self.logger.logrich(f"<inference_loop.2> AggResults: {self.agg_results}", name='agg_results')
-            except Exception as e:
-                self.logger.logerr(f"<inference_loop.2> Error occurs: {e}")
+                parts = [str(p).strip() for p in parts if str(p).strip()]
 
-            # Ready to answer?
-            try:
-                (thres_low, thres_high) = self.confidence_threshold
-
-                best_confidence = agg_results.get('best_confidence')
-                enough_observation = (self.exploration_status == 'no_frontier')
-
-                if self.start_time:
-                    now = rospy.Time.now()
-                    elapsed = now - self.start_time
-                    remaining_time = (self.start_time + self.time_limit) - now
+                if (not require_non_empty) or (len(parts) > 0):
+                    self.logger.loginfo(f"{param_name} loaded (n={len(parts)})")
+                    return parts
                 else:
-                    remaining_time = rospy.Duration(60)
-                    elapsed = rospy.Time.now()
-                ready_to_answer = (((best_confidence > thres_high) and enough_observation)
-                                   or (remaining_time <= rospy.Duration(30)))  # (sec)
-                self.logger.logrich(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status}", name='time')
-                # timeout = 10분
-                if ready_to_answer:
-                    self.answer_result = self.agg_results.best_answer  # TODO
-                    self.answer_the_question(self.answer_result)
-                    self.logger.loginfo(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} >= {thres_high}.")
-                    return
-                else:
-                    self.logger.loginfo(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} < {thres_high}.")
-            except Exception as e:
-                self.logger.logerr(f"<inference_loop.3.1&2> Error occurs: {e}")
+                    # Parameter exists but is empty → continue waiting
+                    pass
 
-            # Inference
-            try:
-                for _ in range(self.inference_queue.qsize()):
-                    jobs = self.inference_queue.get_nowait()
-                    for item, result in self.run_parallel(self.inference, jobs, max_workers=self.max_workers):
-                        gid = item.get('gid')
-                        if result is None:
-                            self.logger.loginfo(f"<inference_loop.4.2.{_}> result is None.")
-                            continue
+            # Log periodically only to prevent log spam
+            now = rospy.Time.now()
+            if now - last_log_t > log_period:
+                self.logger.loginfo(f"Waiting for parameter {param_name} from manager...")
+                last_log_t = now
 
-                        try:
-                            etype = result.get('entity_type')
-                            target_ids = result.get('target_ids', [])
-                            if self.action == 'count':
-                                count = len(target_ids)
-                                if count == 0:
-                                    answer = None
-                                else:
-                                    answer = Answer(count=count, data=result['data'])
-                                self.logger.loginfo(f"<inference_loop.4.3.{_}> Answer(count={count})")
-                            elif self.action == 'find':
-                                if len(target_ids) > 1:
-                                    self.logger.logwarn(f"<inference_loop.4.3.{_}> #target_ids={len(target_ids)} > 1")
-                                if len(target_ids) == 0:
-                                    answer = None
-                                    self.logger.loginfo(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: X")
-                                else:
-                                    target_id = int(target_ids[0])
-                                    # candidate_entities = self.sg.get_candidate_entities('all')
-                                    target_entity = self.sg.entities.get_single(target_id)
-                                    answer = Answer(object=target_entity, data=result['data'])
-                                    self.logger.loginfo(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {target_entity}")
-                            else:
-                                raise NotImplementedError(f"action must be in ['count'], but {self.action} was given.")
-                        except Exception as e:
-                            self.logger.logerr(f"<inference_loop.4.3.{_}> Error occurs: {e}")
+            r.sleep()
 
-                        try:
-                            if answer is not None:
-                                self.agg_results.update(gid=gid, answer=answer, confidence=get_confidence(etype))
-                                self.logger.loginfo(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
-                            else:
-                                self.logger.loginfo(f"<inference_loop.4.4.{_}> No updated agg_results")
-                        except Exception as e:
-                            self.logger.logerr(f"<inference_loop.4.4.{_}> Error occurs: {e}")
-                        finally:
-                            # --- 예약 해제 (성공/실패 무관 1건) ---
-                            if (gid is not None) and (answer is not None):
-                                self.agg_results.release(gid, 1, eids=answer.eids)
-                                self.agg_results.inc_queries(gid, 1, eids=answer.eids)
-                            self.logger.loginfo(f"<inference_loop.4.4.{_}> Release group({gid})")
-                            self.logger.logrich(f"<inference_loop.4.5.{_}> AggResults: {self.agg_results}", name='agg_results')
+        # When node shuts down, reach here
+        raise rospy.ROSInterruptException("Shutdown before ~api_keys was set.")
 
-            except Exception as e:
-                self.logger.logerr(f"<inference_loop.4> Error occurs: {e}")
-            rate.sleep()
-
-    def select_keyframes(
-            self, entity_type='object', w_cov=1.0, w_area=1.0, alpha=0.5, target_eids=None,
-            min_kfs=None, max_kfs=10, iter_margin=5, *args, **kwargs
-    ):
-        with self.sg_lock:
-            sg = self.sg
-        etype = 'all' if entity_type == 'image' else entity_type
-
-        # --- candidate ids 준비 ---
-        try:
-            if target_eids is None:
-                target_eids = set(sg.get_related_entities(etype).ids)
-            else:
-                target_eids = set(target_eids)
-            if not target_eids:
-                self.logger.logwarn(f"<select_keyframes.1> target_eids is empty.")
-                return sg.keyframes.get([])
-            self.logger.loginfo(f"<select_keyframes.1> target_eids: {target_eids}")
-        except Exception as e:
-            self.logger.logerr(f"<select_keyframes.1> Error occurs: {e}")
-
-        # --- min/max 보정 ---
-        max_kfs = max(0, int(max_kfs))
-        min_kfs = 0 if min_kfs is None else max(0, min(int(min_kfs), max_kfs))
-
-        kfs = sg.keyframes
-        # ---------- 주어진 target entities를 포함하는 keyframes를 구성: kfs_with_targets, pid2target_eids ----------
-        try:
-            eid2pids = kfs.entity_id2place_ids
-            pid2eids = kfs.place_id2entity_ids
-
-            num_places = len(kfs)
-            num_target_entities = len(target_eids)
-            use_pid2eids = num_target_entities > max(1, num_places // 8)
-
-            kfs_with_targets = {}
-            pid2target_eids = defaultdict(set)
-            available_pids = set(kfs.keys())
-            if not use_pid2eids:
-                for target_eid in target_eids:
-                    for pid_with_target in eid2pids.get(target_eid, ()):
-                        if pid_with_target not in available_pids:
-                            self.logger.logwarn(f"<select_keyframes.3> Warning occurs: PID({pid_with_target}) is not in available PIDs: {available_pids}")
-                            continue
-                        if pid_with_target not in kfs_with_targets:
-                            kfs_with_targets[pid_with_target] = kfs[pid_with_target]
-                        pid2target_eids[pid_with_target].add(target_eid)
-            else:
-                for pid in available_pids:
-                    eids_here = set(pid2eids.get(pid, ()))
-                    if not eids_here:
-                        self.logger.logwarn(f"<select_keyframes.3> Warning occurs: PID({pid}) has no any EIDs.")
-                        continue
-                    target_eids_here = eids_here & target_eids
-                    if not target_eids_here:
-                        continue
-                    kfs_with_targets[pid] = kfs[pid]
-                    pid2target_eids[pid] = target_eids_here
-            self.logger.loginfo(f"<select_keyframes.2> Target EIDs per each kf: {', '.join([f'{k}: {v}' for k, v  in pid2target_eids.items()])}")
-
-            if len(kfs_with_targets) < min_kfs:
-                self.logger.logwarn(
-                    f"<select_keyframes.2> #kfs_with_targets={len(kfs_with_targets)} < min_kfs={min_kfs}. Skip.")
-                return sg.keyframes.get([])  # Early Stop
-        except Exception as e:
-            self.logger.logerr(f"<select_keyframes.2> Error occurs: {e}")
-
-        # Cache: Area
-        target_entities = sg.get_related_entities(etype).get(target_eids)
-        per_obj_area = defaultdict(dict)  # {pid: {eid: area}, ...}
-
-        def _entity_area(kf, pid, eid):
-            d = per_obj_area[pid]
-            if eid in d:
-                return d[eid]
-            tgt_ent = target_entities.get_single(eid)
-            if tgt_ent is None:
-                d[eid] = 0.0
-                return 0.0
-            tgt_bbox = tgt_ent.get_bbox(pose=kf.pose, image_size=kf.image_size, is_real_world=kf.is_real_world, kf_id=kf.id)
-            d[eid] = float(tgt_bbox.area)
-            return d[eid]
-
-        # Select N keyframes which contains target entities (N < max_kfs)
-        try:
-            selected_pids = []
-            uncovered_target_eids = set(target_eids)
-            iter_cap = max(1, min(len(kfs_with_targets), max_kfs) + iter_margin)
-            iter_cnt = 0
-            while uncovered_target_eids and kfs_with_targets and len(selected_pids) < max_kfs:
-                iter_cnt += 1
-                if iter_cnt > iter_cap:
-                    self.logger.logwarn(f"<select_keyframes.4> iter_cap reached. Bail out.")
-                    break
-
-                num_uncovered_tgts = len(uncovered_target_eids)
-                max_area = 0.0
-                tmp_stats = {}  # {pid: (c, a, covered_eids_now), ...}
-                for pid, kf in kfs_with_targets.items():
-                    covered_eids_now = pid2target_eids.get(pid, ()) & uncovered_target_eids
-                    if not covered_eids_now:
-                        continue
-                    c = len(covered_eids_now) / num_uncovered_tgts
-                    a = 0.0
-                    for eid in covered_eids_now:
-                        a += _entity_area(kf, pid, eid)
-                    if a > max_area:
-                        max_area = a
-                    tmp_stats[pid] = (c, a, covered_eids_now)
-
-                if not tmp_stats:
-                    self.logger.logwarn(f"<select_keyframes.4> tmp_stats is None")
-                    break
-
-                best_pid, best_score = None, float("-inf")
-                for pid, (c, a, _) in tmp_stats.items():
-                    base = w_cov * c + (w_area * (a / max_area) if max_area > 0 else 0.0)
-                    cnt = self.kf_counts.get(pid, 0)  # TODO
-                    seen = 1.0 / (1.0 + alpha * cnt)
-                    score = base * seen
-                    if score > best_score:
-                        best_score, best_pid = score, pid
-
-                    if best_pid is None:
-                        self.logger.logwarn(f"<select_keyframes.4> best_pid is None")
-                        break
-
-                selected_pids.append(best_pid)
-                _, _, covered_eids_best = tmp_stats[best_pid]
-                uncovered_target_eids.difference_update(covered_eids_best)
-                self.kf_counts[best_pid] = self.kf_counts.get(best_pid, 0) + 1
-                kfs_with_targets.pop(best_pid, None)
-                pid2target_eids.pop(best_pid, None)
-
-            self.logger.loginfo(f"<select_keyframes.3> selected_pids: {selected_pids}")
-        except Exception as e:
-            self.logger.logerr(f"<select_keyframes.3> Error occurs: {e}")
-
-        # Add M keyframes which contains target entities (min_kfs < N+M)
-        try:
-            while (len(selected_pids) < min_kfs) and kfs_with_targets:
-                best_pid = max(
-                    kfs_with_targets.keys(),
-                    key=lambda pid: (-self.kf_counts.get(pid, 0), len(pid2target_eids.get(pid, ())))
-                )
-                selected_pids.append(best_pid)
-                covered_target_eids = pid2target_eids.get(best_pid, ())
-                uncovered_target_eids.difference_update(covered_target_eids)
-                self.kf_counts[best_pid] = self.kf_counts.get(best_pid, 0) + 1
-                kfs_with_targets.pop(best_pid, None)
-                pid2target_eids.pop(best_pid, None)
-            self.logger.loginfo(f"<select_keyframes.4> selected_pids: {selected_pids}")
-        except Exception as e:
-            self.logger.logerr(f"<select_keyframes.4> Error occurs: {e}")
-
-        return sg.keyframes.get(selected_pids)
-    
-    @staticmethod
-    def multi_thread_process(func, input_data, max_workers=3):
-        it = iter(input_data)
-        client_counter = 0
-        in_flight = {}
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # 1) 초기 워커만큼 예열(submit)
-            for _ in range(max_workers):
-                try:
-                    item = next(it)
-                except StopIteration:
-                    break
-                fut = executor.submit(func, item, client_counter=client_counter)
-                in_flight[fut] = item
-                client_counter += 1
-
-            # 2) 완료되는 대로 결과를 내보내고, 다음 작업을 즉시 투입
-            while in_flight:
-                # 완료된 future만 순서 무관하게 가져옴
-                for fut in concurrent.futures.as_completed(list(in_flight.keys()), timeout=None):
-                    item = in_flight.pop(fut)
-                    try:
-                        result = fut.result()
-                    except Exception as e:
-                        result = e
-                    yield (item, result)
-
-                    # 빈 슬롯에 다음 작업 투입
-                    try:
-                        next_item = next(it)
-                    except StopIteration:
-                        # 더 이상 넣을 작업이 없으면 넘어감(남은 in_flight만 소진)
-                        continue
-                    new_fut = executor.submit(func, next_item, client_counter=client_counter)
-                    in_flight[new_fut] = next_item
-                    client_counter += 1
-
+    def _to_sys_sec(self, stamp: rospy.Time) -> float:
+        # Convert an absolute ROS time to seconds since system start.
+        if not self.system_start_received or self.system_start_ros is None:
+            return stamp.to_sec()  # fallback
+        return (stamp - self.system_start_ros).to_sec()
 
 class BaseActiveVisualGrounder(BaseVisualGrounder):
+# INIT
     def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        """ Navigation """
         self.min_point_spacing = 0.5
         self.radius = 0.55 # (m)
         self._empty_path_since = {}  # {gid: rospy.Time}
         self._empty_path_cooldown = rospy.Duration(3.0)  # 3초
-        super().__init__(*args, **kwargs)
 
-        """ Navigation """
         self.agent_pose = None
         self.hull_grouper = None
         self.path_points = None
         self.is_path_points_updated = False
+        
         self.navigation_running = threading.Event()
         self.navigation_lock = threading.RLock()
 
@@ -1350,49 +1342,68 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
     def _init_services(self, *args, **kwargs) -> None:
         super()._init_services(*args, **kwargs)
+        
+        """ Active clients """
         self.active_clients = ActiveClients(*args, **kwargs)
 
     def _init_subscribers(self, *args, **kwargs):
         super()._init_subscribers(*args, **kwargs)
+        
+        """ Robot current state """
+        self.odom_sub = rospy.Subscriber("/state_estimation", Odometry, self._odom_callback, queue_size=20)
+
+        """ Traversable area """
         self.traversable_points = None
         self._traversable_lock = threading.RLock()
-        self.path_xy = np.zeros((0, 2), dtype=float)
-        self.exploration_status = None
-
-        self.occupancy_grid = None
-
         self.traversable_area_sub = rospy.Subscriber(
             "/traversable_area_filtered", PointCloud2, self._traversable_area_callback, queue_size=10)
-        self.robot_path_sub = rospy.Subscriber("/path_recorder/path", Path, self._robot_path_callback, queue_size=1)
-        self.odom_sub = rospy.Subscriber("/state_estimation", Odometry, self._odom_callback, queue_size=20)
+        
+        """ Occupancy grid """
+        self.occupancy_grid = None
         self.occupancy_grid_sub = rospy.Subscriber("/occupancy_map", OccupancyGrid, self._occupancy_grid_callback, queue_size=1)
+
+        """ Path history """
+        self.path_xy = np.zeros((0, 2), dtype=float)
+        self.robot_path_sub = rospy.Subscriber("/path_recorder/path", Path, self._robot_path_callback, queue_size=1)
+
+        """ Exploration status """
+        self.exploration_status = None
         self.exploration_status_sub = rospy.Subscriber("/instruction_following_exp_status", String, self._exploration_status_callback, queue_size=1)
 
+        """ Timeout """
         self.timeout_sub = rospy.Subscriber(
             "/timeout", Empty, self._timeout_callback, queue_size=10)
 
+    def _init_publishers(self, *args, **kwargs):
+        super()._init_publishers(*args, **kwargs)
+        
+        """ Active navigation """
+        self.path_points_pub = rospy.Publisher("/active_waypoints", MarkerArray, queue_size=1)
+        
+        # Visualization
+        self.previous_path_points = None
+        self.path_points_vis_pub = rospy.Publisher("/active_waypoints_vis", MarkerArray, queue_size=1)
+
+        """ Exploration strategy """
+        self.exploration_strategy_pub = rospy.Publisher("/exploration_strategy", String, queue_size=1)
+
+# RESET
     def _reset_vars(self):
         super()._reset_vars()
+        
+        """ Navigation """
         self.path_points = None
         self.navigation_running = threading.Event()
         self.active_clients.end()
 
-    def _timeout_callback(self, msg) -> None:
-        if self.status != Status.COMPLETED:
-            self.logger.loginfo("<timeout_callback> Timeout signal received #############")
-            self.answer_result = self.agg_results.best_answer
-            if self.answer_result is None:
-                if self.action == 'find':
-                    self.answer_result = random.choice(list(self.sg.get_candidate_entities('object', include_untracked=False).ids))
-                elif self.action == 'count':
-                    self.answer_result = random.randint(2, 6)
-                else:
-                    raise NotImplementedError(f"self.action must be in ['find', 'count'], but {self.action} was given.")
-            self.answer_the_question(self.answer_result)
-        else:
-            self.answer_the_question(self.answer_result)
-            self.logger.loginfo("<timeout_callback> Finished :) #############")
-        return
+# CALLBACKS
+    def _odom_callback(self, msg):
+        self.agent_pose = {
+            "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
+            "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
+        }
+        if self.debug:  # TODO: debug: Save the path_xy
+            _ = save_path_xy(self.agent_pose['position'], base_dir="/ws/external/offline_map", name="agent_pose")
 
     def _traversable_area_callback(self, msg) -> None:
         if self.traversable_points is None:
@@ -1400,12 +1411,12 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             with self._traversable_lock:
                 self.traversable_points = traversable_pts
 
-    def _init_publishers(self, *args, **kwargs):
-        super()._init_publishers(*args, **kwargs)
-        self.exploration_strategy_pub = rospy.Publisher("/exploration_strategy", String, queue_size=1)
-        self.path_points_pub = rospy.Publisher("/active_waypoints", MarkerArray, queue_size=1)
-        self.path_points_vis_pub = rospy.Publisher("/active_waypoints_vis", MarkerArray, queue_size=1)
-        self.previous_path_points = None
+    def _occupancy_grid_callback(self, msg):
+        self.occupancy_grid = CustomOccupancyGrid(msg)
+        if self.debug:
+            filename = f"occupancy_grid_{datetime.now().strftime('%Y%m%d_%H%M%S')}.npz"
+            save_path = os.path.join("/ws/external/offline_map/", filename)
+            self.occupancy_grid.save_npz(save_path)
 
     def _robot_path_callback(self, msg):
         pts = []
@@ -1420,21 +1431,6 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
         if self.debug:  # TODO: debug: Save the path_xy
             _ = save_path_xy(self.path_xy, base_dir="/ws/external/offline_map", name="path_xy")
-
-    def _odom_callback(self, msg):
-        self.agent_pose = {
-            "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
-            "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
-        }
-        if self.debug:  # TODO: debug: Save the path_xy
-            _ = save_path_xy(self.agent_pose['position'], base_dir="/ws/external/offline_map", name="agent_pose")
-
-    def _occupancy_grid_callback(self, msg):
-        self.occupancy_grid = CustomOccupancyGrid(msg)
-        if self.debug:
-            filename = f"occupancy_grid_{datetime.now().strftime('%Y%m%d_%H%M%S')}.npz"
-            save_path = os.path.join("/ws/external/offline_map/", filename)
-            self.occupancy_grid.save_npz(save_path)
 
     def _exploration_status_callback(self, msg):
         self.exploration_status = msg.data
@@ -1458,50 +1454,24 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 self.logger.loginfo(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} < {thres_high}.")
             return
 
-    def build_batch_for_gid(self, eids: List[int], num_queries_required: int):
-        self.logger.loginfo(f"<build_batch_for_gid.0> EIDs: {eids}")
-        try:
-            data, pids = [], []
-            budget = max(0, int(num_queries_required))
-            self.logger.loginfo(f"<build_batch_for_gid.1> Budget: {budget}")
+    def _timeout_callback(self, msg) -> None:
+        if self.status != Status.COMPLETED:
+            self.logger.loginfo("<timeout_callback> Timeout signal received #############")
+            self.answer_result = self.agg_results.best_answer
+            if self.answer_result is None:
+                if self.action == 'find':
+                    self.answer_result = random.choice(list(self.sg.get_candidate_entities('object', include_untracked=False).ids))
+                elif self.action == 'count':
+                    self.answer_result = random.randint(2, 6)
+                else:
+                    raise NotImplementedError(f"self.action must be in ['find', 'count'], but {self.action} was given.")
+            self.answer_the_question(self.answer_result)
+        else:
+            self.answer_the_question(self.answer_result)
+            self.logger.loginfo("<timeout_callback> Finished :) #############")
+        return
 
-            etype = 'object'
-            while budget > 0 and (etype in self.etypes):
-                keyframes = self.select_keyframes(entity_type=etype, target_eids=eids, min_kfs=1, max_kfs=10)
-                if len(keyframes) == 0:
-                    break
-                data += [{'keyframes': keyframes, 'etype': etype, 'atype': 'object_box_id', 'eids': eids}]
-                pids += keyframes.ids
-                budget -= 1
-            self.logger.loginfo(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
-
-            etype = 'all'
-            while budget > 0 and (etype in self.etypes):
-                keyframes = self.select_keyframes(entity_type=etype, target_eids=eids, min_kfs=1, max_kfs=10)
-                if len(keyframes) == 0:
-                    break
-                data += [{'keyframes': keyframes, 'etype': etype, 'atype': 'object_box_id', 'eids': eids}]
-                pids += keyframes.ids
-                budget -= 1
-            self.logger.loginfo(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
-        except Exception as e:
-            self.logger.logerr(f"<build_batch_for_gid.1> Error occurs: {e}")
-
-        try:
-            etype = 'image'
-            while budget > 0 and (etype in self.etypes):
-                keyframes = self.select_keyframes(entity_type=etype, target_eids=eids, min_kfs=budget, max_kfs=3)
-                if len(keyframes) == 0:
-                    break
-                data += [{'keyframes': kf, 'etype': 'image', 'atype': 'none', 'eids': eids} for kf in keyframes.to_list()]
-                pids += keyframes.ids
-                budget -= 1
-            self.logger.loginfo(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
-        except Exception as e:
-            self.logger.logerr(f"<build_batch_for_gid.2> Error occurs: {e}")
-
-        return data, pids
-
+# MAIN LOOP
     def process(self, **kwargs):
         self.logger.loginfo(f"<process.0> Start")
         self.update_resource(**kwargs)
@@ -1574,6 +1544,55 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         except Exception as e:
             self.logger.logerr(f"<process.3> Error occurs: {e}")
 
+# NAVIGATION LOOP
+    def navigation_loop(self, hz):
+        rate = rospy.Rate(hz)
+        while not rospy.is_shutdown():
+            self.logger.logrich(f"<navigation_loop.1> Resource status: {'Updated' if self.updated_resource else 'Not yet'}", name="resource_status")
+            try:
+                if not self.updated_resource:
+                    rate.sleep()
+                    self.logger.loginfo(f"<navigation_loop.1> Resource is not updated. Let's sleep..")
+                    continue
+
+                if self.subtask == None:
+                    rate.sleep()
+                    self.logger.loginfo(f"<navigation_loop.1> Subtask is None. Let's sleep..")
+                    continue
+
+                if self.navigation_running.is_set():
+                    rate.sleep()
+                    self.logger.loginfo(f"<navigation_loop.1> Navigation is already running. Let's sleep..")
+                    continue
+
+                if self.status != Status.PROCESSING:
+                    rate.sleep()
+                    self.logger.loginfo(f"<navigation_loop.1> Status is not processing. Let's sleep..")
+                    continue
+            except Exception as e:
+                self.logger.logerr(f"<navigation_loop.1> Error occurs: {e}")
+
+            self.navigation_running.set()
+
+            try:
+                self.update_path_points()
+                self.logger.loginfo(f"<navigation_loop.2> Updated path_points: #={len(self.path_points) if self.path_points is not None else 'None'}")
+            except Exception as e:
+                self.logger.logerr(f"<navigation_loop.2> Error occurs: {e}")
+
+            try:
+                # self._get_node_active_signal()
+                # if self.node_active_signal:
+                if self.node_active_signal:
+                    self.navigate()
+                self.logger.loginfo(f"<navigation_loop.3> Navigate")
+            except Exception as e:
+                self.logger.logerr(f"<navigation_loop.3> Error occurs: {e}")
+            finally:
+                self.navigation_running.clear()
+                self.logger.loginfo(f"<navigation_loop.3> Clear navigation_running")
+            rate.sleep()
+
     def update_path_points(self) -> None:
         # TODO: Detection-based update_path_points
         try:
@@ -1637,54 +1656,6 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.logger.logrich(f"<update_path_points.3> path_points (#valid/#total): {{{', '.join([f'{gid}: ({valid}/{total})' for gid, (valid, total) in log_data.items()])}}}", name="path_points")
         except Exception as e:
             self.logger.logerr(f"<update_path_points.3> Error occurs: {e}")
-
-    def navigation_loop(self, hz):
-        rate = rospy.Rate(hz)
-        while not rospy.is_shutdown():
-            self.logger.logrich(f"<navigation_loop.1> Resource status: {'Updated' if self.updated_resource else 'Not yet'}", name="resource_status")
-            try:
-                if not self.updated_resource:
-                    rate.sleep()
-                    self.logger.loginfo(f"<navigation_loop.1> Resource is not updated. Let's sleep..")
-                    continue
-
-                if self.subtask == None:
-                    rate.sleep()
-                    self.logger.loginfo(f"<navigation_loop.1> Subtask is None. Let's sleep..")
-                    continue
-
-                if self.navigation_running.is_set():
-                    rate.sleep()
-                    self.logger.loginfo(f"<navigation_loop.1> Navigation is already running. Let's sleep..")
-                    continue
-
-                if self.status != Status.PROCESSING:
-                    rate.sleep()
-                    self.logger.loginfo(f"<navigation_loop.1> Status is not processing. Let's sleep..")
-                    continue
-            except Exception as e:
-                self.logger.logerr(f"<navigation_loop.1> Error occurs: {e}")
-
-            self.navigation_running.set()
-
-            try:
-                self.update_path_points()
-                self.logger.loginfo(f"<navigation_loop.2> Updated path_points: #={len(self.path_points) if self.path_points is not None else 'None'}")
-            except Exception as e:
-                self.logger.logerr(f"<navigation_loop.2> Error occurs: {e}")
-
-            try:
-                # self._get_node_active_signal()
-                # if self.node_active_signal:
-                if self.node_active_signal:
-                    self.navigate()
-                self.logger.loginfo(f"<navigation_loop.3> Navigate")
-            except Exception as e:
-                self.logger.logerr(f"<navigation_loop.3> Error occurs: {e}")
-            finally:
-                self.navigation_running.clear()
-                self.logger.loginfo(f"<navigation_loop.3> Clear navigation_running")
-            rate.sleep()
 
     def navigate(self):
         try:
@@ -1850,6 +1821,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         except Exception as e:
             self.logger.logerr(f"<navigate.4> Error occurs: {e}")
 
+        # Visualize
         try:
             path_points_marker = make_marker_array_from_points(
                 current_path_points, ns=f"path_points_{current_gid}", color=colors[current_gid], frame_id=self.frame_id)
@@ -1858,7 +1830,6 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         except Exception as e:
             self.logger.logerr(f"<navigate.4.3> Error occurs: {e}")
 
-        # Visualize
         try:
             marker_array_all = []
             for gid, path_points in path_points_all.items():
@@ -1912,6 +1883,50 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.logger.loginfo("Starting coverage path planning strategy")
         self.exploration_strategy_pub.publish(String('coverage_planning'))
 
+# OTHERS
+    def build_batch_for_gid(self, eids: List[int], num_queries_required: int):
+        self.logger.loginfo(f"<build_batch_for_gid.0> EIDs: {eids}")
+        try:
+            data, pids = [], []
+            budget = max(0, int(num_queries_required))
+            self.logger.loginfo(f"<build_batch_for_gid.1> Budget: {budget}")
+
+            etype = 'object'
+            while budget > 0 and (etype in self.etypes):
+                keyframes = self.select_keyframes(entity_type=etype, target_eids=eids, min_kfs=1, max_kfs=10)
+                if len(keyframes) == 0:
+                    break
+                data += [{'keyframes': keyframes, 'etype': etype, 'atype': 'object_box_id', 'eids': eids}]
+                pids += keyframes.ids
+                budget -= 1
+            self.logger.loginfo(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
+
+            etype = 'all'
+            while budget > 0 and (etype in self.etypes):
+                keyframes = self.select_keyframes(entity_type=etype, target_eids=eids, min_kfs=1, max_kfs=10)
+                if len(keyframes) == 0:
+                    break
+                data += [{'keyframes': keyframes, 'etype': etype, 'atype': 'object_box_id', 'eids': eids}]
+                pids += keyframes.ids
+                budget -= 1
+            self.logger.loginfo(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
+        except Exception as e:
+            self.logger.logerr(f"<build_batch_for_gid.1> Error occurs: {e}")
+
+        try:
+            etype = 'image'
+            while budget > 0 and (etype in self.etypes):
+                keyframes = self.select_keyframes(entity_type=etype, target_eids=eids, min_kfs=budget, max_kfs=3)
+                if len(keyframes) == 0:
+                    break
+                data += [{'keyframes': kf, 'etype': 'image', 'atype': 'none', 'eids': eids} for kf in keyframes.to_list()]
+                pids += keyframes.ids
+                budget -= 1
+            self.logger.loginfo(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
+        except Exception as e:
+            self.logger.logerr(f"<build_batch_for_gid.2> Error occurs: {e}")
+
+        return data, pids
 
 if __name__ == "__main__":
     logger = Logger()

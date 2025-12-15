@@ -22,6 +22,7 @@
 #include <deque>
 #include <map>
 #include <nlohmann/json.hpp>
+#include <rosgraph_msgs/Clock.h>
 
 #include "user_interface/SetInput.h"
 #include "task_planner/Subplans.h"
@@ -99,6 +100,7 @@ private:
     const std::string node_name_user_input_ = "/user_interface";
 
     // Publishers
+    ros::Publisher system_start_time_pub_= nh_.advertise<rosgraph_msgs::Clock>("/system_start_time", 1, /*latch=*/true); // /system_start_time (latched)
     ros::Publisher timeout_pub_ = nh_.advertise<std_msgs::Empty>("/timeout", 1);
     ros::Publisher goal_pub_ = nh_.advertise<geometry_msgs::Pose2D>("/way_point_with_heading", 1);
     ros::Publisher steps_pub_ = nh_.advertise<std_msgs::String>("/steps", 1); // Subscriber: exploration
@@ -128,6 +130,7 @@ private:
 
     // Variables
     std::string instructions_;
+    ros::Time system_start_time_;
     ros::Time start_time_;
     task_planner::Plan plans_;
     task_planner::Task current_step_;
