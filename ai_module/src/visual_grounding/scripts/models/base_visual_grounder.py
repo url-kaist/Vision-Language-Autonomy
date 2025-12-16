@@ -936,7 +936,7 @@ class BaseVisualGrounder(BaseModel):
                 (thres_low, thres_high) = self.confidence_threshold
 
                 best_confidence = agg_results.get('best_confidence')
-                enough_observation = (self.exploration_status == 'no_frontier')
+                enough_observation = True # (self.exploration_status == 'no_frontier')
 
                 ready_to_answer = (((best_confidence > thres_high) and enough_observation)
                                    or (remaining_time <= rospy.Duration(30)))  # (sec)
