@@ -314,6 +314,7 @@ class BaseVisualGrounder(BaseModel):
         # Inference queue
         self.inference_signal_queue = queue.Queue(maxsize=3)
         self.inference_queue = queue.Queue(maxsize=10)
+        self.inference_queue_lock = threading.Lock()
         
         # Aggregated results
         self.agg_results = AggregatedResult(**self.aggregated_results_cfg)
@@ -810,7 +811,8 @@ class BaseVisualGrounder(BaseModel):
             if len(keyframes) == 0:
                 self.logger.loginfo(f"<process.6> No keyframes to put: #kfs={len(keyframes)}")
             elif len(data) > 0:
-                self.inference_queue.put(data)
+                with self.inference_queue_lock:
+                    self.inference_queue.put(data)
                 # --- 예약 수 반영 ---
                 self.inference_results.schedule(gid, len(data), data=data)
                 self.logger.loginfo(f"<process.6> Put data to inference_queue: {data}")
@@ -936,11 +938,17 @@ class BaseVisualGrounder(BaseModel):
                 (thres_low, thres_high) = self.confidence_threshold
 
                 best_confidence = agg_results.get('best_confidence')
-                enough_observation = True # (self.exploration_status == 'no_frontier')
-
-                ready_to_answer = (((best_confidence > thres_high) and enough_observation)
-                                   or (remaining_time <= rospy.Duration(30)))  # (sec)
-                self.logger.logrich(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status}", name='time')
+                enough_observation = (self.exploration_status == 'no_frontier')
+                all_inference_done = (self.inference_queue.qsize() == 0) and (self.inference_signal_queue.qsize() == 0) # TODO: If inference becomes asynchronous, this logic must be updated.
+                
+                # Determine if ready to answer
+                ## Option1: High confidence & Enough time elapsed
+                ## Option2: Enough observation & All inference is done
+                ## Option3: Time is almost up
+                ready_to_answer = (((best_confidence > thres_high and elapsed >= rospy.Duration(5 * 60)) 
+                                    or (enough_observation and all_inference_done))
+                                    or (remaining_time <= rospy.Duration(30)))  # (sec)
+                self.logger.logrich(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", name='time')
 
                 if ready_to_answer:
                     self.answer_result = self.agg_results.best_answer  # TODO
@@ -954,9 +962,12 @@ class BaseVisualGrounder(BaseModel):
 
             # Inference
             try:
-                for _ in range(self.inference_queue.qsize()):
+                with self.inference_queue_lock:
+                    inference_queue_size = self.inference_queue.qsize()
+                for _ in range(inference_queue_size):
                     try:
-                        jobs = self.inference_queue.get_nowait()
+                        with self.inference_queue_lock:
+                            jobs = self.inference_queue.get_nowait()
                     except queue.Empty:
                         break
                     for item, result in self.run_parallel(self.inference, jobs, max_workers=self.max_workers):
@@ -1007,7 +1018,6 @@ class BaseVisualGrounder(BaseModel):
                                 self.agg_results.inc_queries(gid, 1, eids=answer.eids)
                             self.logger.loginfo(f"<inference_loop.4.4.{_}> Release group({gid})")
                             self.logger.logrich(f"<inference_loop.4.5.{_}> AggResults: {self.agg_results}", name='agg_results')
-
             except Exception as e:
                 self.logger.logerr(f"<inference_loop.4> Error occurs: {e}")
             rate.sleep()
@@ -1477,7 +1487,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.update_resource(**kwargs)
 
         # Select Group ID
-        num_queries_required = self.agg_results.min_query
+        num_queries_required = 1 # self.agg_results.min_query
         try:
             (gid, eids) = self.inference_signal_queue.get_nowait()
             # self.agg_results.generate(gid=gid)  # 모든 related_entity는 어떤 group에 할당됨
@@ -1683,6 +1693,8 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             colors = _color_palette(len(path_points_all), alpha=0.5)
             current_gid = self.current_gid
             self.logger.logrich(f"<navigate.3> Current group ID: {current_gid}", name="gid")
+            
+            # Fail to find current_gid
             if current_gid is None:
                 self.logger.loginfo(f"<navigate.3> Current GID is None.")
                 if self.agent_pose:
@@ -1698,80 +1710,83 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                             min_gid = gid
                     self.current_gid = min_gid
                     self.logger.loginfo(f"<navigate.3> Changed GID: {current_gid} -> {self.current_gid}")
+                    
+                # current_gid = self.current_gid
+                # current_path_points = path_points_all.get(current_gid, [])
+                # if len(current_path_points) == 0:
+                #     now = rospy.Time.now()
+                #     t0 = self._empty_path_since.get(current_gid)
 
-                current_path_points = path_points_all.get(current_gid, [])
-                if len(current_path_points) == 0:
-                    now = rospy.Time.now()
-                    t0 = self._empty_path_since.get(current_gid)
+                #     if t0 is None:
+                #         # 처음 빈 상태 감지 → 타이머 시작
+                #         self._empty_path_since[current_gid] = now
+                #         self.logger.loginfo(f"<navigate.bump> Start empty-path timer for GID({current_gid})")
+                #     else:
+                #         candidate_eids1 = self.sg.get_candidate_entities('object').ids
+                #         candidate_eids2 = self.sg.get_candidate_entities('detection').ids
+                #         candidate_eids = list(set(candidate_eids1 + candidate_eids2))
+                #         pending_eids = sorted(
+                #             [
+                #                 eid for eid in candidate_eids
+                #                 if self.agg_results.results_by_entity.num_queries.get(eid, 0) < self.agg_results.min_query
+                #             ],
+                #             key=lambda eid: self.agg_results.results_by_entity.num_queries.get(eid, 0)
+                #         )
+                #         pending_candidate_eids = list(set(pending_eids) & set(candidate_eids))
 
-                    if t0 is None:
-                        # 처음 빈 상태 감지 → 타이머 시작
-                        self._empty_path_since[current_gid] = now
-                        self.logger.loginfo(f"<navigate.bump> Start empty-path timer for GID({current_gid})")
-                    else:
-                        candidate_eids1 = self.sg.get_candidate_entities('object').ids
-                        candidate_eids2 = self.sg.get_candidate_entities('detection').ids
-                        candidate_eids = list(set(candidate_eids1 + candidate_eids2))
-                        pending_eids = sorted(
-                            [
-                                eid for eid in candidate_eids
-                                if self.agg_results.results_by_entity.num_queries.get(eid, 0) < self.agg_results.min_query
-                            ],
-                            key=lambda eid: self.agg_results.results_by_entity.num_queries.get(eid, 0)
-                        )
-                        pending_candidate_eids = list(set(pending_eids) & set(candidate_eids))
+                #         dur = now - t0
+                #         if dur > self._empty_path_cooldown and len(pending_candidate_eids) == 0:
+                #             before = self.agg_results.min_query
+                #             self.agg_results.min_query = min(
+                #                 self.agg_results.min_query + 1,
+                #                 getattr(self.agg_results, "max_query", self.agg_results.min_query + 1)
+                #             )
+                #             after = self.agg_results.min_query
+                #             self.logger.loginfo(
+                #                 f"<navigate.bump> Increase min_query: {before} -> {after} "
+                #                 f"(empty-path {dur.to_sec():.3f} sec)"
+                #             )
 
-                        dur = now - t0
-                        if dur > self._empty_path_cooldown and len(pending_candidate_eids) == 0:
-                            before = self.agg_results.min_query
-                            self.agg_results.min_query = min(
-                                self.agg_results.min_query + 1,
-                                getattr(self.agg_results, "max_query", self.agg_results.min_query + 1)
-                            )
-                            after = self.agg_results.min_query
-                            self.logger.loginfo(
-                                f"<navigate.bump> Increase min_query: {before} -> {after} "
-                                f"(empty-path {dur.to_sec():.3f} sec)"
-                            )
+                #             # 2) 이 GID에 대해 즉시 배치 구성 후 enqueue
+                #             try:
+                #                 num_queries_required = self.agg_results.min_query
+                #                 if len(pending_candidate_eids) == 0:
+                #                     data, pids = [], []
+                #                 else:
+                #                     data, pids = self.build_batch_for_gid(
+                #                         eids=pending_candidate_eids, num_queries_required=num_queries_required
+                #                     )
+                #                 self.logger.loginfo(f"<navigate.bump> Selected KFs: {list(set(pids))}")
+                #                 if data:
+                #                     # 큐에 투입
+                #                     try:
+                #                         self.inference_queue.put_nowait(data)
+                #                     except queue.Full:  # 꽉 차면 다음 턴에 시도 (예약도 건너뜀)
+                #                         self.logger.logwarn("<navigate.bump> inference_queue full; will retry later.")
+                #                     else:
+                #                         # 예약 증가
+                #                         self.agg_results.schedule(current_gid, n=len(data), data=data)
+                #                         self.logger.loginfo(
+                #                             "<navigate.bump> Put data to inference_queue:\n" +
+                #                             "\n".join([
+                #                                 f"  > pids: {', '.join(map(str, d['keyframes'].ids))}, etype: {d['etype']}, atype: {d['atype']}, eids: {d['eids']}"
+                #                                 for d in data
+                #                             ])
+                #                         )
+                #                 else:
+                #                     self.logger.loginfo(f"<navigate.bump> No keyframes for GID({current_gid})")
+                #             except Exception as e:
+                #                 self.logger.logerr(f"<navigate.bump> Error while enqueue: {e}")
 
-                            # 2) 이 GID에 대해 즉시 배치 구성 후 enqueue
-                            try:
-                                num_queries_required = self.agg_results.min_query
-                                if len(pending_candidate_eids) == 0:
-                                    data, pids = [], []
-                                else:
-                                    data, pids = self.build_batch_for_gid(
-                                        eids=pending_candidate_eids, num_queries_required=num_queries_required
-                                    )
-                                self.logger.loginfo(f"<navigate.bump> Selected KFs: {list(set(pids))}")
-                                if data:
-                                    # 큐에 투입
-                                    try:
-                                        self.inference_queue.put_nowait(data)
-                                    except queue.Full:  # 꽉 차면 다음 턴에 시도 (예약도 건너뜀)
-                                        self.logger.logwarn("<navigate.bump> inference_queue full; will retry later.")
-                                    else:
-                                        # 예약 증가
-                                        self.agg_results.schedule(current_gid, n=len(data), data=data)
-                                        self.logger.loginfo(
-                                            "<navigate.bump> Put data to inference_queue:\n" +
-                                            "\n".join([
-                                                f"  > pids: {', '.join(map(str, d['keyframes'].ids))}, etype: {d['etype']}, atype: {d['atype']}, eids: {d['eids']}"
-                                                for d in data
-                                            ])
-                                        )
-                                else:
-                                    self.logger.loginfo(f"<navigate.bump> No keyframes for GID({current_gid})")
-                            except Exception as e:
-                                self.logger.logerr(f"<navigate.bump> Error while enqueue: {e}")
-
-                            # 3) 타이머 리셋(지속적으로 쏟아내지 않도록)
-                            self._empty_path_since[current_gid] = now  # 또는 None으로 초기화도 가능
-                    # ------------------ ✅ 끝 ------------------
+                #             # 3) 타이머 리셋(지속적으로 쏟아내지 않도록)
+                #             self._empty_path_since[current_gid] = now  # 또는 None으로 초기화도 가능
+                #     # ------------------ ✅ 끝 ------------------
 
                 exp_strategy = "geometric_frontier"
                 self.exploration_strategy_pub.publish(String(exp_strategy))
                 return
+            
+            # Success to find current_gid
             current_path_points = path_points_all.get(current_gid)
             if current_path_points is None:
                 self.logger.loginfo(f"<navigate.3> Current path_points for GID({current_gid}) is None.")
@@ -1847,6 +1862,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         except Exception as e:
             self.logger.logerr(f"<navigate.4.4> Error occurs: {e}")
 
+        # Set exploration strategy
         try:
             if len(current_path_points) > 0:
                 is_running = self.active_clients.start()
@@ -1933,10 +1949,10 @@ if __name__ == "__main__":
 
     SCENE = "arabic_room"
     if SCENE == "arabic_room":
-        instruction = "How many sofas are below a window?"
-        action = 'count'
-        target_name = "sofas below a window"
-        candidate_names, reference_names = ['sofa'], ['window']
+        instruction = "Find the pillow closest to the book on the stool."
+        action = 'find'
+        target_name = "pillow closest to the book on the stool"
+        candidate_names, reference_names = ['pillow'], ['book', 'stool']
     else:
         raise TypeError(f"SCENE must be in ['office_1', 'hotel_room_1', 'chinese_room'], but {SCENE} was given.")
 
