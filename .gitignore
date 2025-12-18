@@ -16,3 +16,6 @@ vis/*
 keyframes/*
 ai_module/src/model_weights
 system/
+
+# secrets
+ai_module/src/config.json
