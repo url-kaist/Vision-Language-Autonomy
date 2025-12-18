@@ -15,8 +15,6 @@ import random
 import time
 import threading
 import numpy as np
-if not hasattr(np, "int"):
-    np.int = int  # for older networkx that still refers to np.int
 from collections import deque
 import json
 import tf
@@ -73,12 +71,7 @@ from active_utils import (quaternion_to_yaw, create_fov_polygon,
 
 from label_constants import MATTERPORT_COLOR_MAP_160, MATTERPORT_LABELS_160
 from bg_process import BGProcessor
-from generate_seg_cloud import (
-    generate_seg_comp_cloud,
-    scan2pixels_jackal,
-    generate_seg_comp_cloud_jackal,
-    _generate_seg_comp_cloud_from_depth,
-)
+from generate_seg_cloud import generate_seg_comp_cloud, scan2pixels_jackal, generate_seg_comp_cloud_jackal
 
 sys.path.append("/workspace")
 sys.path.append("/workspace/ai_module/src/")
@@ -189,19 +182,6 @@ class SceneGraphProcessor:
         # self.new_detection_signal = True
         self.active_signal = False
 
-        # depth 카메라 좌표계(z-앞, x-오른쪽, y-아래)를
-        # 로봇 body 좌표계(x-앞, y-좌, z-위)로 변환하는 회전
-        # [x_b, y_b, z_b]^T = R_cb @ [x_cam, y_cam, z_cam]^T
-        self.cam_to_body_R = np.array(
-            [
-                [0.0, 0.0, 1.0],   # x_b ← z_cam
-                [-1.0, 0.0, 0.0],  # y_b ← -x_cam
-                [0.0, -1.0, 0.0],  # z_b ← -y_cam
-            ],
-            dtype=np.float32,
-        )
-        self.cam_to_body_t = np.zeros(3, dtype=np.float32)
-
         device = "cuda:0" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "cpu"
         self.logger.loginfo(f"******** Device: {device} **********")
         try:
@@ -295,58 +275,27 @@ class SceneGraphProcessor:
         # self.odom_sub = rospy.Subscriber("/state_estimation", Odometry, self.test_callback, callback_args="odom", queue_size=10)
         # self.traversable_area_sub = rospy.Subscriber("/traversable_area_filtered", PointCloud2, self.test_callback, callback_args="traversable", queue_size=10) # Test
 
-        # 설정
-        self.use_depth_for_seg = rospy.get_param("~use_depth_for_seg", True)
-        # 기본값은 fakeD455DepthFromLidar가 publish 하는 토픽과 맞춤
-
         # ROS I/O
         self.is_real_world = rospy.get_param('~real_world', False)
         if self.is_real_world:
-            self.is_compressed_image = False
+            self.is_compressed_image = True
             self.logger.loginfo(f"Hello Real World!!")
-            if self.is_compressed_image:
-                self.rgb_sub = Subscriber("/camera/image/compressed", CompressedImage)
-            else:
-                self.rgb_sub = Subscriber("/camera/image", Image)
-            if self.use_depth_for_seg:
-                self.logger.loginfo(f"Depth sync enabled (real), topic=/camera/depth_image")
-                self.depth_sub = Subscriber("/camera/depth_image", Image)
+            self.rgb_sub = Subscriber("/camera/image", CompressedImage)
+
             self.yolo_debug_img_pub = rospy.Publisher("/debug/yolo_image", Image, queue_size=1)
             self.debug_publish_rate = 2.0  # Hz
             self.last_debug_pub_time = rospy.Time(0)
         else:
             self.rgb_sub = Subscriber("/camera/image", Image)
             self.is_compressed_image = False
-            if self.use_depth_for_seg:
-                self.logger.loginfo(f"Depth sync enabled (sim), topic=/camera/depth_image")
-                self.depth_sub = Subscriber("/camera/depth_image", Image)
-        self.cloud_sub = Subscriber("/registered_scan", PointCloud2)
+        self.cloud_sub = Subscriber("/sensor_scan", PointCloud2)
         self.odom_sub = rospy.Subscriber("/state_estimation", Odometry, self.odom_callback, queue_size=10)
-        if self.use_depth_for_seg:
-            # Depth 기반 세그멘테이션 사용 시,
-            # 실세계(real_world)에서는 LiDAR 없이 RGB+Depth만 동기화하여
-            # depth가 있으면 LiDAR에 의존하지 않도록 구성.
-            if self.is_real_world:
-                print("ApproximateTimeSynchronizer with depth (real world, no lidar)")
-                self.sync_sub = ApproximateTimeSynchronizer(
-                    [self.rgb_sub, self.depth_sub], queue_size=20, slop=0.1
-                )
-            else:
-                print("ApproximateTimeSynchronizer with depth + lidar")
-                self.sync_sub = ApproximateTimeSynchronizer(
-                    [self.rgb_sub, self.depth_sub, self.cloud_sub], queue_size=20, slop=0.1
-                )
-        else:
-            # Depth를 사용하지 않는 경우, 기존처럼 LiDAR와만 동기화
-            self.sync_sub = ApproximateTimeSynchronizer(
-                [self.rgb_sub, self.cloud_sub], queue_size=10, slop=0.05
-            )
+        self.sync_sub = ApproximateTimeSynchronizer([self.rgb_sub, self.cloud_sub], queue_size=10, slop=0.02)
         self.sync_sub.registerCallback(self.sync_callback)
 
 
         self.frame_id = "world" if self.is_real_world else "map"
-        # real_world 에서는 DBSCAN 반경을 줄여 좀 더 타이트하게 클러스터링
-        self.dbscan_eps = 0.2 if self.is_real_world else 0.1
+        self.dbscan_eps = 0.5 if self.is_real_world else 0.1
         self.keyframe_dist = 0.5 if self.is_real_world else 3.0
 
         self.hash_map_pub = rospy.Publisher(
@@ -458,9 +407,10 @@ class SceneGraphProcessor:
         with self.lock:
             self.odom_queue.append((stamp, pose))
 
-    def sync_callback(self, img_msg, *args):
+    def sync_callback(self, img_msg, cloud_msg):
         if not self.already_set_classes:
             return
+
         stamp = img_msg.header.stamp.to_nsec()
         if self.is_compressed_image:
             np_arr = np.frombuffer(img_msg.data, np.uint8)
@@ -469,32 +419,8 @@ class SceneGraphProcessor:
             rgb = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
         self.rgb_queue.put((stamp, rgb))
 
-        depth = None
-        cloud_msg = None
-        if self.use_depth_for_seg:
-            # depth 기반 세그멘테이션 사용 시
-            # - (depth_msg, cloud_msg) 또는
-            # - (depth_msg,) 형태 모두 허용
-            if len(args) == 2:
-                depth_msg, cloud_msg = args
-            elif len(args) == 1:
-                (depth_msg,) = args
-                cloud_msg = None
-            else:
-                return
-
-            try:
-                depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
-            except Exception:
-                depth = None
-        else:
-            # depth를 사용하지 않는 경우: args는 (cloud_msg,) 이어야 함
-            if len(args) != 1:
-                return
-            (cloud_msg,) = args
-
         with self.lock:
-            self.vision_queue.append((stamp, rgb, depth, cloud_msg))
+            self.vision_queue.append((stamp, rgb, cloud_msg))
 
     def find_interpolated_pose(self, target_stamp):
         with self.lock:
@@ -546,13 +472,14 @@ class SceneGraphProcessor:
             if len(self.vision_queue) == 0 or len(self.odom_queue) == 0:
                 rospy.sleep(0.01)
                 continue
-            stamp, rgb, depth, cloud_msg = self.vision_queue[-1]
+            stamp, rgb, cloud_msg = self.vision_queue[-1]
             pose_interp = self.find_interpolated_pose(stamp)
             if pose_interp is None:
                 if self.odom_queue[0][0] > stamp:
                     self.vision_queue.popleft()
                 continue
-            self.sync_queue[stamp] = (rgb, depth, cloud_msg, pose_interp)
+            # self.sync_queue.append((stamp, rgb, depth, pose_interp))
+            self.sync_queue[stamp] = (rgb, cloud_msg, pose_interp)
             with self.lock:
                 self.vision_queue.popleft()
                 self.odom_queue.popleft()
@@ -664,7 +591,7 @@ class SceneGraphProcessor:
         return hash_key
 
     def merge_detections_every_n_iter(self, iter_num, n=10):   # todo
-        if iter_num==0 or iter_num%n !=0:
+        if iter_num%n !=0:
             return
         print("merge_detections_every_n_iter", n)
 
@@ -792,7 +719,6 @@ class SceneGraphProcessor:
                     affected_pts[old_id].append(f"{old_point[0]}_{old_point[1]}_{old_point[2]}")
                     continue
             self.map_hash[key] = [new_point]
-        print(f"override_points: affected_ids: {affected_ids} pts: {len(points)}")
 
         # 2. affected id의 points 재계산
         for affected_id in affected_ids:
@@ -1014,7 +940,6 @@ class SceneGraphProcessor:
                 self.sg_graph.nodes[object_node]["bbox_by_kf"] = bbox_by_kf
 
             elif object_node not in self.sg_graph:
-                print(f"New object {det_id} {det['class_name']} add node to SG!!!!!")
                 self.sg_graph.add_node(
                     object_node,
                     type="object",
@@ -1158,26 +1083,20 @@ class SceneGraphProcessor:
             #         self.logger.loginfo(f"New max track ID: {self.prev_max_id}")
             #         self.new_detection_signal = True
 
-            image, depth_image, cloud_msg, pose = synced_data
+            
+            image, cloud_msg, pose = synced_data
             for k in list(self.sync_queue.keys()):
                 if k < stamp:
                     del self.sync_queue[k]
-
-            # LiDAR가 없는 경우(real world에서 depth만 사용하는 경우 등)를
-            # 고려하여 cloud_msg가 None일 수 있음.
-            if cloud_msg is not None:
-                cloud_body = convert_pointcloud2_to_xyz(cloud_msg)
-                if self.is_real_world:
-                    cloud_body = cloud_body[np.linalg.norm(cloud_body, axis=1) < 5.0]
-            else:
-                cloud_body = np.empty((0, 3), dtype=np.float32)
-
+            cloud_body = convert_pointcloud2_to_xyz(cloud_msg)
+            if self.is_real_world:
+                cloud_body = cloud_body[np.linalg.norm(cloud_body, axis=1) < 5.0]
             # cloud_body = voxel_downsample(cloud_body, 0.02)
 
             # cloud_body = cloud_body[cloud_body[:, 2] > 0.05]
             R_b2w = pose["rotation"]
             t_b2w = pose["position"]
-            cloud = cloud_body @ R_b2w.T + t_b2w if cloud_body.size > 0 else np.empty((0, 3), dtype=np.float32)
+            cloud = cloud_body @ R_b2w.T + t_b2w
 
             #4x4 pose
             cur_pose = np.eye(4)
@@ -1211,44 +1130,46 @@ class SceneGraphProcessor:
                         label = self.obj_classes[cls_id] if 0 <= cls_id < len(self.obj_classes) else str(cls_id)
                         cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
                         txt = f"{label} {conf:.2f}"
-                        cv2.putText(
-                            debug_img,
-                            txt,
-                            (x1, max(0, y1 - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 255, 0),
-                            1,
-                            cv2.LINE_AA,
-                        )
+                        cv2.putText(debug_img, txt, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
+                                    cv2.LINE_AA)
+
                     height, width, _ = debug_img.shape
-                    # 여기서는 YOLO 박스만 그리고, depth 기반 포인트 투영은
-                    # 아래에서 obj_clouds_world 결과를 가지고 다시 그린다.
+                    point_pixel_idx = scan2pixels_jackal(cloud_body)
+                    point_pixel_idx[:,1] += 200
+
+                    out_of_bound_filter = (
+                            (point_pixel_idx[:, 0] >= 0) & (point_pixel_idx[:, 0] < width) &
+                            (point_pixel_idx[:, 1] >= 0) & (point_pixel_idx[:, 1] < height)
+                    )
+                    point_pixel_idx = point_pixel_idx[out_of_bound_filter]
+
+                    for x, y, z in point_pixel_idx:
+                        cv2.circle(debug_img, (x, y), 3, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+                    cv2.imwrite("/workspace/vis/yolo_debug.jpg", debug_img)
+
+                    # msg = CompressedImage()
+                    # msg.header.stamp = rospy.Time(secs=int(stamp // 1e9), nsecs=int(stamp % 1e9))
+                    # msg.format = "jpeg"
+                    # msg.data = np.array(cv2.imencode('.jpg', debug_img, [cv2.IMWRITE_JPEG_QUALITY, 60])[1]).tobytes()
+
+                    seconds = int(stamp // 1e9)
+                    nanoseconds = int(stamp % 1e9)
+                    msg = self.bridge.cv2_to_imgmsg(debug_img, encoding="bgr8")
+                    msg.header.stamp = rospy.Time(secs=seconds, nsecs=nanoseconds)
+                    msg.header.frame_id = "camera"  # 카메라 프레임명에 맞게 변경 가능
+
+                    self.yolo_debug_img_pub.publish(msg)
+                    self.last_debug_pub_time = vis_now
+                    self.logger.loginfo(f"publish yolo")
 
             sam_results = self.sam_model.predict(
                 image.copy(), bboxes=bounding_boxes, verbose=False,
             )
             masks = sam_results[0].masks.data
-
-            # SAM 마스크에 약간의 침식을 적용해서 경계를 더 보수적으로 만듦
             masks_np = []
-            for i, box in enumerate(bounding_boxes):
-                mask_i = masks[i].cpu().numpy().astype(np.uint8)
-                # 박스 폭 기반으로 1D 커널 크기 결정
-                try:
-                    box_width = float(box[2] - box[0])
-                except Exception:
-                    box_width = mask_i.shape[1]
-                kernel_width = int(box_width / 5.0)
-                if kernel_width > 10:
-                    kernel = np.ones((1, kernel_width), np.uint8)
-                    eroded_mask = cv2.erode(mask_i, kernel, iterations=1)
-                    masks_np.append(eroded_mask)
-                else:
-                    masks_np.append(mask_i)
-            masks_np = np.array(masks_np)
-
+            
             sam_boxes = []
+            masks_np = np.array(masks.cpu().numpy())
 
             def mask_to_bbox(mask: torch.Tensor):
                 if isinstance(mask, np.ndarray):
@@ -1269,159 +1190,28 @@ class SceneGraphProcessor:
 
             t3 = time.time()
             projected_image = image.copy()
-
-            # Kinect(depth) 기반 포인트 클라우드 사용 (가능하면)
-            if self.use_depth_for_seg and (depth_image is not None):
-                obj_clouds_world, pts_body_list, colors_list, semantic_labels = _generate_seg_comp_cloud_from_depth(
-                    depth_image,
+            if self.is_real_world:
+                obj_clouds_world, colors_list, semantic_labels = generate_seg_comp_cloud_jackal(
+                    cloud_body,
                     masks_np,
-                    labels,
+                    labels,  # same order with masks_np
                     pose["rotation"],
                     pose["position"],
                     image_src=image.copy(),
-                    depth_scale=0.001,  # RealSense 계열 depth: mm 단위 → m 로 변환
-                    cam_to_body_R=self.cam_to_body_R,
-                    cam_to_body_t=self.cam_to_body_t,
+                    platform="wheelchair",
                 )
             else:
-                # 기존 LiDAR 기반 경로 (fallback)
-                if self.is_real_world:
-                    obj_clouds_world, colors_list, semantic_labels = generate_seg_comp_cloud_jackal(
-                        cloud_body,
-                        masks_np,
-                        labels,  # same order with masks_np
-                        pose["rotation"],
-                        pose["position"],
-                        image_src=image.copy(),
-                        platform="wheelchair",
-                    )
-                else:
-                    obj_clouds_world, colors_list, semantic_labels = generate_seg_comp_cloud(
-                        cloud_body,
-                        masks_np,
-                        labels,  # same order with masks_np
-                        pose["rotation"],
-                        pose["position"],
-                        image_src=image.copy(),
-                        platform="wheelchair",
-                        label_ids=self.classnames
-                        # index=iter
-                    )
-
-            # Depth 기반 포인트클라우드(obj_clouds_world)를
-            # RGB 이미지에 다시 투영해서 시각화 (디버그용)
-            if (
-                self.is_real_world
-                and self.use_depth_for_seg
-                and (depth_image is not None)
-                and (self.yolo_debug_img_pub is not None)
-                and obj_clouds_world
-            ):
-                vis_now = rospy.Time.now()
-                if (vis_now - self.last_debug_pub_time).to_sec() > 1.0 / self.debug_publish_rate:
-                    debug_img = image.copy()
-                    # 1) YOLO 박스/레이블 다시 그리기
-                    for i, box in enumerate(bounding_boxes):
-                        x1, y1, x2, y2 = map(int, box)
-                        cls_id = class_ids[i]
-                        conf = confs[i]
-                        label = self.obj_classes[cls_id] if 0 <= cls_id < len(self.obj_classes) else str(cls_id)
-                        cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        txt = f"{label} {conf:.2f}"
-                        cv2.putText(
-                            debug_img,
-                            txt,
-                            (x1, max(0, y1 - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 255, 0),
-                            1,
-                            cv2.LINE_AA,
-                        )
-
-                    height, width, _ = debug_img.shape
-
-                    # 2) pts_body_list (body 좌표)를 RGB 이미지로 투영
-                    H_rgb, W_rgb, _ = image.shape
-
-                    # RGB 카메라 intrinsic (480x640 기준, CameraInfo)
-                    if H_rgb == 480 and W_rgb == 640:
-                        fx_rgb = 606.040283203125
-                        fy_rgb = 606.2955932617188
-                        cx_rgb = 328.3797912597656
-                        cy_rgb = 245.35792541503906
-                    else:
-                        # 해상도가 다른 경우에는 대략적인 intrinsic 사용
-                        fx_rgb = W_rgb / 2.0
-                        fy_rgb = H_rgb / 2.0
-                        cx_rgb = W_rgb / 2.0
-                        cy_rgb = H_rgb / 2.0
-
-                    max_range = 10.0  # [m], 이 이상은 far
-
-                    for pts_body in pts_body_list:
-                        if pts_body is None:
-                            continue
-                        pts_body = np.asarray(pts_body, dtype=np.float32)
-                        if pts_body.size == 0:
-                            continue
-
-                        # body → camera 좌표 변환 (camera 기준으로 투영)
-                        # pts_body = pts_cam @ R_cb^T  =>  pts_cam = pts_body @ R_cb
-                        pts_cam = pts_body @ self.cam_to_body_R
-
-                        Z = pts_cam[:, 2]
-                        valid = (Z > 0) & np.isfinite(Z)
-                        if not np.any(valid):
-                            continue
-                        pts_cam = pts_cam[valid]
-                        Z = Z[valid]
-                        X = pts_cam[:, 0]
-                        Y = pts_cam[:, 1]
-
-                        u = fx_rgb * (X / Z) + cx_rgb
-                        v = fy_rgb * (Y / Z) + cy_rgb
-
-                        u = u.astype(np.int32)
-                        v = v.astype(np.int32)
-
-                        in_img = (u >= 0) & (u < width) & (v >= 0) & (v < height)
-                        if not np.any(in_img):
-                            continue
-
-                        u = u[in_img]
-                        v = v[in_img]
-                        Z_draw = Z[in_img]
-
-                        # 너무 많으면 샘플링
-                        step_pts = max(1, int(len(u) / 2000))
-
-                        for uu, vv, d in zip(u[::step_pts], v[::step_pts], Z_draw[::step_pts]):
-                            # 깊이에 따라 색상 변경 (가까울수록 노랑, 멀수록 밝은 빨강)
-                            val = float(np.clip(d / max_range, 0.0, 1.0))
-                            # BGR: near -> (0,255,255) (yellow), far -> (0,0,255) (red)
-                            b = 0
-                            r = 255
-                            g = int(255 * (1.0 - val))
-                            cv2.circle(
-                                debug_img,
-                                (int(uu), int(vv)),
-                                2,
-                                (b, g, r),
-                                -1,
-                                lineType=cv2.LINE_AA,
-                            )
-
-                    # 디버그용 depth 세그 포인트 투영 이미지 저장 및 publish
-                    cv2.imwrite("/workspace/vis/0_depth_seg_reproj_debug.jpg", debug_img)
-                    seconds = int(stamp // 1e9)
-                    nanoseconds = int(stamp % 1e9)
-                    msg = self.bridge.cv2_to_imgmsg(debug_img, encoding="bgr8")
-                    msg.header.stamp = rospy.Time(secs=seconds, nsecs=nanoseconds)
-                    msg.header.frame_id = "camera"
-                    self.yolo_debug_img_pub.publish(msg)
-                    self.last_debug_pub_time = vis_now
-                    self.logger.loginfo("publish depth_seg_reproj_debug")
+                obj_clouds_world, colors_list, semantic_labels = generate_seg_comp_cloud(
+                    cloud_body,
+                    masks_np,
+                    labels,  # same order with masks_np
+                    pose["rotation"],
+                    pose["position"],
+                    image_src=image.copy(),
+                    platform="wheelchair",
+                    label_ids=self.classnames
+                    # index=iter
+                )
             
             for i, tracking_id in enumerate(tracking_ids):
                 if tracking_id == -1:
@@ -1482,8 +1272,7 @@ class SceneGraphProcessor:
 
                 cloud_tmp = obj_cloud.copy()
                 # print(f"self.dbscan_eps {self.dbscan_eps}")
-                # min_samples 를 3으로 올려 더 빡세게 잡음
-                obj_cloud = cluster_dbscan(obj_cloud, self.dbscan_eps, 3)
+                obj_cloud = cluster_dbscan(obj_cloud, self.dbscan_eps, 2)
                 
                 if obj_cloud.shape[0] < 3:
                     filtered2_num += 1
@@ -1665,7 +1454,6 @@ class SceneGraphProcessor:
                         "yolo_conf": yolo_conf,
                         "bbox": bounding_box,
                     })
-
                 # 3. NEW OBJECT (create new object if not merged)
                 else:
                     class_dict = {}
@@ -1693,7 +1481,6 @@ class SceneGraphProcessor:
                     print(f"{tracking_id} bounding_box {bounding_box}")
 
             self.logger.log(f"\033[94m✅ -1: {track_fail_num}, all: {all_num}, filtered: {filtered1_num}, {filtered2_num}, {filtered3_num}, {filtered4_num}, tracked: {tracked_num}, diff_cls: {diff_cls_num}, merged: {merged_num}, new: {new_detected_num}\033[0m")
-            
 
             # save current keyframe
             # current_time = time.time()
@@ -1894,27 +1681,11 @@ class SceneGraphProcessor:
                 continue
             if obj["center"] is None:
                 continue
-            min_pt = np.asarray(obj["min_bbox"], dtype=float)
-            max_pt = np.asarray(obj["max_bbox"], dtype=float)
-            center = np.asarray(obj["center"], dtype=float)
-            # NaN/inf 방지
-            if (
-                min_pt.shape[0] != 3
-                or max_pt.shape[0] != 3
-                or center.shape[0] != 3
-                or not np.all(np.isfinite(min_pt))
-                or not np.all(np.isfinite(max_pt))
-                or not np.all(np.isfinite(center))
-            ):
-                continue
-
+            min_pt, max_pt = obj["min_bbox"], obj["max_bbox"]
+            center = obj["center"]
             class_ids = obj["class_ids"]
-            if not class_ids:
-                continue
             class_id = max(class_ids, key=class_ids.get)
-            label = obj.get("class_name", "")
-            if label is None or str(label).strip() == "":
-                label = "object"
+            label = obj["class_name"]
             object_id = obj["id"]
             color = self.get_color(class_id)
             num_detections = obj["num_detections"]
@@ -1984,11 +1755,7 @@ class SceneGraphProcessor:
         marker.scale.z = scale
         marker.color.r, marker.color.g, marker.color.b = [c / 255.0 for c in color]
         marker.color.a = 1.0
-        # 빈 문자열/whitespace 방지
-        full_text = f"{object_id} {text}".strip()
-        if not full_text:
-            full_text = str(object_id)
-        marker.text = full_text  # + f" ({num_detections:.2f})"
+        marker.text = str(object_id) + " " + text # + f" ({num_detections:.2f})"
         return marker
 
     def get_bubble_marker(self, min_pt, max_pt, obj_id, color):
@@ -2083,11 +1850,12 @@ class SceneGraphProcessor:
                 marker.type = Marker.SPHERE
                 marker.action = Marker.ADD
 
+
                 pos = attr.get("position", None)
+                if pos is None:
+                    continue
 
                 if node_type == "building":
-                    if pos is None:
-                        continue
                     pos = list(pos)
                     pos[2] += 9.0
                     marker.color.r = 1.0
@@ -2098,9 +1866,7 @@ class SceneGraphProcessor:
                     marker.scale.y = 0.5
                     marker.scale.z = 0.5
                     # print(f"[INFO] Building node found at position: {pos}")
-                elif node_type == "room":
-                    if pos is None:
-                        continue
+                if node_type == "room":
                     pos = list(pos)
                     pos[2] += 6.0
                     # marker.type = Marker.CYLINDER
@@ -2112,8 +1878,6 @@ class SceneGraphProcessor:
                     marker.scale.y = 0.3
                     marker.scale.z = 0.3
                 elif node_type == "keyframe":
-                    if pos is None:
-                        continue
                     pos = list(pos)
                     pos[2] -= 3.0
                     marker.type = Marker.CUBE
@@ -2125,8 +1889,6 @@ class SceneGraphProcessor:
                     marker.scale.y = 0.3
                     marker.scale.z = 0.3
                 elif node_type == "place":
-                    if pos is None:
-                        continue
                     pos = list(pos)
                     pos[2] += 3.0
                     marker.type = Marker.CUBE
@@ -2159,14 +1921,9 @@ class SceneGraphProcessor:
                 else:
                     continue
 
-                # NaN/inf 방지
-                pos_arr = np.asarray(pos, dtype=float)
-                if pos_arr.shape[0] != 3 or not np.all(np.isfinite(pos_arr)):
-                    continue
-
-                marker.pose.position.x = float(pos_arr[0])
-                marker.pose.position.y = float(pos_arr[1])
-                marker.pose.position.z = float(pos_arr[2])
+                marker.pose.position.x = pos[0]
+                marker.pose.position.y = pos[1]
+                marker.pose.position.z = pos[2]
                 marker.pose.orientation.w = 1.0
 
                 markers.markers.append(marker)
@@ -2197,9 +1954,8 @@ class SceneGraphProcessor:
                     if best_room is None:
                         best_room = attr.get("room_label", "")
                         text_marker.color.r = 1.0
-                    # 텍스트가 비거나 공백뿐이면 RViz에서 경고가 나므로 스킵
-                    if best_room is not None and str(best_room).strip() != "":
-                        text_marker.text = f"{best_room}"
+                    if best_room is not None : #and best_room != "invalid":
+                        text_marker.text = f"{best_room}" if best_room is not None else place_id
                         markers.markers.append(text_marker)
                         marker_id += 1
 
@@ -2487,64 +2243,10 @@ class SceneGraphProcessor:
             ########
 
             # Prepare graph data
-            for node_id, attr in self.sg_graph.nodes(data=True):
-                # position to list
+            for _, attr in self.sg_graph.nodes(data=True):
                 pos = attr.get('position')
                 if hasattr(pos, 'tolist'):
                     attr['position'] = pos.tolist()
-
-                # Enrich object-layer nodes with desired schema
-                if attr.get("type") == "object":
-                    instance_id = attr.get("instance_id")
-
-                    # Fixed attributes
-                    attr["level"] = "NodeLevel.OBJECT"
-
-                    # Name: detected class name
-                    if "name" not in attr and "class_name" in attr:
-                        attr["name"] = attr["class_name"]
-
-                    # Attach raw points, centroid, extent, R (OBB)
-                    pts = None
-                    if instance_id is not None and instance_id in self.objects:
-                        obj_info = self.objects[instance_id]
-                        pts = obj_info.get("points", None)
-                        if isinstance(pts, np.ndarray):
-                            pts = pts.tolist()
-                        # Only set if not already present
-                        if "points" not in attr:
-                            attr["points"] = pts
-
-                        min_bbox = obj_info.get("min_bbox", None)
-                        max_bbox = obj_info.get("max_bbox", None)
-                        if min_bbox is not None and max_bbox is not None:
-                            min_arr = np.asarray(min_bbox, dtype=float)
-                            max_arr = np.asarray(max_bbox, dtype=float)
-                            centroid = (min_arr + max_arr) / 2.0
-                            extent = max_arr - min_arr
-                        elif pts is not None:
-                            pts_np = np.asarray(pts, dtype=float)
-                            centroid = pts_np.mean(axis=0)
-                            extent = pts_np.max(axis=0) - pts_np.min(axis=0)
-                        else:
-                            centroid = np.zeros(3, dtype=float)
-                            extent = np.zeros(3, dtype=float)
-
-                        attr["centroid"] = np.asarray(centroid, dtype=float).tolist()
-                        attr["extent"] = np.asarray(extent, dtype=float).tolist()
-                        # For now use axis-aligned box -> identity rotation
-                        attr["R"] = np.eye(3, dtype=float).tolist()
-                    else:
-                        # Fallback: use existing points on node if any
-                        pts = attr.get("points", None)
-                        if pts is not None:
-                            pts_np = np.asarray(pts, dtype=float)
-                            if pts_np.size > 0:
-                                centroid = pts_np.mean(axis=0)
-                                extent = pts_np.max(axis=0) - pts_np.min(axis=0)
-                                attr["centroid"] = np.asarray(centroid, dtype=float).tolist()
-                                attr["extent"] = np.asarray(extent, dtype=float).tolist()
-                                attr["R"] = np.eye(3, dtype=float).tolist()
 
             graph_data = node_link_data(self.sg_graph)
 

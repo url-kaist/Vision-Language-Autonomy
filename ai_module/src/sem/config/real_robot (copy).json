@@ -1,0 +1,6 @@
+{
+  "classnames": [],
+  "image_topic": "/theta_driver_node/image/compressed",
+  "lidar_topic": "/cloud_registered_body",
+  "odom_topic": "/Odometry"
+}
