@@ -38,7 +38,7 @@ from collections import defaultdict
 from multiprocessing import shared_memory
 
 import sys
-sys.path.append("/workspace/ai_module/src/sem/mmyolo/")
+sys.path.append("/ws/external/ai_module/src/sem/mmyolo/")
 
 from mmengine.config import Config, DictAction
 from mmengine.runner.amp import autocast
@@ -80,9 +80,9 @@ from generate_seg_cloud import (
     _generate_seg_comp_cloud_from_depth,
 )
 
-sys.path.append("/workspace")
-sys.path.append("/workspace/ai_module/src/")
-sys.path.append("/workspace/ai_module/src/sem/")
+sys.path.append("/ws/external")
+sys.path.append("/ws/external/ai_module/src/")
+sys.path.append("/ws/external/ai_module/src/sem/")
 from sem.srv import SetClasses, SetClassesResponse
 from std_srvs.srv import Trigger, TriggerResponse
 
@@ -91,7 +91,7 @@ from ultralytics import YOLO, SAM
 import open_clip
 
 from ai_module.src.utils.logger import Logger
-MODEL_WEIGHTS_DIR = "/workspace/ai_module/src/model_weights"
+MODEL_WEIGHTS_DIR = "/ws/external/ai_module/src/model_weights"
 
 scene = "scene"
 import multiprocessing as mp
@@ -115,15 +115,15 @@ class SceneGraphProcessor:
     def __init__(self):
         quiet = rospy.get_param('~quiet', False)
         self.logger = Logger(
-            quiet=quiet, prefix='SceneGraph', log_path="/workspace/log/scene_graph.log")
-        base_dir = '/workspace/offline_map'  # TODO: handle this using .json config file
+            quiet=quiet, prefix='SceneGraph', log_path="/ws/external/log/scene_graph.log")
+        base_dir = '/ws/external/offline_map'  # TODO: handle this using .json config file
         if os.path.exists(base_dir) and os.path.isdir(base_dir):
             shutil.rmtree(base_dir)
         os.makedirs(base_dir, exist_ok=True)
 
         self.debug = rospy.get_param('~debug', False)
         # Load Configuration
-        config_path = rospy.get_param('~config', "/workspace/ai_module/src/sem/config/simulation.json")
+        config_path = rospy.get_param('~config', "/ws/external/ai_module/src/sem/config/simulation.json")
         with open(config_path, "r") as f:
             config = json.load(f)
         self.logger.loginfo(f"=== configuration ===")
@@ -131,7 +131,7 @@ class SceneGraphProcessor:
             self.logger.loginfo(f"  {k} : {v}")
         self.logger.loginfo(f"=====================")
 
-        perception_debug_dir = "/workspace/perception_debug"
+        perception_debug_dir = "/ws/external/perception_debug"
         for file_path in glob.glob(os.path.join(perception_debug_dir, "*")):
             if os.path.isfile(file_path):
                 os.remove(file_path)
@@ -140,7 +140,7 @@ class SceneGraphProcessor:
         os.makedirs(perception_debug_dir, exist_ok=True)
         self.perception_debug_dir = perception_debug_dir
 
-        image_save_dir = "/workspace/keyframes"
+        image_save_dir = "/ws/external/keyframes"
         for file_path in glob.glob(os.path.join(image_save_dir, "*")):
             if os.path.isfile(file_path):
                 os.remove(file_path)
@@ -161,7 +161,7 @@ class SceneGraphProcessor:
         
         # perception
         try:
-            with open("/workspace/ai_module/src/config.json", "r") as f:
+            with open("/ws/external/ai_module/src/config.json", "r") as f:
                 yolo_config = json.load(f)
             self.model_size = yolo_config["YOLO_MODEL_SIZE"] ## m or l or x
             self.confidence = yolo_config["YOLO_CONFIDENCE"]
@@ -170,7 +170,7 @@ class SceneGraphProcessor:
             self.model_size = "l" ## m or l or x
             self.confidence = 0.3
         try:
-            cfg = Config.fromfile("/workspace/ai_module/src/sem/config/yolo-world_config_" + self.model_size + ".py")
+            cfg = Config.fromfile("/ws/external/ai_module/src/sem/config/yolo-world_config_" + self.model_size + ".py")
             cfg.load_from = os.path.join(MODEL_WEIGHTS_DIR, f"yolo_weights/yolo-world_{self.model_size}.pth")
 
             # models
@@ -180,7 +180,7 @@ class SceneGraphProcessor:
             self.logger.logerr(f"ERROR MSG: {e}")
             # self.logger.logerr(f"Please download \"yolo_weights/yolo-world_{self.model_size}.pth\""
             #                    f"from `urserver.kaist.ac.kr/dataset/project_dataset/CMU-VLA-Challenge/_model_weights/` "
-            #                    f"and place it to `/workspace/ai_module/src/model_weights/`.")
+            #                    f"and place it to `/ws/external/ai_module/src/model_weights/`.")
         test_pipeline_cfg = get_test_pipeline_cfg(cfg=cfg)
         self.test_pipeline = Compose(test_pipeline_cfg)
 
@@ -1413,7 +1413,7 @@ class SceneGraphProcessor:
                             )
 
                     # 디버그용 depth 세그 포인트 투영 이미지 저장 및 publish
-                    cv2.imwrite("/workspace/vis/0_depth_seg_reproj_debug.jpg", debug_img)
+                    cv2.imwrite("/ws/external/vis/0_depth_seg_reproj_debug.jpg", debug_img)
                     seconds = int(stamp // 1e9)
                     nanoseconds = int(stamp % 1e9)
                     msg = self.bridge.cv2_to_imgmsg(debug_img, encoding="bgr8")
@@ -1787,8 +1787,8 @@ class SceneGraphProcessor:
             txt = f"{id}: {class_name}"
             cv2.putText(image, txt, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5,  (255, 255, 255), 1,
                         cv2.LINE_AA)
-        os.makedirs(f"/workspace/vis", exist_ok=True)
-        cv2.imwrite(f"/workspace/vis/bbox_by_kf_{kf_id}.jpg", image)
+        os.makedirs("/ws/external/vis", exist_ok=True)
+        cv2.imwrite(f"/ws/external/vis/bbox_by_kf_{kf_id}.jpg", image)
         print(f"Saved bbox_by_kf_{kf_id}.jpg")
 
     def show_yolosam_image(self, rgb, boxes, masks, tracking_ids):
@@ -1819,7 +1819,7 @@ class SceneGraphProcessor:
             rgb = cv2.addWeighted(rgb, 1, mask_rgb, 0.5, 0)
 
         # cv2.imshow("YOLO + SAM Masked Image", rgb)
-        cv2.imwrite("/workspace/vis/masked_image.png", rgb)
+        cv2.imwrite("/ws/external/vis/masked_image.png", rgb)
         # cv2.waitKey(1)
         
     def publish_hash_map(self):
@@ -1882,8 +1882,8 @@ class SceneGraphProcessor:
                     colored_mask[:, :, c] = mask * color[c]
                 overlay = cv2.addWeighted(overlay, 1.0, colored_mask, 0.8, 0)
         result = cv2.addWeighted(image, 1.0, overlay, 0.8, 0)
-        os.makedirs(f"/workspace/ai_module/src/test", exist_ok=True)
-        cv2.imwrite(f"/workspace/ai_module/src/test/annotated_{index}.jpg", result)
+        os.makedirs("/ws/external/test", exist_ok=True)
+        cv2.imwrite(f"/ws/external/test/annotated_{index}.jpg", result)
 
         # return cv2.addWeighted(image, 1.0, overlay, 0.8, 0)
 
@@ -2405,8 +2405,8 @@ class SceneGraphProcessor:
             else:
                 return obj
 
-        # base_dir = '/workspace/vla_ws/CMU-VLA-Challenge/ai_module/offline_map' #'/workspace/offline_map'
-        base_dir = '/workspace/offline_map' # TODO: handle this using .json config file
+        # base_dir = '/ws/external/vla_ws/CMU-VLA-Challenge/ai_module/offline_map' #'/ws/external/offline_map'
+        base_dir = '/ws/external/offline_map' # TODO: handle this using .json config file
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir = os.path.join(base_dir, timestamp)
         os.makedirs(save_dir, exist_ok=True)
@@ -2487,33 +2487,68 @@ class SceneGraphProcessor:
             ########
 
             # Prepare graph data
+            place_nodes_by_id = {}
+            node_attrs = {}
             for node_id, attr in self.sg_graph.nodes(data=True):
-                # position to list
-                pos = attr.get('position')
-                if hasattr(pos, 'tolist'):
-                    attr['position'] = pos.tolist()
+                pos = attr.get("position")
+                if hasattr(pos, "tolist"):
+                    attr["position"] = pos.tolist()
+                node_attrs[node_id] = attr
+                if attr.get("type") == "place":
+                    pid = attr.get("instance_id", attr.get("id"))
+                    if pid is None:
+                        try:
+                            pid = int(str(node_id).split("_")[-1])
+                        except Exception:
+                            pid = None
+                    if pid is not None:
+                        place_nodes_by_id[int(pid)] = attr
 
-                # Enrich object-layer nodes with desired schema
-                if attr.get("type") == "object":
-                    instance_id = attr.get("instance_id")
+            serialized_nodes = []
+            node_references = {}
+            for node_id, attr in node_attrs.items():
+                node_type = attr.get("type")
+                if node_type == "place":
+                    pid = attr.get("instance_id", attr.get("id"))
+                    if pid is None:
+                        try:
+                            pid = int(str(node_id).split("_")[-1])
+                        except Exception:
+                            pid = None
+                    if pid is not None:
+                        node_references[node_id] = {"level": "NodeLevel.PLACE", "id": int(pid)}
+                    continue
+                if node_type not in ("object", "keyframe"):
+                    continue
 
-                    # Fixed attributes
-                    attr["level"] = "NodeLevel.OBJECT"
+                node_entry = dict(attr)
+                serialized_id = attr.get("instance_id") if node_type == "object" else attr.get("id")
+                if serialized_id is None:
+                    try:
+                        serialized_id = int(str(node_id).split("_")[-1])
+                    except Exception:
+                        serialized_id = None
+                else:
+                    try:
+                        serialized_id = int(serialized_id)
+                    except Exception:
+                        pass
 
-                    # Name: detected class name
-                    if "name" not in attr and "class_name" in attr:
-                        attr["name"] = attr["class_name"]
+                if node_type == "object":
+                    node_entry["level"] = "NodeLevel.OBJECT"
+                    node_entry["id"] = serialized_id
+                    if "name" not in node_entry and "class_name" in node_entry:
+                        node_entry["name"] = node_entry["class_name"]
 
-                    # Attach raw points, centroid, extent, R (OBB)
+                    instance_id = node_entry.get("instance_id")
                     pts = None
                     if instance_id is not None and instance_id in self.objects:
                         obj_info = self.objects[instance_id]
                         pts = obj_info.get("points", None)
                         if isinstance(pts, np.ndarray):
                             pts = pts.tolist()
-                        # Only set if not already present
-                        if "points" not in attr:
-                            attr["points"] = pts
+                        if "points" not in node_entry:
+                            node_entry["points"] = pts
 
                         min_bbox = obj_info.get("min_bbox", None)
                         max_bbox = obj_info.get("max_bbox", None)
@@ -2530,23 +2565,88 @@ class SceneGraphProcessor:
                             centroid = np.zeros(3, dtype=float)
                             extent = np.zeros(3, dtype=float)
 
-                        attr["centroid"] = np.asarray(centroid, dtype=float).tolist()
-                        attr["extent"] = np.asarray(extent, dtype=float).tolist()
-                        # For now use axis-aligned box -> identity rotation
-                        attr["R"] = np.eye(3, dtype=float).tolist()
+                        node_entry["centroid"] = np.asarray(centroid, dtype=float).tolist()
+                        node_entry["extent"] = np.asarray(extent, dtype=float).tolist()
+                        node_entry["R"] = np.eye(3, dtype=float).tolist()
                     else:
-                        # Fallback: use existing points on node if any
-                        pts = attr.get("points", None)
+                        pts = node_entry.get("points", None)
                         if pts is not None:
                             pts_np = np.asarray(pts, dtype=float)
                             if pts_np.size > 0:
                                 centroid = pts_np.mean(axis=0)
                                 extent = pts_np.max(axis=0) - pts_np.min(axis=0)
-                                attr["centroid"] = np.asarray(centroid, dtype=float).tolist()
-                                attr["extent"] = np.asarray(extent, dtype=float).tolist()
-                                attr["R"] = np.eye(3, dtype=float).tolist()
+                                node_entry["centroid"] = np.asarray(centroid, dtype=float).tolist()
+                                node_entry["extent"] = np.asarray(extent, dtype=float).tolist()
+                                node_entry["R"] = np.eye(3, dtype=float).tolist()
 
-            graph_data = node_link_data(self.sg_graph)
+                    if node_entry.get("instance_id") is not None:
+                        try:
+                            node_entry["id"] = int(node_entry["instance_id"])
+                        except Exception:
+                            node_entry["id"] = node_entry["instance_id"]
+
+                elif node_type == "keyframe":
+                    node_entry["level"] = "NodeLevel.KEYFRAME"
+                    node_entry["id"] = serialized_id
+                    place_info = place_nodes_by_id.get(serialized_id, {})
+                    if "image_path" not in node_entry:
+                        node_entry["image_path"] = place_info.get("image_path")
+                    if "pose" not in node_entry:
+                        node_entry["pose"] = place_info.get("pose")
+                    if "detections" not in node_entry:
+                        dets = []
+                        for det in place_info.get("detections", []) or []:
+                            bbox = det.get("bbox", [])
+                            if hasattr(bbox, "tolist"):
+                                bbox = bbox.tolist()
+                            score = det.get("yolo_conf", det.get("score", 0.0))
+                            try:
+                                score = float(score)
+                            except Exception:
+                                pass
+                            det_id = det.get("id", -1)
+                            try:
+                                det_id = int(det_id)
+                            except Exception:
+                                pass
+                            dets.append({
+                                "id": det_id,
+                                "bbox": bbox,
+                                "score": score,
+                                "name": det.get("class_name", det.get("name", "")),
+                            })
+                        node_entry["detections"] = dets
+
+                if isinstance(node_entry["id"], str):
+                    try:
+                        node_entry["id"] = int(node_entry["id"])
+                    except Exception:
+                        pass
+
+                serialized_nodes.append(node_entry)
+                node_references[node_id] = {
+                    "level": node_entry.get("level"),
+                    "id": node_entry["id"],
+                }
+
+            serialized_edges = []
+            for source_key, target_key, attr in self.sg_graph.edges(data=True):
+                if source_key not in node_references or target_key not in node_references:
+                    continue
+                edge_entry = {
+                    "source": node_references[source_key],
+                    "target": node_references[target_key],
+                    "direction": attr.get("direction", "BIDIRECTIONAL"),
+                }
+                for k, v in attr.items():
+                    if k not in edge_entry:
+                        edge_entry[k] = v
+                serialized_edges.append(edge_entry)
+
+            graph_data = {
+                "nodes": serialized_nodes,
+                "edges": serialized_edges,
+            }
 
             # Convert numpy types and save the graph JSON
             json_graph = convert_numpy_types(graph_data)
