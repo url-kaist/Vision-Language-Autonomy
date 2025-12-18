@@ -943,20 +943,34 @@ class BaseVisualGrounder(BaseModel):
                 
                 # Determine if ready to answer
                 ## Option1: High confidence & Enough time elapsed
-                ## Option2: Enough observation & All inference is done
+                ## Option2: Enough observation & All inference is done & Has any result
                 ## Option3: Time is almost up
-                ready_to_answer = (((best_confidence > thres_high and elapsed >= rospy.Duration(5 * 60)) 
-                                    or (enough_observation and all_inference_done))
+                minimum_time_to_answer = rospy.Duration(5 * 60)  # 5 minutes
+                has_any_result = self.agg_results.best_answer is not None
+
+                ready_to_answer = (((best_confidence > thres_high and elapsed >= minimum_time_to_answer) 
+                                    or (enough_observation and all_inference_done and has_any_result))
                                     or (remaining_time <= rospy.Duration(30)))  # (sec)
                 self.logger.logrich(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", name='time')
 
                 if ready_to_answer:
                     self.answer_result = self.agg_results.best_answer  # TODO
                     self.answer_the_question(self.answer_result)
-                    self.logger.loginfo(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} >= {thres_high}.")
+                    if best_confidence > thres_high:
+                        self.logger.loginfo(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} > {thres_high}.")
+                    elif enough_observation and all_inference_done and has_any_result:
+                        self.logger.loginfo(f"<inference_loop.3.2> Answer the final result. Enough observation and all inference done.")
+                    else:
+                        self.logger.loginfo(f"<inference_loop.3.2> Answer the final result. Time is almost up {remaining_time.to_sec()} sec left.")
                     return
                 else:
-                    self.logger.loginfo(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} < {thres_high}.")
+                    if best_confidence <= thres_high:
+                        self.logger.loginfo(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} <= {thres_high}.")
+                    elif elapsed < minimum_time_to_answer:
+                        self.logger.loginfo(f"<inference_loop.3.2> Let's inference. Not enough time elapsed yet. {int(elapsed.to_sec())} sec passed.")
+                    else:
+                        self.logger.loginfo(f"<inference_loop.3.2> Let's inference.")
+                    
             except Exception as e:
                 self.logger.logerr(f"<inference_loop.3.1&2> Error occurs: {e}")
 
@@ -1511,7 +1525,8 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     self.logger.loginfo(f"<process.1> There is no pending_gids")
                     return
                 gid = pending_gids[0]
-                pending_eids = self.agg_results.results.get(gid, set())
+                # pending_eids = self.agg_results.results.get(gid, set()) # error
+                pending_eids = self.hull_grouper.groups(gid)
                 self.logger.loginfo(f"<process.1> There are pending_gids: {gid} (pending_eids:{pending_eids})")
             else:
                 self.logger.logerr(f"<process.1> Error occurs: self.action must be in ['find', 'count'], bug {self.action} was given.")
