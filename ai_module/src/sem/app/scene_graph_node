@@ -1357,7 +1357,7 @@ class SceneGraphProcessor:
                         cx_rgb = W_rgb / 2.0
                         cy_rgb = H_rgb / 2.0
 
-                    max_range = 10.0  # [m], 이 이상은 far
+                    max_range = 3 #10.0  # [m], 이 이상은 far
 
                     for pts_body in pts_body_list:
                         if pts_body is None:
@@ -2488,6 +2488,8 @@ class SceneGraphProcessor:
 
             # Prepare graph data
             place_nodes_by_id = {}
+            place_node_keys_by_id = {}
+            keyframe_nodes_by_id = {}
             node_attrs = {}
             for node_id, attr in self.sg_graph.nodes(data=True):
                 pos = attr.get("position")
@@ -2503,6 +2505,16 @@ class SceneGraphProcessor:
                             pid = None
                     if pid is not None:
                         place_nodes_by_id[int(pid)] = attr
+                        place_node_keys_by_id[int(pid)] = node_id
+                if attr.get("type") == "keyframe":
+                    kid = attr.get("id")
+                    if kid is None:
+                        try:
+                            kid = int(str(node_id).split("_")[-1])
+                        except Exception:
+                            kid = None
+                    if kid is not None:
+                        keyframe_nodes_by_id[int(kid)] = node_id
 
             serialized_nodes = []
             node_references = {}
@@ -2629,23 +2641,36 @@ class SceneGraphProcessor:
                     "id": node_entry["id"],
                 }
 
-            serialized_edges = []
-            for source_key, target_key, attr in self.sg_graph.edges(data=True):
-                if source_key not in node_references or target_key not in node_references:
+            filtered_edges = []
+            for pid, place_node in place_node_keys_by_id.items():
+                kf_node_key = keyframe_nodes_by_id.get(pid)
+                if kf_node_key is None:
                     continue
-                edge_entry = {
-                    "source": node_references[source_key],
-                    "target": node_references[target_key],
-                    "direction": attr.get("direction", "BIDIRECTIONAL"),
-                }
-                for k, v in attr.items():
-                    if k not in edge_entry:
-                        edge_entry[k] = v
-                serialized_edges.append(edge_entry)
+                kf_ref = node_references.get(kf_node_key)
+                if kf_ref is None:
+                    continue
+
+                obj_neighbors = set()
+                for nb in self.sg_graph.successors(place_node):
+                    if node_attrs.get(nb, {}).get("type") == "object":
+                        obj_neighbors.add(nb)
+                for nb in self.sg_graph.predecessors(place_node):
+                    if node_attrs.get(nb, {}).get("type") == "object":
+                        obj_neighbors.add(nb)
+
+                for obj_key in obj_neighbors:
+                    obj_ref = node_references.get(obj_key)
+                    if obj_ref is None:
+                        continue
+                    filtered_edges.append({
+                        "source": kf_ref,
+                        "target": obj_ref,
+                        "direction": "BIDIRECTIONAL",
+                    })
 
             graph_data = {
                 "nodes": serialized_nodes,
-                "edges": serialized_edges,
+                "edges": filtered_edges,
             }
 
             # Convert numpy types and save the graph JSON
