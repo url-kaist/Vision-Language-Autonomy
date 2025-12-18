@@ -3,8 +3,10 @@ import numpy as np
 import os
 import cv2
 import open3d as o3d
+from typing import Optional
 
 from scipy.spatial.transform import Rotation
+from utils import load_depth_intrinsics
 
 # def scan2pixels(laserCloud, LIDAR_PARA, CAMERA_PARA):
 #     lidar_offset = np.array([LIDAR_PARA["x"], LIDAR_PARA["y"], LIDAR_PARA["z"]])
@@ -250,6 +252,173 @@ def scan2pixels_mcanum(laserCloud):
     point_pixel_idx = np.array([horiPixelID, vertPixelID, pixelDepth]).T
 
     return point_pixel_idx
+
+
+def _generate_seg_comp_cloud_from_depth(
+    depth_image: np.ndarray,
+    masks,
+    labels,
+    R_b2w,
+    t_b2w,
+    image_src=None,
+    depth_K: Optional[np.ndarray] = None,
+    cam_to_body_R: Optional[np.ndarray] = None,
+    cam_to_body_t: Optional[np.ndarray] = None,
+    depth_scale: float = 1.0,
+):
+    """
+    depth 기반으로 mask별 포인트 클라우드 생성.
+
+    depth_image: (H, W) 단일 채널 depth (meter 혹은 depth_scale로 보정)
+    masks: [N, H, W] binary mask 배열 (numpy)
+    labels: 길이 N의 label 인덱스 배열
+    R_b2w, t_b2w: body → world 변환
+    image_src: (H, W, 3) RGB 이미지 (색상 평균용)
+    depth_K: (3, 3) depth 카메라 intrinsic, 없으면 HFOV=90 기준으로 추정
+    cam_to_body_R, cam_to_body_t: camera → body 변환, 없으면 단위/0 사용
+    depth_scale: raw depth * depth_scale = [m]
+    """
+    if depth_image is None or masks is None or labels is None:
+        return [], [], []
+
+    depth = depth_image.astype(np.float32)
+    H, W = depth.shape[:2]
+
+    # 1) depth 카메라 intrinsic 설정
+    #    - 640x480, 주신 depth camera info를 기본값으로 사용
+    #    - 그 외 해상도는 기존 HFOV 기반 근사값 사용
+    if depth_K is None:
+        if H == 480 and W == 640:
+            depth_K = np.array(
+                [
+                    [389.8971252441406, 0.0, 325.1298828125],
+                    [0.0, 389.8971252441406, 236.91766357421875],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+        else:
+            depth_K = load_depth_intrinsics(H, W)
+    depth_K = np.asarray(depth_K, dtype=np.float32)
+    fx_d, fy_d = float(depth_K[0, 0]), float(depth_K[1, 1])
+    cx_d, cy_d = float(depth_K[0, 2]), float(depth_K[1, 2])
+
+    # 2) RGB 카메라 intrinsic (마스크/이미지 기준 좌표계)
+    #    - 현재 pipeline에서 masks / image_src 는 RGB 카메라 프레임 기준이므로,
+    #      RGB intrinsic을 사용해 3D ray를 정의하고, depth 쪽으로만 픽셀을 매핑.
+    if H == 480 and W == 640:
+        rgb_K = np.array(
+            [
+                [606.040283203125, 0.0, 328.3797912597656],
+                [0.0, 606.2955932617188, 245.35792541503906],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+    else:
+        # 해상도가 다르면 일단 depth_K와 동일하다고 가정 (기존 동작 유지)
+        rgb_K = depth_K
+    rgb_K = np.asarray(rgb_K, dtype=np.float32)
+    fx_rgb, fy_rgb = float(rgb_K[0, 0]), float(rgb_K[1, 1])
+    cx_rgb, cy_rgb = float(rgb_K[0, 2]), float(rgb_K[1, 2])
+
+    if cam_to_body_R is None:
+        cam_to_body_R = np.eye(3, dtype=np.float32)
+    if cam_to_body_t is None:
+        cam_to_body_t = np.zeros(3, dtype=np.float32)
+
+    R_b2w = np.asarray(R_b2w, dtype=np.float32)
+    t_b2w = np.asarray(t_b2w, dtype=np.float32)
+
+    obj_cloud_world_list = []
+    pts_body_list = []
+    colors = []
+    semantic_labels = []
+
+    for i in range(len(labels)):
+        mask = masks[i]
+        if mask is None:
+            continue
+
+        # mask / RGB / depth 해상도 일치 가정 (640x480)
+        if mask.shape != depth.shape:
+            # 크기가 다르면 해당 객체는 스킵
+            continue
+
+        ys_rgb, xs_rgb = np.where(mask)
+        if ys_rgb.size == 0:
+            continue
+
+        # --- RGB 픽셀 → 정규화 좌표 (RGB 카메라 기준) ---
+        xs_rgb_f = xs_rgb.astype(np.float32)
+        ys_rgb_f = ys_rgb.astype(np.float32)
+        x_n_rgb = (xs_rgb_f - cx_rgb) / fx_rgb
+        y_n_rgb = (ys_rgb_f - cy_rgb) / fy_rgb
+
+        # --- RGB ray를 depth 이미지 좌표계로 투영 ---
+        # 같은 방향의 ray라고 가정하고, 서로 다른 intrinsics만 반영
+        u_d = x_n_rgb * fx_d + cx_d
+        v_d = y_n_rgb * fy_d + cy_d
+
+        u_d_rounded = np.round(u_d).astype(np.int32)
+        v_d_rounded = np.round(v_d).astype(np.int32)
+
+        in_bounds = (
+            (u_d_rounded >= 0)
+            & (u_d_rounded < W)
+            & (v_d_rounded >= 0)
+            & (v_d_rounded < H)
+        )
+        if not np.any(in_bounds):
+            continue
+
+        xs_rgb_f = xs_rgb_f[in_bounds]
+        ys_rgb_f = ys_rgb_f[in_bounds]
+        u_d_rounded = u_d_rounded[in_bounds]
+        v_d_rounded = v_d_rounded[in_bounds]
+
+        # depth 이미지에서 대응되는 depth 샘플링
+        d = depth[v_d_rounded, u_d_rounded] * depth_scale
+        # 유효한 depth만 사용 (0 초과이면서 finite)
+        valid_depth = (d > 0) & np.isfinite(d)
+        if not np.any(valid_depth):
+            continue
+
+        xs_rgb_f = xs_rgb_f[valid_depth]
+        ys_rgb_f = ys_rgb_f[valid_depth]
+        d = d[valid_depth].astype(np.float32)
+
+        # --- RGB 카메라 좌표계로 back-projection ---
+        X = (xs_rgb_f - cx_rgb) * d / fx_rgb
+        Y = (ys_rgb_f - cy_rgb) * d / fy_rgb
+        Z = d
+        pts_cam = np.stack([X, Y, Z], axis=1)  # (N,3)
+
+        # camera → body → world
+        pts_body = pts_cam @ cam_to_body_R.T + cam_to_body_t
+        pts_world = pts_body @ R_b2w.T + t_b2w
+
+        obj_cloud_world_list.append(pts_world.astype(np.float32))
+        pts_body_list.append(pts_body.astype(np.float32))
+
+        if image_src is not None:
+            try:
+                obj_colors = image_src[ys_rgb_f.astype(int), xs_rgb_f.astype(int)].astype(
+                    np.float32
+                )
+                if obj_colors.size > 0:
+                    avg_color = np.mean(obj_colors, axis=0)
+                else:
+                    avg_color = np.array([0, 0, 0], dtype=np.float32)
+            except Exception:
+                avg_color = np.array([0, 0, 0], dtype=np.float32)
+        else:
+            avg_color = np.array([0, 0, 0], dtype=np.float32)
+
+        colors.append(avg_color)
+        semantic_labels.append(labels[i])
+
+    return obj_cloud_world_list, pts_body_list, colors, semantic_labels
 
 ## for GT
 def generate_sem_cloud(

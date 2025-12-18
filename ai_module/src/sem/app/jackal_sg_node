@@ -15,6 +15,8 @@ import random
 import time
 import threading
 import numpy as np
+if not hasattr(np, "int"):
+    np.int = int  # for older networkx that still refers to np.int
 from collections import deque
 import json
 import tf
@@ -51,7 +53,7 @@ from bg_process import BGProcessor
 from generate_seg_cloud import generate_seg_cloud, generate_color_cloud, generate_seg_comp_cloud, generate_seg_comp_cloud_jackal
 
 import sys
-sys.path.append("/ws/external/ai_module/src/")
+sys.path.append("/workspace/ai_module/src/")
 # from sem.srv import SetClasses, SetClassesResponse
 
 import torch
@@ -69,7 +71,7 @@ mp.set_start_method('spawn', force=True)
 
 class SceneGraphProcessor:
     def __init__(self):
-        image_save_dir = "/ws/external/keyframes"
+        image_save_dir = "/workspace/keyframes"
         if os.path.exists(image_save_dir) and os.path.isdir(image_save_dir):
             shutil.rmtree(image_save_dir)
         os.makedirs(image_save_dir, exist_ok=True)
@@ -1701,7 +1703,7 @@ class SceneGraphProcessor:
             else:
                 return obj
 
-        base_dir = '/workspace/vla_ws/CMU-VLA-Challenge/ai_module/offline_map' #'/ws/external/offline_map'
+        base_dir = '/workspace/vla_ws/CMU-VLA-Challenge/ai_module/offline_map' #'/workspace/offline_map'
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir = os.path.join(base_dir, timestamp)
         os.makedirs(save_dir, exist_ok=True)
