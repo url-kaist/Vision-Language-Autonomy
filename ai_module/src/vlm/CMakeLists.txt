@@ -192,7 +192,7 @@ target_include_directories(manager PRIVATE
 #         ${PCL_LIBRARIES}
 # )
 # target_link_libraries(VLM ${catkin_LIBRARIES} scenegraph)
-target_link_libraries(manager ${catkin_LIBRARIES})
+target_link_libraries(manager ${catkin_LIBRARIES} utils_rrlogger)
 
 
 #############

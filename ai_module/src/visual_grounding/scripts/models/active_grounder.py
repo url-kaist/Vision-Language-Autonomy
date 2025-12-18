@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import concurrent.futures
 import os
-import time
+import sys
 import threading
-import copy
+sys.path.append("/ws/external/ai_module")
 import queue
 
 from base_visual_grounder import BaseActiveVisualGrounder, Status
@@ -21,7 +21,7 @@ try:
     use_rospy = True
 except:
     use_rospy = False
-
+    import src.utils.debug.rospy
 
 ANSWER_TYPE = {'find': Int32, 'count': Marker}
 

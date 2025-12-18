@@ -56,6 +56,7 @@ from rosgraph_msgs.msg import Clock
 from visualization_msgs.msg import Marker, MarkerArray
 from visual_grounding.srv import SetSubplans, SetSubplansResponse
 from std_srvs.srv import Trigger, TriggerResponse
+from ai_module.src.utils.rr_logger import RRLogger
 
 ANSWER_TYPE = {'find': Marker, 'count': Int32}
 ANSWER_TOPIC_NAME = {'find': 'selected_object_marker', 'count': '/numerical_response'}
@@ -284,6 +285,8 @@ class BaseVisualGrounder(BaseModel):
         
         """ Initialization """
         self._init_all(*args, **kwargs)
+
+        self.rr_logger = RRLogger()
 
     def _init_all(self, *args, **kwargs):
         self._init_vars(*args, **kwargs)

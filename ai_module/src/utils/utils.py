@@ -4,8 +4,7 @@ try:
 except:
     import sys
     sys.path.append("/ws/external/ai_module/src/utils/debug")
-    import ai_module.src.utils.debug
-    import rospy
+    from ai_module.src.utils.debug import rospy
     use_ros = False
 import sensor_msgs.point_cloud2 as pc2
 from visualization_msgs.msg import Marker, MarkerArray

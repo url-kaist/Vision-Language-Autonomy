@@ -13,8 +13,7 @@ try:
     import rospy
 except:
     sys.path.append("/ws/external/ai_module/src/utils/debug")
-    import ai_module.src.utils.debug
-    import rospy
+    from ai_module.src.utils.debug import rospy
 from std_srvs.srv import Empty, EmptyResponse, Trigger, TriggerResponse, SetBool, SetBoolResponse
 
 

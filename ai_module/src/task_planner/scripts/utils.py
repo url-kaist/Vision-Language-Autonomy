@@ -4,7 +4,10 @@ import os
 import sys
 sys.path.append('/ws/external')
 import json
-import rospy
+try:
+    import rospy
+except ImportError:
+    from ai_module.src.utils.debug import rospy
 
 from task_planner.msg import Plan as PlanMsg
 from task_planner.msg import Task as TaskMsg
