@@ -13,13 +13,11 @@ class Answer:
         pids, eids = [], []
         if data:
             keyframes = data['keyframes']
-            if isinstance(keyframes, Keyframe):
-                pids += [keyframes.id]
-                eids += keyframes.entities['candidate'].ids
-            else:  # Keyframes
-                for pid, kf in keyframes.items():
-                    pids += [pid]
-                    eids += kf.entities['candidate'].ids
+            pid2eids = data['pid2eids']
+            for kf in keyframes:
+                pid = kf['id'][1]
+                pids += [pid]
+                eids += pid2eids[pid]
         self.pids = tuple(pids)
         self.eids = tuple(eids)
 
@@ -30,7 +28,7 @@ class Answer:
         if self.count is not None:
             args = self.count
         elif self.object is not None:
-            args = self.object.id
+            args = self.object['id']
         else:
             args = "?"
         return f"{self.__class__.__name__}({args})"
@@ -39,7 +37,7 @@ class Answer:
         if self.count is not None:
             return str(self.count)
         elif self.object is not None:
-            return str(self.object.id)
+            return str(self.object['id'][1])
         else:
             return "?"
 

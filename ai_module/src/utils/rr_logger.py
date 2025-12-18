@@ -91,6 +91,29 @@ class RRLogger:
                 stderr=subprocess.DEVNULL
             )
             rr.init(name, spawn=False)
+
+            prefix_sg = "SG"
+            blueprint = rrb.Blueprint(
+                rrb.Horizontal(
+                    # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
+                    rrb.Spatial3DView(
+                        name="SceneGraph 3D",
+                        origin=prefix_sg,
+                        contents=[f"{prefix_sg}/**"],
+                    ),
+
+                    # (2) 우측 패널: 2D 이미지 + 선택 패널
+                    rrb.Vertical(
+                        rrb.Spatial2DView(
+                            name="Keyframe Image",
+                            origin=f"{prefix_sg}",
+                            contents=[f"{prefix_sg}/nodes/NodeLevel.KEYFRAME/**"],
+                        ),
+                        rrb.SelectionPanel(),
+                    ),
+                )
+            )
+            rr.send_blueprint(blueprint, make_active=True)
             rr.connect("127.0.0.1:9876")
 
         self.rr = rr

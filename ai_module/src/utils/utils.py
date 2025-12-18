@@ -78,6 +78,9 @@ def find_closest_point(query_points, key_points, extra_margin=0.0):
     """
     try:
         N, Ndim = query_points.shape
+        if key_points is None:
+            print(f"No traversable_area")
+            return np.zeros((0,2), dtype=np.float32)
         M, Mdim = key_points.shape
         if Ndim > Mdim:
             key_points = np.hstack([key_points, np.zeros((M, 1))])

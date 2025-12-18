@@ -6,6 +6,7 @@ import numpy as np
 import cv2
 import networkx as nx
 import json
+import shutil
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
@@ -30,7 +31,7 @@ class NodeLevel(IntEnum):
     NOT_DEFINED = 4
 
 class Node:
-    level = NodeLevel.NOT_DEFINED
+    level = str(NodeLevel.NOT_DEFINED)
     schema : ClassVar[Dict[str, AttrSpec]] = {}
     def __init__(self,
                  id: int,
@@ -60,7 +61,7 @@ class Node:
         return f"Node[{str(self.id[0])}, {self.id[1]}]()"
 
 class BuildingNode(Node):
-    level = NodeLevel.BUILDING
+    level = str(NodeLevel.BUILDING)
     schema = {
         'name':         AttrSpec(),             # {str}
         'centroid':     AttrSpec(),             # {list: 3} [x,y,z] # TODO: Add (position->centroid)
@@ -68,7 +69,7 @@ class BuildingNode(Node):
     }
 
 class PlaceNode(Node):
-    level = NodeLevel.PLACE
+    level = str(NodeLevel.PLACE)
     schema = {
         'centroid':     AttrSpec(),             # {list: 3} [x,y,z] # TODO: Add (position->centroid)
         'position':     AttrSpec(ignored=True), # {list: 3} [x,y,z] # TODO: Remove
@@ -79,7 +80,7 @@ class PlaceNode(Node):
     }
 
 class ObjectNode(Node):
-    level = NodeLevel.OBJECT
+    level = str(NodeLevel.OBJECT)
     schema = {
         # Required
         'name':         AttrSpec(required=True, default='unknown'), # {str} # TODO: Add
@@ -100,12 +101,15 @@ class ObjectNode(Node):
     }
 
 class KeyframeNode(Node):
-    level = NodeLevel.KEYFRAME
+    level = str(NodeLevel.KEYFRAME)
     schema = {
-        'image_path':   AttrSpec(required=True, default='vis/000000.jpg'),  # {str} # TODO: Add
-        'pose':         AttrSpec(required=True, default=np.eye(4)),         # {list: 4 {list: 4} } # TODO: Add
-        'detections':   AttrSpec(required=True, default=[]),                # {list: Detections}, Detections(id{int}, bbox{list: 4}) # TODO: Add
-        'position':     AttrSpec(ignored=True),                             # {list: 3} [x,y,z]
+        # Required
+        'image_path':   AttrSpec(required=True),    # {str}
+        'pose':         AttrSpec(required=True),    # {list: 4 {list: 4} }
+        'detections':   AttrSpec(required=True),    # {list: Detections}, Detections(id{int}, bbox{list: 4})
+        # Ignored
+        'position':     AttrSpec(ignored=True),     # {list: 3} [x,y,z]
+        'type':         AttrSpec(ignored=True),
     }
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -121,6 +125,10 @@ _NODE_LEVEL_TO_CLS = {
     NodeLevel.PLACE: PlaceNode,
     NodeLevel.OBJECT: ObjectNode,
     NodeLevel.KEYFRAME: KeyframeNode,
+    str(NodeLevel.BUILDING): BuildingNode,
+    str(NodeLevel.PLACE): PlaceNode,
+    str(NodeLevel.OBJECT): ObjectNode,
+    str(NodeLevel.KEYFRAME): KeyframeNode,
 }
 
 
@@ -128,12 +136,46 @@ class SceneGraph:
     def __init__(self, candidate_names=[], reference_names=[], save_dir='/ws/external/log/sg', *args, **kwargs):
         self._lock = threading.Lock()
         self.G = nx.DiGraph()
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir, exist_ok=True)
+        if os.path.exists(save_dir) and os.path.isdir(save_dir):
+            shutil.rmtree(save_dir)
+        os.makedirs(save_dir, exist_ok=True)
         self.save_dir = save_dir
         self.candidate_names = candidate_names
         self.reference_names = reference_names
         self.related_names = list(set(candidate_names + reference_names))
+
+        self.depth_K = depth_K = np.array(
+            [
+                [389.8971252441406, 0.0, 325.1298828125],
+                [0.0, 389.8971252441406, 236.91766357421875],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        self.fx_d, self.fy_d = float(depth_K[0, 0]), float(depth_K[1, 1])
+        self.cx_d, self.cy_d = float(depth_K[0, 2]), float(depth_K[1, 2])
+
+        self.rgb_K = rgb_K = np.array(
+            [
+                [606.040283203125, 0.0, 328.3797912597656],
+                [0.0, 606.2955932617188, 245.35792541503906],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        self.fx_rgb, self.fy_rgb = float(rgb_K[0, 0]), float(rgb_K[1, 1])
+        self.cx_rgb, self.cy_rgb = float(rgb_K[0, 2]), float(rgb_K[1, 2])
+
+        self.cam_to_body_R = np.array(
+            [
+                [0.0, 0.0, 1.0],  # x_b ← z_cam
+                [-1.0, 0.0, 0.0],  # y_b ← -x_cam
+                [0.0, -1.0, 0.0],  # z_b ← -y_cam
+            ],
+            dtype=np.float32,
+        )
+        self.cam_to_body_t = np.zeros(3, dtype=np.float32)
+
     def save_path(self, etype, fname='', suffix=''):
         save_path = os.path.join(self.save_dir, etype)
         if not os.path.exists(save_path):
@@ -168,59 +210,73 @@ class SceneGraph:
             # Python version
             with self._lock:
                 for data in scene_graph.get('nodes', []):
-                    try:
-                        if 'level' in data:
-                            level = str(data.pop('level')).lower()
-                        else:
-                            level = str(data.pop('type')).lower()  # TODO: 'type' -> 'level'
-                    except:
-                        print("")
-                        continue
+                    # try:
+                    #     if 'level' in data:
+                    #         level = str(data.pop('level')).lower()
+                    #     else:
+                    #         level = str(data.pop('type')).lower()  # TODO: 'type' -> 'level'
+                    # except:
+                    #     print("")
+                    #     continue
+                    level = data.pop('level')
 
-                    # TODO: Remove
-                    if level in str(NodeLevel.BUILDING).lower():   # Building
-                        level = NodeLevel.BUILDING
-                        continue
-                    elif level in str(NodeLevel.PLACE).lower():    # Place
-                        level = NodeLevel.PLACE
-                        continue
-                    elif level in str(NodeLevel.OBJECT).lower():   # Object
-                        level = NodeLevel.OBJECT
-                    elif level in str(NodeLevel.KEYFRAME).lower(): # Keyframe
-                        level = NodeLevel.KEYFRAME
-                    else:
-                        raise TypeError(f"Node level must be in ")
+                    # # TODO: Remove
+                    # if level in str(NodeLevel.BUILDING).lower():   # Building
+                    #     level = NodeLevel.BUILDING
+                    # elif level in str(NodeLevel.PLACE).lower():    # Place
+                    #     level = NodeLevel.PLACE
+                    # elif level in str(NodeLevel.OBJECT).lower():   # Object
+                    #     level = NodeLevel.OBJECT
+                    # elif level in str(NodeLevel.KEYFRAME).lower(): # Keyframe
+                    #     level = NodeLevel.KEYFRAME
+                    # else:
+                    #     raise TypeError(f"Node level must be in ")
 
-                    # TODO: Remove
-                    if 'id' in data:
-                        id = data.pop('id')
-                    else:
-                        id = max((node_id for (lvl, node_id) in self.G.nodes if lvl == level), default=-1) + 1
-
-                    # TODO: Remove
-                    if level == NodeLevel.OBJECT:
-                        if data.get('instance_id') < 0:
-                            print(f"Detection!!! {data}")
-                            continue
+                    # # TODO: Remove
+                    # if 'id' in data:
+                    #     id = data.pop('id')
+                    # else:
+                    #     id = max((node_id for (lvl, node_id) in self.G.nodes if lvl == level), default=-1) + 1
+                    id = data.pop('id')
+                    if id < 0:
+                        continue
+                    # # TODO: Remove
+                    # if level == NodeLevel.OBJECT:
+                    #     if data.get('instance_id') < 0:
+                    #         print(f"Detection!!! {data}")
+                    #         continue
 
                     NodeCls = _NODE_LEVEL_TO_CLS[level]
                     node = NodeCls(id=id, **data)
                     self.G.add_node(node.id, **node.__dict__)
-                    # print(f"Add node: {node}")
+                    print(f"Add node: {node}")
 
-                # for data in scene_graph.get('links', []):
-                #     source = (data['source']['level'], data['source']['id']) # TODO: Apply
-                #     target = (data['target']['level'], data['target']['id']) # TODO: Apply
-                #     self.G.add_edge(source, target)
-                #     self.G.add_edge(target, target)
-                #     # print(f"Add edge: {source} <-> {target}")
+                for data in scene_graph.get('edges', []):
+                    source = (data['source']['level'], data['source']['id'])
+                    target = (data['target']['level'], data['target']['id'])
+
+                    # TODO: Remove
+                    if target[0] == str(NodeLevel.PLACE):
+                        target = (str(NodeLevel.KEYFRAME), target[1])
+                    if source[0] == str(NodeLevel.PLACE):
+                        source = (str(NodeLevel.KEYFRAME), source[1])
+                    if target[0] == str(NodeLevel.OBJECT) and target[1] < 0:
+                        continue
+                    if source[0] == str(NodeLevel.OBJECT) and source[1] < 0:
+                        continue
+                    if target[0] == source[0]:
+                        continue
+
+                    self.G.add_edge(source, target)
+                    self.G.add_edge(target, target)
+                    print(f"Add edge: {source} <-> {target}")
             print(f"=> Graph: {self.G}")
 
 
     def get_entity_names(self, names, *args, **kwargs) -> Entities:
         output_entities = []
         for (level, id), data in self.G.nodes(data=True):
-            if level == NodeLevel.OBJECT:
+            if level == str(NodeLevel.OBJECT):
                 name = data.get("_attrs", {}).get("name")
                 if name in names:
                     output_entities.append(data)
@@ -229,11 +285,10 @@ class SceneGraph:
     def get_candidate_entities(self, *args, **kwargs) -> List:
         output_entities = []
         for (level, id), data in self.G.nodes(data=True):
-            if level != NodeLevel.OBJECT:
-                continue
-            name = data.get("_attrs", {}).get("name")
-            if name in self.candidate_names:
-                output_entities.append(id)
+            if level == str(NodeLevel.OBJECT):
+                name = data.get("_attrs", {}).get("name")
+                if name in self.candidate_names:
+                    output_entities.append(id)
         return list(set(output_entities))
 
     def get_reference_entities(self, etype: Literal['object', 'detection', 'all'] = 'object') -> Entities:
@@ -246,7 +301,7 @@ class SceneGraph:
     def keyframes(self):
         output = []
         for (level, id), data in self.G.nodes(data=True):
-            if level == NodeLevel.KEYFRAME:
+            if level == str(NodeLevel.KEYFRAME):
                 output.append(data)
         return output
 
@@ -259,10 +314,14 @@ class SceneGraph:
             vlev, vid = G.nodes[v].get('id', (None, None))
             if not uid or not vid:
                 continue
-            if ({ulev, vlev} == {NodeLevel.OBJECT, NodeLevel.KEYFRAME}):
+            if ulev == str(NodeLevel.OBJECT) and vlev == str(NodeLevel.KEYFRAME):
                 if not uid in eid2pids:
                     eid2pids[uid] = []
-                eid2pids[uid].append(vid)
+                eid2pids[uid] = list(set(eid2pids[uid] + [vid]))
+            elif ulev == str(NodeLevel.KEYFRAME) and vlev == str(NodeLevel.OBJECT):
+                if not vid in eid2pids:
+                    eid2pids[vid] = []
+                eid2pids[vid] = list(set(eid2pids[vid] + [uid]))
         return eid2pids
 
     @property
@@ -274,11 +333,55 @@ class SceneGraph:
             vlev, vid = G.nodes[v].get('id', (None, None))
             if not uid or not vid:
                 continue
-            if ({ulev, vlev} == {NodeLevel.KEYFRAME, NodeLevel.OBJECT}):
+            if ulev == str(NodeLevel.OBJECT) and vlev == str(NodeLevel.KEYFRAME):
+                if not vid in pid2eids:
+                    pid2eids[vid] = []
+                pid2eids[vid] = list(set(pid2eids[vid] + [uid]))
+            elif ulev == str(NodeLevel.KEYFRAME) and vlev == str(NodeLevel.OBJECT):
                 if not uid in pid2eids:
                     pid2eids[uid] = []
-                pid2eids[uid].append(vid)
+                pid2eids[uid] = list(set(pid2eids[uid] + [vid]))
         return pid2eids
+
+    def project_pts(self, pts_world, pose, image_size):
+        R_b2w = pose[:3, :3]
+        t_b2w = pose[:3, 3]
+
+        pts_body = (pts_world - t_b2w) @ R_b2w
+        pts_cam = (pts_body - self.cam_to_body_t) @ self.cam_to_body_R
+
+        X, Y, Z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
+        valid = Z > 0
+        X = X[valid]
+        Y = Y[valid]
+        Z = Z[valid]
+
+        fx_rgb, fy_rgb = float(self.rgb_K[0, 0]), float(self.rgb_K[1, 1])
+        cx_rgb, cy_rgb = float(self.rgb_K[0, 2]), float(self.rgb_K[1, 2])
+        xs = fx_rgb * (X / Z) + cx_rgb
+        ys = fy_rgb * (Y / Z) + cy_rgb
+
+        image_height, image_width = image_size
+        in_img = (
+                (xs >= 0) & (xs < image_width) &
+                (ys >= 0) & (ys < image_height)
+        )
+        xs = xs[in_img]
+        ys = ys[in_img]
+        return xs, ys
+
+    def project_entity_bbox(self, entity, kf):
+        e_attrs = entity.get("_attrs", {})
+        pts_world = np.asarray(e_attrs['points'], dtype=np.float32)
+
+        kf_attrs = kf.get("_attrs", {})
+        pose = np.array(kf_attrs['pose'], dtype=np.float32)
+
+        image_height, image_width, _ = kf_attrs['image'].shape
+        xs, ys = self.project_pts(pts_world, pose, image_size=(image_height, image_width))
+
+        u_min, v_min, u_max, v_max = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+        return (u_min, v_min, u_max, v_max)
 
 
 if __name__ == "__main__":

@@ -158,17 +158,16 @@ class GridGrouper:
         return self
 
     def update(self, entities):
-        eids = [eid for eid in entities.ids if eid != -1]
-        entities = entities.get(eids)
-
-        for eid, entity in entities.items():
+        for entity in entities:
+            eid = entity['id'][1]
+            attrs = entity.get("_attrs", {})
             if eid not in self.dsu.idx:
                 self.dsu.add(eid)
                 old = set()
             else:
                 old = self.ent_cells.get(eid, set())
 
-            new_cells = self._cells_set_from_points(np.asarray(entity.points, float))
+            new_cells = self._cells_set_from_points(np.asarray(attrs['points'], float))
             self.ent_cells[eid] = new_cells
 
             added = new_cells - old

@@ -588,22 +588,46 @@ class BaseVisualGrounder(BaseModel):
         self.ready = True
 
     def log_sg(self, G):
+        prefix = "SG/nodes"
         for (level, id), data in G.nodes(data=True):
-            if level != NodeLevel.OBJECT:
-                continue
+            entity_path = f"{prefix}/{str(level)}/{id}"
             attrs = data.get('_attrs', {})
+            if level == str(NodeLevel.OBJECT):
+                centers = np.array([attrs['centroid']], dtype=np.float32) # (1, 3)
+                half_sizes = np.array([attrs['extent']], dtype=np.float32) * 0.5
+                quaternions = rotmat_to_quat_xyzw(np.array(attrs['R'])).reshape(1, 4)
+                colors = self.rr_logger.palette[int(str(id).split('_')[-1])]
 
-            centers = np.array([attrs['centroid']], dtype=np.float32) # (1, 3)
-            half_sizes = np.array([attrs['extent']], dtype=np.float32) * 0.5
-            quaternions = rotmat_to_quat_xyzw(np.array(attrs['R'])).reshape(1, 4)
-            colors = self.rr_logger.palette[int(str(id).split('_')[-1])]
+                self.rr_logger.log({
+                    entity_path: rr.Boxes3D(
+                        centers=centers, half_sizes=half_sizes, quaternions=quaternions,
+                        colors=colors, labels=attrs['name']
+                    ),
+                })
+            elif level == str(NodeLevel.KEYFRAME):
+                pose = np.array(attrs['pose'], dtype=np.float32)
+                R, t = pose[:3, :3], pose[:3, 3]
+                self.rr_logger.log({
+                    entity_path: rr.Transform3D(
+                        translation=t, quaternion=rotmat_to_quat_xyzw(R)
+                    )
+                })
+                height, width, _ = attrs['image'].shape
+                fx_rgb = 606.040283203125
+                fy_rgb = 606.2955932617188
+                cx_rgb = 328.3797912597656
+                cy_rgb = 245.35792541503906
+                intrinsics = np.array([[fx_rgb, 0, cx_rgb], [0, fy_rgb, cy_rgb], [0, 0, 1]])
+                self.rr_logger.log({
+                    entity_path: rr.Pinhole(
+                        resolution=[width, height], image_from_camera=intrinsics, camera_xyz=rr.ViewCoordinates.RDF,
+                    )
+                })
+                self.rr_logger.log({
+                    entity_path: rr.EncodedImage(path=attrs['image_path'])
+                })
 
-            self.rr_logger.log({
-                f'SG/nodes/{level}/{id}': rr.Boxes3D(
-                    centers=centers, half_sizes=half_sizes, quaternions=quaternions,
-                    colors=colors, labels=attrs['name']
-                ),
-            })
+
 
     def update_resource(self, **kwargs):
         self.scene_graph_clients.update_scene_graph(**kwargs)
@@ -613,57 +637,100 @@ class BaseVisualGrounder(BaseModel):
             # 'reference': {'show': True, 'color': 'blue'},
             'candidate': {'show': True, 'color': 'green'},
         }
-        # TODO: FIX
-        # with self.sg_lock:
-        #     for etype in self.etypes:
-        #         # self.sg.keyframes.annotate(styles, node_name=self.node_name, suffix=f"_annotated_global_{etype}", etype=etype)
-        #         G = self.sg.G
-        #         for (level, id), data in G.nodes(data=True):
-        #             if level != NodeLevel.KEYFRAME:
-        #                 continue
-        #             attrs = data.get('_attrs', {})
-        #
-        #             image = attrs['image'].copy()
-        #             fname = attrs['fname']
-        #             detections = attrs['detections']
-        #             if not etype == 'image':
-        #                 for det in detections:
-        #                     is_object = det['id'] < 0
-        #                     if is_object and (etype == 'detection'):
-        #                         continue
-        #                     if (not is_object) and (etype == 'object'):
-        #                         continue
-        #
-        #                     is_candidate = (det['name'] in self.sg.candidate_names)
-        #                     is_reference = (det['name'] in self.sg.reference_names)
-        #                     if is_candidate:
-        #                         style = styles.get('candidate', {'show': False})
-        #                         if not style['show']:
-        #                             continue
-        #                         color = style.get('color', 'green')
-        #                     elif is_reference:
-        #                         style = styles.get('reference', {'show': False})
-        #                         if not style['show']:
-        #                             continue
-        #                         color = style.get('color', 'blue')
-        #
-        #                     bbox = det['bbox']
-        #
-        #                     visualizer = Visualizer()
-        #                     color = visualizer._parse_color(color)
-        #                     u_min, v_min, u_max, v_max = bbox
-        #                     top_left, bottom_right = (u_min, v_min), (u_max, v_max)
-        #
-        #                     overlay = image.copy()
-        #                     cv2.rectangle(overlay, top_left, bottom_right, color=color, thickness=2)
-        #
-        #                     cv2.putText(
-        #                         image, f"{det['id']}", (u_min, v_min - 10),
-        #                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
-        #                     )
-        #
-        #             save_path = self.sg.save_path(etype, fname, suffix=suffix)
-        #             success = cv2.imwrite(save_path, image)
+
+        with self.sg_lock:
+            success_path, failed_path = [], []
+            visualizer = Visualizer()
+            for etype in self.etypes:
+                for (level, id), kf in self.sg.G.nodes(data=True):
+                    if level == str(NodeLevel.KEYFRAME):
+                        attrs = kf.get('_attrs', {})
+
+                        image = attrs['image'].copy()
+                        fname = attrs['fname']
+                        detections = attrs['detections']
+                        if etype == 'detection':
+                            for det in detections:
+                                is_object = det['id'] > 0
+                                if not is_object:
+                                    continue
+
+                                is_candidate = (det['name'] in self.sg.candidate_names)
+                                is_reference = (det['name'] in self.sg.reference_names)
+                                if is_candidate:
+                                    style = styles.get('candidate', {'show': False})
+                                    if not style['show']:
+                                        continue
+                                    color = style.get('color', 'green')
+                                elif is_reference:
+                                    style = styles.get('reference', {'show': False})
+                                    if not style['show']:
+                                        continue
+                                    color = style.get('color', 'blue')
+                                else:
+                                    continue
+
+                                bbox = det['bbox']
+                                color = visualizer._parse_color(color)
+                                u_min, v_min, u_max, v_max = bbox
+                                u_min, v_min, u_max, v_max = int(u_min), int(v_min), int(u_max), int(v_max)
+                                top_left, bottom_right = (u_min, v_min), (u_max, v_max)
+
+                                cv2.rectangle(image, top_left, bottom_right, color=color, thickness=2)
+                                cv2.putText(
+                                    image, f"{det['id']}", (u_min, v_min - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+                                )
+                        elif etype == 'object':
+                            eids = self.sg.pid2eids.get(id, [])
+                            for (elevel, eid), entity in self.sg.G.nodes(data=True):
+                                if elevel == str(NodeLevel.OBJECT):
+                                    if eid in eids:
+                                        bbox = self.sg.project_entity_bbox(entity, kf)
+                                        e_attrs = entity.get("_attrs", {})
+
+                                        is_candidate = (e_attrs['name'] in self.sg.candidate_names)
+                                        is_reference = (e_attrs['name'] in self.sg.reference_names)
+
+                                        if is_candidate:
+                                            style = styles.get('candidate', {'show': False})
+                                            if not style['show']:
+                                                continue
+                                            color = style.get('color', 'green')
+                                        elif is_reference:
+                                            style = styles.get('reference', {'show': False})
+                                            if not style['show']:
+                                                continue
+                                            color = style.get('color', 'blue')
+                                        else:
+                                            continue
+
+                                        color = visualizer._parse_color(color)
+                                        u_min, v_min, u_max, v_max = bbox
+                                        u_min, v_min, u_max, v_max = int(u_min), int(v_min), int(u_max), int(v_max)
+                                        top_left, bottom_right = (u_min, v_min), (u_max, v_max)
+
+                                        cv2.rectangle(image, top_left, bottom_right, color=color, thickness=2)
+                                        cv2.putText(
+                                            image, f"{eid}", (u_min, v_min - 10),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+                                        )
+                        else:
+                            raise NotImplementedError("No implementation for other etypes")
+                        save_path = self.sg.save_path(etype, fname)
+                        success = cv2.imwrite(save_path, image)
+                        if success:
+                            success_path.append(save_path)
+                        else:
+                            failed_path.append(save_path)
+                if len(success_path) > 0:
+                    txt = '- \n'.join(success_path)
+                    self.rr_logger.log({
+                        'VG/log': f"Saved images: {txt}"})
+                if len(failed_path) > 0:
+                    txt = '- \n'.join(failed_path)
+                    self.rr_logger.log({
+                        'VG/log': f"Failed to save images: {txt}"}, level='warn')
 
         self.updated_resource = True
 
@@ -735,19 +802,28 @@ class BaseVisualGrounder(BaseModel):
             self.logger.logerr(f"<select_keyframes.2> Error occurs: {e}")
 
         # Cache: Area
-        target_entities = sg.get_related_entities(etype).get(target_eids)
+        target_entities = sg.get_related_entities() # target_entities = sg.get_related_entities(etype).get(target_eids)
         per_obj_area = defaultdict(dict)  # {pid: {eid: area}, ...}
 
-        def _entity_area(kf, pid, eid):
+        def _entity_area(kf, pid, eid, sg):
             d = per_obj_area[pid]
             if eid in d:
                 return d[eid]
-            tgt_ent = target_entities.get_single(eid)
+
+            tgt_ent = [entity for entity in target_entities if entity['id'][1] == eid][0]
             if tgt_ent is None:
                 d[eid] = 0.0
                 return 0.0
-            tgt_bbox = tgt_ent.get_bbox(pose=kf.pose, image_size=kf.image_size, is_real_world=kf.is_real_world, kf_id=kf.id)
-            d[eid] = float(tgt_bbox.area)
+
+            u_min, v_min, u_max, v_max = sg.project_entity_bbox(tgt_ent, kf)
+
+            # top_left, bottom_right = (u_min, v_min), (u_max, v_max)
+            # img_vis = kf_attrs['image'].copy()
+            # cv2.rectangle(img_vis, top_left, bottom_right, color=(0, 255, 0), thickness=2)
+            # cv2.imwrite("/ws/external/vis/tmp.jpg", img_vis)
+
+            area = (u_max - u_min) * (v_max - v_min)
+            d[eid] = float(area)
             return d[eid]
 
         # Select N keyframes which contains target entities (N < max_kfs)
@@ -759,7 +835,7 @@ class BaseVisualGrounder(BaseModel):
             while uncovered_target_eids and kfs_with_targets and len(selected_pids) < max_kfs:
                 iter_cnt += 1
                 if iter_cnt > iter_cap:
-                    self.logger.logwarn(f"<select_keyframes.4> iter_cap reached. Bail out.")
+                    self.log(f"<select_keyframes.4> iter_cap reached. Bail out.", level='warn')
                     break
 
                 num_uncovered_tgts = len(uncovered_target_eids)
@@ -772,13 +848,13 @@ class BaseVisualGrounder(BaseModel):
                     c = len(covered_eids_now) / num_uncovered_tgts
                     a = 0.0
                     for eid in covered_eids_now:
-                        a += _entity_area(kf, pid, eid)
+                        a += _entity_area(kf, pid, eid, sg=self.sg)
                     if a > max_area:
                         max_area = a
                     tmp_stats[pid] = (c, a, covered_eids_now)
 
                 if not tmp_stats:
-                    self.logger.logwarn(f"<select_keyframes.4> tmp_stats is None")
+                    self.log(f"<select_keyframes.4> tmp_stats is None", level='warn')
                     break
 
                 best_pid, best_score = None, float("-inf")
@@ -791,7 +867,7 @@ class BaseVisualGrounder(BaseModel):
                         best_score, best_pid = score, pid
 
                     if best_pid is None:
-                        self.logger.logwarn(f"<select_keyframes.4> best_pid is None")
+                        self.log(f"<select_keyframes.4> best_pid is None", level='warn')
                         break
 
                 selected_pids.append(best_pid)
@@ -801,9 +877,9 @@ class BaseVisualGrounder(BaseModel):
                 kfs_with_targets.pop(best_pid, None)
                 pid2target_eids.pop(best_pid, None)
 
-            self.logger.loginfo(f"<select_keyframes.3> selected_pids: {selected_pids}")
+            self.log(f"<select_keyframes.3> selected_pids: {selected_pids}")
         except Exception as e:
-            self.logger.logerr(f"<select_keyframes.3> Error occurs: {e}")
+            self.log(f"<select_keyframes.3> Error occurs: {e}")
 
         # Add M keyframes which contains target entities (min_kfs < N+M)
         try:
@@ -818,11 +894,22 @@ class BaseVisualGrounder(BaseModel):
                 self.kf_counts[best_pid] = self.kf_counts.get(best_pid, 0) + 1
                 kfs_with_targets.pop(best_pid, None)
                 pid2target_eids.pop(best_pid, None)
-            self.logger.loginfo(f"<select_keyframes.4> selected_pids: {selected_pids}")
+            self.log(f"<select_keyframes.4> selected_pids: {selected_pids}")
         except Exception as e:
-            self.logger.logerr(f"<select_keyframes.4> Error occurs: {e}")
+            self.log(f"<select_keyframes.4> Error occurs: {e}", level='error')
 
-        return sg.keyframes.get(selected_pids)
+        selected_kfs = []
+        processed_pids = []
+        for pid in selected_pids:
+            for kf in sg.keyframes:
+                if kf['id'][1] == pid:
+                    selected_kfs.append(kf)
+                    processed_pids.append(pid)
+                    break
+        if len(selected_kfs) != len(selected_pids):
+            self.log("<select_keyframes.4> Warn: len(selected_kfs) != len(selected_pids)", level='warn')
+
+        return selected_kfs
 
     def process(self, **kwargs):
         self.update_resource(**kwargs)
@@ -1056,12 +1143,12 @@ class BaseVisualGrounder(BaseModel):
                 if ready_to_answer:
                     self.answer_result = self.agg_results.best_answer  # TODO
                     self.answer_the_question(self.answer_result)
-                    self.logger.loginfo(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} >= {thres_high}.")
+                    self.log(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} >= {thres_high}.")
                     return
                 else:
                     self.log(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} < {thres_high}.")
             except Exception as e:
-                self.logger.logerr(f"<inference_loop.3.1&2> Error occurs: {e}")
+                self.log(f"<inference_loop.3.1&2> Error occurs: {e}", level='error')
 
             # Inference
             try:
@@ -1088,39 +1175,45 @@ class BaseVisualGrounder(BaseModel):
                                     answer = None
                                 else:
                                     answer = Answer(count=count, data=result['data'])
-                                self.logger.loginfo(f"<inference_loop.4.3.{_}> Answer(count={count})")
+                                self.log(f"<inference_loop.4.3.{_}> Answer(count={count})")
                             elif self.action == 'find':
                                 if len(target_ids) > 1:
-                                    self.logger.logwarn(f"<inference_loop.4.3.{_}> #target_ids={len(target_ids)} > 1")
+                                    self.log(f"<inference_loop.4.3.{_}> #target_ids={len(target_ids)} > 1", level='warn')
                                 elif len(target_ids) == 0:
                                     answer = None
-                                    self.logger.loginfo(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: X")
+                                    self.log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: X")
                                 else:
                                     target_id = int(target_ids[0])
                                     # candidate_entities = self.sg.get_candidate_entities('all')
-                                    target_entity = self.sg.entities.get_single(target_id)
-                                    answer = Answer(object=target_entity, data=result['data'])
-                                    self.logger.loginfo(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {target_entity}")
+                                    # target_entity = self.sg.entities.get_single(target_id)
+                                    target_entity = []
+                                    for (level, id), data in self.sg.G.nodes(data=True):
+                                        if level == str(NodeLevel.OBJECT):
+                                            if id == target_id:
+                                                target_entity.append(data)
+                                    result['data'].update({'pid2eids': self.sg.pid2eids})
+                                    answer = Answer(object=target_entity[0], data=result['data'])
+                                    self.log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {target_entity}")
                             else:
                                 raise NotImplementedError(f"action must be in ['count'], but {self.action} was given.")
                         except Exception as e:
-                            self.logger.logerr(f"<inference_loop.4.3.{_}> Error occurs: {e}")
+                            self.log(f"<inference_loop.4.3.{_}> Error occurs: {e}", level='error')
 
                         try:
                             if answer is not None:
                                 self.agg_results.update(gid=gid, answer=answer, confidence=get_confidence(etype))
-                                self.logger.loginfo(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
+                                self.log(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
                             else:
-                                self.logger.loginfo(f"<inference_loop.4.4.{_}> No updated agg_results")
+                                self.log(f"<inference_loop.4.4.{_}> No updated agg_results")
                         except Exception as e:
-                            self.logger.logerr(f"<inference_loop.4.4.{_}> Error occurs: {e}")
+                            self.log(f"<inference_loop.4.4.{_}> Error occurs: {e}", level='error')
                         finally:
                             # --- 예약 해제 (성공/실패 무관 1건) ---
                             if (gid is not None) and (answer is not None): # TODO: fix error case
                                 self.agg_results.release(gid, 1, eids=answer.eids)
                                 self.agg_results.inc_queries(gid, 1, eids=answer.eids)
-                            self.logger.loginfo(f"<inference_loop.4.4.{_}> Release group({gid})")
-                            self.logger.logrich(f"<inference_loop.4.5.{_}> AggResults: {self.agg_results}", name='agg_results')
+                            self.log(f"<inference_loop.4.4.{_}> Release group({gid})")
+                            self.log(f"<inference_loop.4.5.{_}> AggResults: {self.agg_results}")
             except Exception as e:
                 self.log(f"<inference_loop.4> Error occurs: {e}", level='error')
             rate.sleep()
@@ -1143,6 +1236,7 @@ class BaseVisualGrounder(BaseModel):
         # Normalize suffix to always be a list for consistent processing
         suffixes = suffix if isinstance(suffix, list) else [suffix]
         suffix2etype = {
+            '_annotated_global_object_object': 'object',
             '_annotated_global_object': 'object'
         } # TODO: Need to check
 
@@ -1152,7 +1246,7 @@ class BaseVisualGrounder(BaseModel):
                 if s == "":
                     image_path = attrs['image_path']
                 else:
-                    image_path = self.sg.save_path(etype=suffix2etype[s], fname=attrs['image_path'])
+                    image_path = self.sg.save_path(etype=suffix2etype[s], fname=attrs['fname'])
 
                 try:
                     image = self.load_and_preprocess_image(image_path, preprocess)
@@ -1250,11 +1344,16 @@ class BaseVisualGrounder(BaseModel):
             candidate_eids_in_kfs = [] # TODO: Need to check
             pid2eids = self.sg.pid2eids
             for kf in keyframes:
-                pid = kf.get("_attrs", {}).get('id', (None, None))[1]
+                pid = kf['id'][1]
                 if pid is not None:
                     eids = pid2eids[pid]
-                    if eids is not None:
-                        candidate_eids_in_kfs += eids
+                    filtered_eids = [
+                        eid for (level, eid), entity in self.sg.G.nodes(data=True)
+                        if (level == str(NodeLevel.OBJECT))
+                           and (eid in eids)
+                           and (entity.get("_attrs", {})['name'] in self.sg.candidate_names)
+                    ]
+                    candidate_eids_in_kfs += filtered_eids
 
             options = input_data.get('options', self.default_options)
             previous_history = options['prompt']['previous_history']  # TODO
@@ -1356,8 +1455,8 @@ class BaseVisualGrounder(BaseModel):
                 'is_plural': False if self.action == 'find' else True, # TODO: Implement
             })
             if (options['prompt']['is_plural'] is True) and (options['prompt']['atype'] == 'none'):
-                oldest_id = max(keyframes.ids)
-                keyframes = keyframes.get_single(oldest_id) # TODO: need to check
+                oldest_id = max([kf['id'][1] for kf in keyframes])
+                keyframes = [kf for kf in keyframes if kf['id'][1] == oldest_id]# keyframes.get_single(oldest_id) # TODO: need to check
 
             suffix = options['image']['suffix']
             options['image'].update({'suffix': f"{suffix}_{etype}"})
@@ -1708,7 +1807,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
             try:
                 self.update_path_points()
-                self.logger.loginfo(f"<navigation_loop.2> Updated path_points: #={len(self.path_points) if self.path_points is not None else 'None'}")
+                self.log(f"<navigation_loop.2> Updated path_points: #={len(self.path_points) if self.path_points is not None else 'None'}")
             except Exception as e:
                 self.logger.logerr(f"<navigation_loop.2> Error occurs: {e}")
 
@@ -1717,12 +1816,12 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 # if self.node_active_signal:
                 if self.node_active_signal:
                     self.navigate()
-                self.logger.loginfo(f"<navigation_loop.3> Navigate")
+                self.log(f"<navigation_loop.3> Navigate")
             except Exception as e:
                 self.logger.logerr(f"<navigation_loop.3> Error occurs: {e}")
             finally:
                 self.navigation_running.clear()
-                self.logger.loginfo(f"<navigation_loop.3> Clear navigation_running")
+                self.log(f"<navigation_loop.3> Clear navigation_running")
             rate.sleep()
 
     def update_path_points(self) -> None:
@@ -1761,7 +1860,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
         try:
             path_points, log_data = {}, {}
-            for _, group in enumerate(group_hulls):
+            for _, group in enumerate(group_hulls): # TODO: Add traversable_area
                 hull_xy = group['hull']
                 gid = group['gid']
 
@@ -1785,12 +1884,12 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 path_points_marker = make_marker_array_from_points(
                     nearest_points, ns=f"path_points_all", color=(0.5, 0.5, 0.5, 0.5), frame_id=self.frame_id)
                 self.path_points_vis_pub.publish(path_points_marker)
-                self.logger.loginfo(f"<update_path_points.3.1.{_}> Updated path_points for GID({gid}): #={len(current_path_points)}")
+                self.log(f"<update_path_points.3.1.{_}> Updated path_points for GID({gid}): #={len(current_path_points)}")
 
             self.path_points = path_points
             self.is_path_points_updated = True
             self.last_update_time_path_points = now
-            self.logger.logrich(f"<update_path_points.3> path_points (#valid/#total): {{{', '.join([f'{gid}: ({valid}/{total})' for gid, (valid, total) in log_data.items()])}}}", name="path_points")
+            self.log(f"<update_path_points.3> path_points (#valid/#total): {{{', '.join([f'{gid}: ({valid}/{total})' for gid, (valid, total) in log_data.items()])}}}")
         except Exception as e:
             self.log(f"<update_path_points.3> Error occurs: {e}", level='error')
 
@@ -2081,10 +2180,10 @@ if __name__ == "__main__":
         target_name = "pillow closest to the book on the stool"
         candidate_names, reference_names = ['pillow'], ['book', 'stool']
     elif SCENE == 'vla_js_chair_2025-12-17-12-17-43':
-        instruction = "Find the chair closest to the person."
+        instruction = "Find the chair with a blue seat."
         action = 'find'
-        target_name = "chair closest to the person"
-        candidate_names, reference_names = ['chair'], ['person']
+        target_name = "chair with a blue seat"
+        candidate_names, reference_names = ['chair'], []
     else:
         raise TypeError(f"SCENE must be in ['office_1', 'hotel_room_1', 'chinese_room'], but {SCENE} was given.")
 
