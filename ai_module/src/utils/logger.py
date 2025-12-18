@@ -37,7 +37,7 @@ def build_logger(logger=None, logger_cfg: Optional[LoggerConfig] = None):
     elif logger_cfg:
         return RichLogger(**asdict(logger_cfg))
     else:
-        return RichLogger()
+        return Logger()
 
 
 class Logger:

@@ -6,7 +6,9 @@ import open3d as o3d
 from typing import Optional
 
 from scipy.spatial.transform import Rotation
-from utils import load_depth_intrinsics
+import sys
+sys.path.append("/ws/external")
+from ai_module.src.sem.app.utils import load_depth_intrinsics
 
 # def scan2pixels(laserCloud, LIDAR_PARA, CAMERA_PARA):
 #     lidar_offset = np.array([LIDAR_PARA["x"], LIDAR_PARA["y"], LIDAR_PARA["z"]])

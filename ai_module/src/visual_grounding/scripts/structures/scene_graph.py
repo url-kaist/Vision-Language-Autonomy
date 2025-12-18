@@ -3,13 +3,13 @@ import sys
 import time
 sys.path.append('/ws/external')
 import numpy as np
-import copy
+import cv2
 import networkx as nx
 import json
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Literal, Optional, Any, ClassVar, Dict
+from typing import Literal, Optional, Any, ClassVar, Dict, List
 from ai_module.src.visual_grounding.scripts.structures.place import Places
 from ai_module.src.visual_grounding.scripts.structures.entity import Entities
 from ai_module.src.visual_grounding.scripts.structures.keyframe import Keyframes
@@ -81,13 +81,17 @@ class PlaceNode(Node):
 class ObjectNode(Node):
     level = NodeLevel.OBJECT
     schema = {
+        # Required
         'name':         AttrSpec(required=True, default='unknown'), # {str} # TODO: Add
-        'points':       AttrSpec(),                                 # {list: N [ {list:3} ]}
-        'centroid':     AttrSpec(default=[0.0, 0.0, 0.0]),          # {list: 3} [x,y,z] # TODO: Add (position->centroid)
-        'extent':       AttrSpec(default=[0.0, 0.0, 0.0]),          # {list: 3} [x,y,z] # TODO: Add
-        'R':            AttrSpec(default=np.eye(3)),                # {list: 3 [{list:3}]} # TODO: Add
-        'position':     AttrSpec(ignored=True),                     # {list: 3} # TODO: Remove
+        'points':       AttrSpec(required=True),                    # {list: N [ {list:3} ]}
+        'centroid':     AttrSpec(required=True),                    # {list: 3} [x,y,z] # TODO: Add (position->centroid)
+        'extent':       AttrSpec(required=True),                    # {list: 3} [x,y,z] # TODO: Add
+        'R':            AttrSpec(required=True),                    # {list: 3 [{list:3}]} # TODO: Add
+        # Ignored
+        'type': AttrSpec(ignored=True),  # {int}                    # TODO: Remove
         'instance_id':  AttrSpec(ignored=True),                     # {int} # TODO: Remove
+        'class_name': AttrSpec(required=True), # {str}              # TODO: Add
+        'position': AttrSpec(ignored=True),  # {list: 3}            # TODO: Remove
         'has_close_place':AttrSpec(ignored=True),                   # {bool} # TODO: Remove
         'closest_temp_dist': AttrSpec(ignored=True),                # {float} # TODO: Remove
         'closest_temp_place': AttrSpec(ignored=True),               # {float} # TODO: Remove
@@ -103,6 +107,14 @@ class KeyframeNode(Node):
         'detections':   AttrSpec(required=True, default=[]),                # {list: Detections}, Detections(id{int}, bbox{list: 4}) # TODO: Add
         'position':     AttrSpec(ignored=True),                             # {list: 3} [x,y,z]
     }
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        attrs = getattr(self, '_attrs', {})
+        if not 'image_path' in attrs:
+            raise ValueError(f"KeyframeNode must have image_path")
+        image_path = attrs['image_path']
+        attrs['image'] = cv2.imread(image_path)
+        attrs['fname'] = image_path.split("/")[-1]
 
 _NODE_LEVEL_TO_CLS = {
     NodeLevel.BUILDING: BuildingNode,
@@ -113,9 +125,20 @@ _NODE_LEVEL_TO_CLS = {
 
 
 class SceneGraph:
-    def __init__(self, places=None, entities=None, candidate_names=None, reference_names=None, *args, **kwargs):
+    def __init__(self, candidate_names=[], reference_names=[], save_dir='/ws/external/log/sg', *args, **kwargs):
         self._lock = threading.Lock()
         self.G = nx.DiGraph()
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
+        self.save_dir = save_dir
+        self.candidate_names = candidate_names
+        self.reference_names = reference_names
+        self.related_names = list(set(candidate_names + reference_names))
+    def save_path(self, etype, fname='', suffix=''):
+        save_path = os.path.join(self.save_dir, etype)
+        if not os.path.exists(save_path):
+            os.makedirs(save_path, exist_ok=True)
+        return os.path.join(save_path, fname)
 
     def __repr__(self) -> str:
         repr = (f"SceneGraph")
@@ -145,13 +168,22 @@ class SceneGraph:
             # Python version
             with self._lock:
                 for data in scene_graph.get('nodes', []):
-                    level = str(data.pop('type')).lower() # TODO: 'type' -> 'level'
+                    try:
+                        if 'level' in data:
+                            level = str(data.pop('level')).lower()
+                        else:
+                            level = str(data.pop('type')).lower()  # TODO: 'type' -> 'level'
+                    except:
+                        print("")
+                        continue
 
                     # TODO: Remove
                     if level in str(NodeLevel.BUILDING).lower():   # Building
                         level = NodeLevel.BUILDING
+                        continue
                     elif level in str(NodeLevel.PLACE).lower():    # Place
                         level = NodeLevel.PLACE
+                        continue
                     elif level in str(NodeLevel.OBJECT).lower():   # Object
                         level = NodeLevel.OBJECT
                     elif level in str(NodeLevel.KEYFRAME).lower(): # Keyframe
@@ -167,11 +199,9 @@ class SceneGraph:
 
                     # TODO: Remove
                     if level == NodeLevel.OBJECT:
-                        data['name'] = data.pop('class_name')
-                        if isinstance(id, str):
-                            id = id.replace("object_", "")
-                        data['centroid'] = objects[id]['center']
-                        data['points'] = objects[id]['points']
+                        if data.get('instance_id') < 0:
+                            print(f"Detection!!! {data}")
+                            continue
 
                     NodeCls = _NODE_LEVEL_TO_CLS[level]
                     node = NodeCls(id=id, **data)
@@ -184,22 +214,71 @@ class SceneGraph:
                 #     self.G.add_edge(source, target)
                 #     self.G.add_edge(target, target)
                 #     # print(f"Add edge: {source} <-> {target}")
-            # print(f"=> Graph: {self.G}")
+            print(f"=> Graph: {self.G}")
 
 
-    def get_entity_names(self, names, etype: Literal['object', 'detection', 'all'] = 'object', *args, **kwargs) -> Entities:
-        if not isinstance(names, list):
-            names = [names]
-        return Entities({id: data for id, data in self.entities(etype).items() if data.name in names}, *args, **kwargs)
+    def get_entity_names(self, names, *args, **kwargs) -> Entities:
+        output_entities = []
+        for (level, id), data in self.G.nodes(data=True):
+            if level == NodeLevel.OBJECT:
+                name = data.get("_attrs", {}).get("name")
+                if name in names:
+                    output_entities.append(data)
+        return output_entities
 
-    def get_candidate_entities(self, etype: Literal['object', 'detection', 'all'] = 'object', *args, **kwargs) -> Entities:
-        return self.get_entity_names(self.candidate_names, etype=etype, *args, **kwargs)
+    def get_candidate_entities(self, *args, **kwargs) -> List:
+        output_entities = []
+        for (level, id), data in self.G.nodes(data=True):
+            if level != NodeLevel.OBJECT:
+                continue
+            name = data.get("_attrs", {}).get("name")
+            if name in self.candidate_names:
+                output_entities.append(id)
+        return list(set(output_entities))
 
     def get_reference_entities(self, etype: Literal['object', 'detection', 'all'] = 'object') -> Entities:
         return self.get_entity_names(self.reference_names, etype=etype)
 
     def get_related_entities(self, etype: Literal['object', 'detection', 'all'] = 'object') -> Entities:
         return self.get_entity_names(self.related_names, etype=etype)
+
+    @property
+    def keyframes(self):
+        output = []
+        for (level, id), data in self.G.nodes(data=True):
+            if level == NodeLevel.KEYFRAME:
+                output.append(data)
+        return output
+
+    @property
+    def eid2pids(self):
+        G = self.G
+        eid2pids = {}
+        for u, v in G.edges():
+            ulev, uid = G.nodes[u].get('id', (None, None))
+            vlev, vid = G.nodes[v].get('id', (None, None))
+            if not uid or not vid:
+                continue
+            if ({ulev, vlev} == {NodeLevel.OBJECT, NodeLevel.KEYFRAME}):
+                if not uid in eid2pids:
+                    eid2pids[uid] = []
+                eid2pids[uid].append(vid)
+        return eid2pids
+
+    @property
+    def pid2eids(self):
+        G = self.G
+        pid2eids = {}
+        for u, v in G.edges():
+            ulev, uid = G.nodes[u].get('id', (None, None))
+            vlev, vid = G.nodes[v].get('id', (None, None))
+            if not uid or not vid:
+                continue
+            if ({ulev, vlev} == {NodeLevel.KEYFRAME, NodeLevel.OBJECT}):
+                if not uid in pid2eids:
+                    pid2eids[uid] = []
+                pid2eids[uid].append(vid)
+        return pid2eids
 
 
 if __name__ == "__main__":

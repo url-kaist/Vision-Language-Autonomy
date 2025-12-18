@@ -1,6 +1,7 @@
 import os
 import sys
 sys.path.append('/ws/external/')
+import cv2
 import glob
 import time
 import random
@@ -40,6 +41,11 @@ from ai_module.src.visual_grounding.scripts.vlms.utils.helpers import parse_json
 from ai_module.src.visual_grounding.scripts.structures.keyframe import Keyframes, Keyframe
 from ai_module.src.visual_grounding.scripts.structures.entity import Entity
 from ai_module.src.visual_grounding.scripts.structures.answer import Answer
+from ai_module.src.visual_grounding.scripts.structures.scene_graph import NodeLevel
+from ai_module.src.visual_grounding.scripts.structures.bbox import BBoxes
+from ai_module.src.utils.visualizer import Visualizer
+
+import rerun as rr
 
 try:
     import rospy
@@ -56,7 +62,7 @@ from rosgraph_msgs.msg import Clock
 from visualization_msgs.msg import Marker, MarkerArray
 from visual_grounding.srv import SetSubplans, SetSubplansResponse
 from std_srvs.srv import Trigger, TriggerResponse
-from ai_module.src.utils.rr_logger import RRLogger
+from ai_module.src.utils.rr_logger import RRLogger, rotmat_to_quat_xyzw
 
 ANSWER_TYPE = {'find': Marker, 'count': Int32}
 ANSWER_TOPIC_NAME = {'find': 'selected_object_marker', 'count': '/numerical_response'}
@@ -383,16 +389,16 @@ class BaseVisualGrounder(BaseModel):
         self._init_vars()
 
 # CALLBACKS
-    def _set_task_callback(self, req, *args, **kwargs):
+    def _set_task_callback(self, req, candidate_names=[], reference_names=[], *args, **kwargs):
         if self.status == Status.WAITING:
             subtask = req.current_step
             self.start_time = req.start_time
             relation_graph = subtask.entity.relation_graph
 
-            related_names = []
-            candidate_names = []
+            # related_names = []
+            # candidate_names = []
             for node in relation_graph.nodes:
-                related_names.append(node.name)
+                # related_names.append(node.name)
                 if node.is_target:
                     if node.name == 'path':
                         for edge in relation_graph.edges:
@@ -402,9 +408,11 @@ class BaseVisualGrounder(BaseModel):
                                     if _node.id in target_ids:
                                         candidate_names.append(_node.name)
                     candidate_names.append(node.name)
-            self.related_names = list(set(related_names))
+                else:
+                    reference_names.append(node.name)
+            self.related_names = list(set(reference_names + candidate_names))
             self.candidate_names = list(set(candidate_names))
-            self.reference_names = list(set(related_names) - set(candidate_names))
+            self.reference_names = list(set(reference_names))
             self.subtask = subtask
             self.agg_results.action = self.action
 
@@ -535,18 +543,27 @@ class BaseVisualGrounder(BaseModel):
             self.logger.loginfo(f"<main_loop> Main is cleared. Let's sleep..")
             rate.sleep()
 
-    def spin_once(self, event, **kwargs):
-        self.logger.logrich(f"Status: {self.status} | #inference_queue={len(self.inference_queue.queue)}", name='status')
-        self.logger.logrich(f"Answer: {self.answer} | MinQuery: {self.agg_results.min_query}", name='answer')
+    def log_status(self):
+        self.rr_logger.log({
+            'VG/status': self.status,
+            'VG/#inference_queue': len(self.inference_queue.queue),
+            'VG/answer': self.answer,
+            'VG/MinQuery': self.agg_results.min_query,
+        })
 
+    def spin_once(self, event, **kwargs):
+        self.log_status()
         if self.status == Status.STANDBY:
+            self.log_status()
             self.standby()
 
         if self.status == Status.PROCESSING:
-            self.logger.logrich(f"Status: {self.status} | #inference_queue={len(self.inference_queue.queue)}", name='status')
+            self.log_status()
+            # self.logger.logrich(f"Status: {self.status} | #inference_queue={len(self.inference_queue.queue)}", name='status')
             self.process(**kwargs)
 
         if self.status == Status.COMPLETED:
+            self.log_status()
             self.answer_the_question(self.answer_result)
 
     def standby(self, **kwargs):
@@ -554,7 +571,7 @@ class BaseVisualGrounder(BaseModel):
             candidate_names=self.candidate_names,
             reference_names=self.reference_names,
             **kwargs
-        )
+        ) # TODO: FIX
 
         action = self.action
         self.answer_pub = rospy.Publisher(ANSWER_TOPIC_NAME.get(action, '/answer'), ANSWER_TYPE.get(action, String), queue_size=1)
@@ -570,16 +587,84 @@ class BaseVisualGrounder(BaseModel):
 
         self.ready = True
 
+    def log_sg(self, G):
+        for (level, id), data in G.nodes(data=True):
+            if level != NodeLevel.OBJECT:
+                continue
+            attrs = data.get('_attrs', {})
+
+            centers = np.array([attrs['centroid']], dtype=np.float32) # (1, 3)
+            half_sizes = np.array([attrs['extent']], dtype=np.float32) * 0.5
+            quaternions = rotmat_to_quat_xyzw(np.array(attrs['R'])).reshape(1, 4)
+            colors = self.rr_logger.palette[int(str(id).split('_')[-1])]
+
+            self.rr_logger.log({
+                f'SG/nodes/{level}/{id}': rr.Boxes3D(
+                    centers=centers, half_sizes=half_sizes, quaternions=quaternions,
+                    colors=colors, labels=attrs['name']
+                ),
+            })
+
     def update_resource(self, **kwargs):
         self.scene_graph_clients.update_scene_graph(**kwargs)
+        self.log_sg(self.sg.G)
 
         styles = {
             # 'reference': {'show': True, 'color': 'blue'},
             'candidate': {'show': True, 'color': 'green'},
         }
-        with self.sg_lock:
-            for etype in self.etypes:
-                self.sg.keyframes.annotate(styles, node_name=self.node_name, suffix=f"_annotated_global_{etype}", etype=etype)
+        # TODO: FIX
+        # with self.sg_lock:
+        #     for etype in self.etypes:
+        #         # self.sg.keyframes.annotate(styles, node_name=self.node_name, suffix=f"_annotated_global_{etype}", etype=etype)
+        #         G = self.sg.G
+        #         for (level, id), data in G.nodes(data=True):
+        #             if level != NodeLevel.KEYFRAME:
+        #                 continue
+        #             attrs = data.get('_attrs', {})
+        #
+        #             image = attrs['image'].copy()
+        #             fname = attrs['fname']
+        #             detections = attrs['detections']
+        #             if not etype == 'image':
+        #                 for det in detections:
+        #                     is_object = det['id'] < 0
+        #                     if is_object and (etype == 'detection'):
+        #                         continue
+        #                     if (not is_object) and (etype == 'object'):
+        #                         continue
+        #
+        #                     is_candidate = (det['name'] in self.sg.candidate_names)
+        #                     is_reference = (det['name'] in self.sg.reference_names)
+        #                     if is_candidate:
+        #                         style = styles.get('candidate', {'show': False})
+        #                         if not style['show']:
+        #                             continue
+        #                         color = style.get('color', 'green')
+        #                     elif is_reference:
+        #                         style = styles.get('reference', {'show': False})
+        #                         if not style['show']:
+        #                             continue
+        #                         color = style.get('color', 'blue')
+        #
+        #                     bbox = det['bbox']
+        #
+        #                     visualizer = Visualizer()
+        #                     color = visualizer._parse_color(color)
+        #                     u_min, v_min, u_max, v_max = bbox
+        #                     top_left, bottom_right = (u_min, v_min), (u_max, v_max)
+        #
+        #                     overlay = image.copy()
+        #                     cv2.rectangle(overlay, top_left, bottom_right, color=color, thickness=2)
+        #
+        #                     cv2.putText(
+        #                         image, f"{det['id']}", (u_min, v_min - 10),
+        #                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+        #                     )
+        #
+        #             save_path = self.sg.save_path(etype, fname, suffix=suffix)
+        #             success = cv2.imwrite(save_path, image)
+
         self.updated_resource = True
 
     def select_keyframes(
@@ -593,13 +678,13 @@ class BaseVisualGrounder(BaseModel):
         # --- candidate ids 준비 ---
         try:
             if target_eids is None:
-                target_eids = set(sg.get_related_entities(etype).ids)
+                target_eids = set(sg.get_related_entities(etype).ids) # TODO: Need to check
             else:
                 target_eids = set(target_eids)
             if not target_eids:
                 self.logger.logwarn(f"<select_keyframes.1> target_eids is empty.")
                 return sg.keyframes.get([])
-            self.logger.loginfo(f"<select_keyframes.1> target_eids: {target_eids}")
+            self.log(f"<select_keyframes.1> target_eids: {target_eids}")
         except Exception as e:
             self.logger.logerr(f"<select_keyframes.1> Error occurs: {e}")
 
@@ -610,8 +695,9 @@ class BaseVisualGrounder(BaseModel):
         kfs = sg.keyframes
         # ---------- 주어진 target entities를 포함하는 keyframes를 구성: kfs_with_targets, pid2target_eids ----------
         try:
-            eid2pids = kfs.entity_id2place_ids
-            pid2eids = kfs.place_id2entity_ids
+            # TODO: Need to check the below code
+            eid2pids = sg.eid2pids
+            pid2eids = sg.pid2eids
 
             num_places = len(kfs)
             num_target_entities = len(target_eids)
@@ -619,12 +705,12 @@ class BaseVisualGrounder(BaseModel):
 
             kfs_with_targets = {}
             pid2target_eids = defaultdict(set)
-            available_pids = set(kfs.keys())
+            available_pids = set([kf['id'][1] for kf in kfs])
             if not use_pid2eids:
                 for target_eid in target_eids:
                     for pid_with_target in eid2pids.get(target_eid, ()):
                         if pid_with_target not in available_pids:
-                            self.logger.logwarn(f"<select_keyframes.3> Warning occurs: PID({pid_with_target}) is not in available PIDs: {available_pids}")
+                            self.log(f"<select_keyframes.3> Warning occurs: PID({pid_with_target}) is not in available PIDs: {available_pids}", level='warn')
                             continue
                         if pid_with_target not in kfs_with_targets:
                             kfs_with_targets[pid_with_target] = kfs[pid_with_target]
@@ -640,12 +726,11 @@ class BaseVisualGrounder(BaseModel):
                         continue
                     kfs_with_targets[pid] = kfs[pid]
                     pid2target_eids[pid] = target_eids_here
-            self.logger.loginfo(f"<select_keyframes.2> Target EIDs per each kf: {', '.join([f'{k}: {v}' for k, v  in pid2target_eids.items()])}")
+            self.log(f"<select_keyframes.2> Target EIDs per each kf: {', '.join([f'{k}: {v}' for k, v  in pid2target_eids.items()])}")
 
             if len(kfs_with_targets) < min_kfs:
-                self.logger.logwarn(
-                    f"<select_keyframes.2> #kfs_with_targets={len(kfs_with_targets)} < min_kfs={min_kfs}. Skip.")
-                return sg.keyframes.get([])  # Early Stop
+                self.log(f"<select_keyframes.2> #kfs_with_targets={len(kfs_with_targets)} < min_kfs={min_kfs}. Skip.", level='warn')
+                return sg.keyframes  # Early Stop
         except Exception as e:
             self.logger.logerr(f"<select_keyframes.2> Error occurs: {e}")
 
@@ -913,28 +998,37 @@ class BaseVisualGrounder(BaseModel):
                 # Time check
                 if self.start_time:
                     now = rospy.Time.now()
-                    elapsed = now - self.start_time
-                    remaining_time = (self.start_time + self.time_limit) - now
+                    try:
+                        elapsed = now - self.start_time
+                        remaining_time = (self.start_time + self.time_limit) - now
+                    except:
+                        elapsed = now.secs - self.start_time
+                        remaining_time = (self.start_time + self.time_limit.secs) - now.secs
                 else:
                     remaining_time = rospy.Duration(60)
                     elapsed = rospy.Time.now()
-                self.logger.logrich(f"<inference_loop.1> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)", name='time')
+                try:
+                    time_txt = f"{int(elapsed.to_sec())}/{int(self.time_limit.to_sec())}"
+                except:
+                    time_txt = f"{int(elapsed)}/{int(self.time_limit.secs)}"
+                self.log(f"<inference_loop.1> Time: {time_txt} (sec)")
+                self.rr_logger.log({'VG/Time': f"{time_txt} (sec)"})
                 
                 # Current status check
                 if self.status != Status.PROCESSING:
                     rate.sleep()
                     self.logger.loginfo(f"<inference_loop.1> Let's sleep...")
                     continue
-                self.logger.loginfo(f"<inference_loop.1> Let's inference!!")
+                self.log(f"<inference_loop.1> Let's inference!!")
             except Exception as e:
                 self.logger.logerr(f"<inference_loop.1> Error occurs: {e}")
 
             try:
                 with self.agg_results_lock:
                     agg_results = self.agg_results.snapshot()
-                self.logger.logrich(f"<inference_loop.2> AggResults: {self.agg_results}", name='agg_results')
+                self.log(f"<inference_loop.2> AggResults: {self.agg_results}")
             except Exception as e:
-                self.logger.logerr(f"<inference_loop.2> Error occurs: {e}")
+                self.log(f"<inference_loop.2> Error occurs: {e}", level='error')
 
             # Ready to answer?
             try:
@@ -948,10 +1042,16 @@ class BaseVisualGrounder(BaseModel):
                 ## Option1: High confidence & Enough time elapsed
                 ## Option2: Enough observation & All inference is done
                 ## Option3: Time is almost up
-                ready_to_answer = (((best_confidence > thres_high and elapsed >= rospy.Duration(5 * 60)) 
-                                    or (enough_observation and all_inference_done))
-                                    or (remaining_time <= rospy.Duration(30)))  # (sec)
-                self.logger.logrich(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", name='time')
+                try:
+                    ready_to_answer = (((best_confidence > thres_high and elapsed >= rospy.Duration(5 * 60))
+                                        or (enough_observation and all_inference_done))
+                                       or (remaining_time <= rospy.Duration(30)))  # (sec)
+                    self.log(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
+                except:
+                    ready_to_answer = (((best_confidence > thres_high and elapsed >= 5 * 60)
+                                        or (enough_observation and all_inference_done))
+                                       or (remaining_time <= 30))  # (sec)
+                    self.log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
 
                 if ready_to_answer:
                     self.answer_result = self.agg_results.best_answer  # TODO
@@ -959,7 +1059,7 @@ class BaseVisualGrounder(BaseModel):
                     self.logger.loginfo(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} >= {thres_high}.")
                     return
                 else:
-                    self.logger.loginfo(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} < {thres_high}.")
+                    self.log(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} < {thres_high}.")
             except Exception as e:
                 self.logger.logerr(f"<inference_loop.3.1&2> Error occurs: {e}")
 
@@ -976,7 +1076,7 @@ class BaseVisualGrounder(BaseModel):
                     for item, result in self.run_parallel(self.inference, jobs, max_workers=self.max_workers):
                         gid = item.get('gid')
                         if result is None:
-                            self.logger.loginfo(f"<inference_loop.4.2.{_}> result is None.")
+                            self.log(f"<inference_loop.4.2.{_}> result is None.")
                             continue
 
                         try:
@@ -1022,7 +1122,7 @@ class BaseVisualGrounder(BaseModel):
                             self.logger.loginfo(f"<inference_loop.4.4.{_}> Release group({gid})")
                             self.logger.logrich(f"<inference_loop.4.5.{_}> AggResults: {self.agg_results}", name='agg_results')
             except Exception as e:
-                self.logger.logerr(f"<inference_loop.4> Error occurs: {e}")
+                self.log(f"<inference_loop.4> Error occurs: {e}", level='error')
             rate.sleep()
 
     def load_and_preprocess_image(self, image_path, preprocess=None):
@@ -1035,28 +1135,32 @@ class BaseVisualGrounder(BaseModel):
         return image
 
     def get_images(self, keyframes, suffix="", preprocess=None, **kwargs):
-        if isinstance(keyframes, Keyframe):
-            keyframes = Keyframes({keyframes.id: keyframes})
+        # if isinstance(keyframes, Keyframe):
+        #     keyframes = Keyframes({keyframes.id: keyframes})
 
         images, image_paths = [], []
 
         # Normalize suffix to always be a list for consistent processing
         suffixes = suffix if isinstance(suffix, list) else [suffix]
+        suffix2etype = {
+            '_annotated_global_object': 'object'
+        } # TODO: Need to check
 
-        for keyframe in keyframes.values():
+        for kf in keyframes:
+            attrs = kf.get("_attrs", {})
             for s in suffixes:
                 if s == "":
-                    image_path = keyframe.image_path
+                    image_path = attrs['image_path']
                 else:
-                    image_path = keyframe.save_path(node_name=self.node_name, suffix=s)
+                    image_path = self.sg.save_path(etype=suffix2etype[s], fname=attrs['image_path'])
 
                 try:
                     image = self.load_and_preprocess_image(image_path, preprocess)
                 except Exception as e:
-                    self.logger.logerr(f"<get_images> Error occurs: {e}\n"
-                                       f"  > Failed to load and preprocess image: {image_path}\n"
-                                       f"  > keyframe: {keyframe}\n"
-                                       f"  > suffixes: {suffixes}\n")
+                    self.log(f"<get_images> Error occurs: {e}\n"
+                             f"  > Failed to load and preprocess image: {image_path}\n"
+                             f"  > keyframe: {kf}\n"
+                             f"  > suffixes: {suffixes}\n", level='error')
                     continue
 
                 images.append(image)
@@ -1138,12 +1242,19 @@ class BaseVisualGrounder(BaseModel):
             time.sleep(random.uniform(0, 0.25))
 
             client = self.clients[client_counter % len(self.clients)]
-            self.logger.loginfo(f"<query_worker.0> Get client: {client_counter % len(self.clients)}")
+            self.log(f"<query_worker.0> Get client: {client_counter % len(self.clients)}")
 
             phase = 1
             keyframes = input_data['keyframes']
-            if isinstance(keyframes, Keyframe): candidate_eids_in_kfs = keyframes.entities['candidate'].ids  # image
-            else: candidate_eids_in_kfs = reduce(operator.add, [kf.entities['candidate'].ids for pid, kf in keyframes.items()])  # object, detection
+
+            candidate_eids_in_kfs = [] # TODO: Need to check
+            pid2eids = self.sg.pid2eids
+            for kf in keyframes:
+                pid = kf.get("_attrs", {}).get('id', (None, None))[1]
+                if pid is not None:
+                    eids = pid2eids[pid]
+                    if eids is not None:
+                        candidate_eids_in_kfs += eids
 
             options = input_data.get('options', self.default_options)
             previous_history = options['prompt']['previous_history']  # TODO
@@ -1151,8 +1262,8 @@ class BaseVisualGrounder(BaseModel):
             # Prepare the prompt and system instruction
             prompt = self.prompt_renderer.render(**options['prompt'], anno_ids=candidate_eids_in_kfs)
             system_instruction = self.system_instruction_renderer.render(**options['prompt'])
-            images, image_paths = self.get_images(keyframes, **options['image'])
-            self.logger.loginfo(f"<query_worker.1> Prepare the input data")
+            images, image_paths = self.get_images(keyframes, **options['image']) # TODO: FIX
+            self.log(f"<query_worker.1> Prepare the input data")
 
             # Query the model
             phase = 2
@@ -1160,7 +1271,7 @@ class BaseVisualGrounder(BaseModel):
             with self.sg_lock:
                 message = client.construct_message(prompt, images, system_instruction, **options['construct_message'])
             end_time = time.time()
-            self.logger.loginfo(f"<query_worker.2> Construct message with client")
+            self.log(f"<query_worker.2> Construct message with client")
 
             phase = 3
             response_text, _, _ = self._get_response_with_retry(
@@ -1174,10 +1285,10 @@ class BaseVisualGrounder(BaseModel):
             response = parse_json(response_text)
             if response:
                 target_ids = response.get('target_ids', [])
-                self.logger.loginfo(f"<query_worker.3> Get response")
+                self.log(f"<query_worker.3> Get response")
             else:
-                self.logger.logwarn(f"<query_worker.3> Failed to parse. response_text (truncated):\n"
-                                    f"{str(response_text)[:1000]}")
+                self.log(f"<query_worker.3> Failed to parse. response_text (truncated):\n"
+                                    f"{str(response_text)[:1000]}", level='warn')
 
             # Log the response
             phase = 4
@@ -1198,14 +1309,14 @@ class BaseVisualGrounder(BaseModel):
             result_text += f"Query time: {end_time - start_time:.2f} seconds\n"
             result_text += f"Response: {response}\n"
             result_text += f"====================================================\n\n"
-            self.logger.loginfo(result_text)
-            self.logger.loginfo(f"<query_worker.4> Print the log")
+            self.log(result_text)
+            self.log(f"<query_worker.4> Print the log")
 
             # Verify
             phase = 5
             if self.action in ['find']:
                 if len(target_ids) > 1:
-                    self.logger.logwarn(f"Object ids mismatch: len(target_ids)={len(target_ids)} != 1")
+                    self.log(f"Object ids mismatch: len(target_ids)={len(target_ids)} != 1", level='warn')
                     return None
             else:
                 if self.default_inference_options['prompt']['action'] == 'follow_between' \
@@ -1218,7 +1329,7 @@ class BaseVisualGrounder(BaseModel):
                         and len(target_ids) != 1:
                     self.logger.logwarn(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 1")
                     return None
-            self.logger.loginfo(f"<query_worker.5> Verify the response")
+            self.log(f"<query_worker.5> Verify the response")
             return response
         except Exception as e:
             self.logger.logerr(f"<query_worker.{phase}> Error occurs: {e}")
@@ -1226,14 +1337,14 @@ class BaseVisualGrounder(BaseModel):
     def inference(self, keyframes, etype='all', atype='object_box_id', client_counter=0, gid=None, *args, **kwargs):
         try:
             if isinstance(keyframes, dict):
-                self.logger.logwarn(f"<inference.1> keyframes is dictionary. Use keyframes['keyframes']")
+                self.log(f"<inference.1> keyframes is dictionary. Use keyframes['keyframes']", level='warn')
                 keyframes = keyframes['keyframes']
             if len(keyframes) == 0:
                 self.logger.logwarn(f"<inference.1> No keyframes input was given.")
                 return
-            self.logger.loginfo(f"<inference.1> Annotation type is {atype}; Entity type is {etype};")
+            self.log(f"<inference.1> Annotation type is {atype}; Entity type is {etype};")
         except Exception as e:
-            self.logger.logerr(f"<inference.1> Error occurs: {e}")
+            self.log(f"<inference.1> Error occurs: {e}", level='error')
 
         try:
             options = copy.deepcopy(self.default_inference_options)
@@ -1246,7 +1357,7 @@ class BaseVisualGrounder(BaseModel):
             })
             if (options['prompt']['is_plural'] is True) and (options['prompt']['atype'] == 'none'):
                 oldest_id = max(keyframes.ids)
-                keyframes = keyframes.get_single(oldest_id)
+                keyframes = keyframes.get_single(oldest_id) # TODO: need to check
 
             suffix = options['image']['suffix']
             options['image'].update({'suffix': f"{suffix}_{etype}"})
@@ -1254,19 +1365,19 @@ class BaseVisualGrounder(BaseModel):
                 'keyframes': keyframes,  # TODO: need to check
                 'options': options,
             }]
-            self.logger.loginfo(f"<inference.2> options and data_list are ready.")
+            self.log(f"<inference.2> options and data_list are ready.")
         except Exception as e:
-            self.logger.logerr(f"<inference.2> Error occurs: {e}")
+            self.log(f"<inference.2> Error occurs: {e}")
 
         try:
-            self.logger.loginfo(f"<inference.3> GID={gid}")
+            self.log(f"<inference.3> GID={gid}")
             response = self.query_worker(data_list[0], client_counter=client_counter)
             if response is None:
-                self.logger.logwarn(f"<inference.3> response is None.")
+                self.log(f"<inference.3> response is None.", level='warn')
                 return
-            self.logger.loginfo(f"<inference.3> Get response from worker({client_counter})")
+            self.log(f"<inference.3> Get response from worker({client_counter})")
         except Exception as e:
-            self.logger.logerr(f"<inference.3> Error occurs: {e}")
+            self.log(f"<inference.3> Error occurs: {e}", level='error')
 
         # Save the result
         try:
@@ -1276,9 +1387,9 @@ class BaseVisualGrounder(BaseModel):
                 'target_ids': response.get('target_ids'),
                 'reason': response.get('reason'),
             }
-            self.logger.loginfo(f"<inference.4> Set inference_ready_event, which is not used.")
+            self.log(f"<inference.4> Set inference_ready_event, which is not used.")
         except Exception as e:
-            self.logger.logerr(f"<inference.4> Error occurs: {e}")
+            self.log(f"<inference.4> Error occurs: {e}", level='error')
         return output
 
 # OTHERS
@@ -1484,9 +1595,18 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.logger.loginfo("<timeout_callback> Finished :) #############")
         return
 
+    def log(self, text, level='info'):
+        if level == 'warn':
+            self.logger.logwarn(text)
+        elif level == 'error':
+            self.logger.logerr(text)
+        else:
+            self.logger.loginfo(text)
+        self.rr_logger.log({'VG/log': text}, level=level.upper())
+
 # MAIN LOOP
     def process(self, **kwargs):
-        self.logger.loginfo(f"<process.0> Start")
+        self.log(f"<process.0> Start")
         self.update_resource(**kwargs)
 
         # Select Group ID
@@ -1497,9 +1617,8 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.logger.loginfo(f"<process.1> New EIDs are given: {eids} (GID={gid})")
         except queue.Empty:
             if self.action == 'find':
-                candidate_eids1 = self.sg.get_candidate_entities('object').ids
-                candidate_eids2 = self.sg.get_candidate_entities('detection', include_untracked=False).ids
-                candidate_eids = list(set(candidate_eids1 + candidate_eids2))
+                # NOTE: Only etype=='object' is supported.
+                candidate_eids = self.sg.get_candidate_entities()
                 pending_eids = sorted(
                     [
                         eid for eid in candidate_eids
@@ -1520,15 +1639,15 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 self.logger.logerr(f"<process.1> Error occurs: self.action must be in ['find', 'count'], bug {self.action} was given.")
 
             if len(pending_eids) == 0:
-                self.logger.loginfo(f"<process.1> Don't need to more inference")
+                self.log(f"<process.1> Don't need to more inference")
                 return
             eids = pending_eids
-            self.logger.loginfo(f"<process.1> Pending EIDs are selected: {eids}")
+            self.log(f"<process.1> Pending EIDs are selected: {eids}")
 
         # Get Keyframes of the group gid
         try:
             # eids = self.hull_grouper.groups(gid)
-            candidate_eids = self.sg.get_candidate_entities().ids
+            candidate_eids = self.sg.get_candidate_entities()
             candidate_eids_in_group = list(set(eids) & set(candidate_eids))
             if len(candidate_eids_in_group) == 0:
                 data, pids = [], []
@@ -1536,9 +1655,9 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 data, pids = self.build_batch_for_gid(
                     eids=candidate_eids_in_group, num_queries_required=num_queries_required
                 )
-            self.logger.loginfo(f"<process.2> Selected KFs: {list(set(pids))}")
+            self.log(f"<process.2> Selected KFs: {list(set(pids))}")
         except Exception as e:
-            self.logger.logerr(f"<process.2> Error occurs: {e}")
+            self.log(f"<process.2> Error occurs: {e}", level='error')
 
         # Put the data to inference_queue
         try:
@@ -1546,14 +1665,14 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 try:
                     self.inference_queue.put_nowait(data)
                     self.agg_results.schedule(gid, n=len(data), data=data)
-                    self.logger.loginfo(
+                    self.log(
                         "<process.3> Put data to inference_queue:\n" +
-                        "\n".join([f"  > pids: {', '.join(map(str, d['keyframes'].ids))}, etype: {d['etype']}, atype: {d['atype']}, eids: {d['eids']}" for d in data])
+                        "\n".join([f"  > pids: {', '.join(map(str, [kf['id'][1] for kf in d['keyframes']]))}, etype: {d['etype']}, atype: {d['atype']}, eids: {d['eids']}" for d in data])
                     )
                 except queue.Full:
-                    self.logger.logwarn("<process.3> inference_queue is full. Will retry next tick.")
+                    self.log("<process.3> inference_queue is full. Will retry next tick.", level='warn')
             else:
-                self.logger.loginfo(f"<process.3> No data to put: {data}")
+                self.log(f"<process.3> No data to put: {data}", level='error')
         except Exception as e:
             self.logger.logerr(f"<process.3> Error occurs: {e}")
 
@@ -1561,7 +1680,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
     def navigation_loop(self, hz):
         rate = rospy.Rate(hz)
         while not rospy.is_shutdown():
-            self.logger.logrich(f"<navigation_loop.1> Resource status: {'Updated' if self.updated_resource else 'Not yet'}", name="resource_status")
+            self.log(f"<navigation_loop.1> Resource status: {'Updated' if self.updated_resource else 'Not yet'}")
             try:
                 if not self.updated_resource:
                     rate.sleep()
@@ -1610,10 +1729,10 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         # TODO: Detection-based update_path_points
         try:
             with self.sg_lock:
-                related_objects = self.sg.get_related_entities('object')
-            self.logger.loginfo(f"<update_path_points.1> #related_objects = {len(related_objects)}")
+                related_objects = self.sg.get_related_entities() # NOTE: Don't support etype!='object'
+            self.log(f"<update_path_points.1> #related_objects = {len(related_objects)}")
         except Exception as e:
-            self.logger.logerr(f"<update_path_points.1> Error occurs: {e}")
+            self.log(f"<update_path_points.1> Error occurs: {e}", level='error')
 
         try:
             group_hulls_bef = None
@@ -1623,17 +1742,22 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 group_hulls_bef = self.hull_grouper.group_hulls()
                 self.hull_grouper.update(related_objects)
 
+            # self.hull_grouper.visualize(
+            #     image=np.ones((1000, 1000, 3), dtype=np.uint8) * 255,
+            #     meta={'xmin': -1, 'ymax': 4, 'scale': 100, 'pad':0},
+            # )
+
             now = rospy.Time.now()
             updated_time_diff = now - self.last_update_time_path_points
             group_hulls = self.hull_grouper.group_hulls()
 
             is_equal_group_hulls = is_equal(group_hulls_bef, group_hulls)
             if is_equal_group_hulls and (updated_time_diff < self.update_interval_path_points):
-                self.logger.loginfo(f"<update_path_points.2> No update group_hulls: #GIDs={len(group_hulls)}")
+                self.log(f"<update_path_points.2> No update group_hulls: #GIDs={len(group_hulls)}")
                 return
-            self.logger.loginfo(f"<update_path_points.2> Updated group_hulls: #GIDs={len(group_hulls)}")
+            self.log(f"<update_path_points.2> Updated group_hulls: #GIDs={len(group_hulls)}")
         except Exception as e:
-            self.logger.logerr(f"<update_path_points.2> Error occurs: {e}")
+            self.log(f"<update_path_points.2> Error occurs: {e}", level='error')
 
         try:
             path_points, log_data = {}, {}
@@ -1668,7 +1792,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.last_update_time_path_points = now
             self.logger.logrich(f"<update_path_points.3> path_points (#valid/#total): {{{', '.join([f'{gid}: ({valid}/{total})' for gid, (valid, total) in log_data.items()])}}}", name="path_points")
         except Exception as e:
-            self.logger.logerr(f"<update_path_points.3> Error occurs: {e}")
+            self.log(f"<update_path_points.3> Error occurs: {e}", level='error')
 
     def navigate(self):
         try:
@@ -1904,11 +2028,11 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
 # OTHERS
     def build_batch_for_gid(self, eids: List[int], num_queries_required: int):
-        self.logger.loginfo(f"<build_batch_for_gid.0> EIDs: {eids}")
+        self.log(f"<build_batch_for_gid.0> EIDs: {eids}")
         try:
             data, pids = [], []
             budget = max(0, int(num_queries_required))
-            self.logger.loginfo(f"<build_batch_for_gid.1> Budget: {budget}")
+            self.log(f"<build_batch_for_gid.1> Budget: {budget}")
 
             etype = 'object'
             while budget > 0 and (etype in self.etypes):
@@ -1916,9 +2040,9 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 if len(keyframes) == 0:
                     break
                 data += [{'keyframes': keyframes, 'etype': etype, 'atype': 'object_box_id', 'eids': eids}]
-                pids += keyframes.ids
+                pids += [kf['id'][1] for kf in keyframes]
                 budget -= 1
-            self.logger.loginfo(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
+            self.log(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
 
             etype = 'all'
             while budget > 0 and (etype in self.etypes):
@@ -1926,11 +2050,11 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 if len(keyframes) == 0:
                     break
                 data += [{'keyframes': keyframes, 'etype': etype, 'atype': 'object_box_id', 'eids': eids}]
-                pids += keyframes.ids
+                pids += [kf['id'][1] for kf in keyframes]
                 budget -= 1
-            self.logger.loginfo(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
+            self.log(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
         except Exception as e:
-            self.logger.logerr(f"<build_batch_for_gid.1> Error occurs: {e}")
+            self.log(f"<build_batch_for_gid.1> Error occurs: {e}", level='error')
 
         try:
             etype = 'image'
@@ -1938,10 +2062,10 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 keyframes = self.select_keyframes(entity_type=etype, target_eids=eids, min_kfs=budget, max_kfs=3)
                 if len(keyframes) == 0:
                     break
-                data += [{'keyframes': kf, 'etype': 'image', 'atype': 'none', 'eids': eids} for kf in keyframes.to_list()]
-                pids += keyframes.ids
+                data += [{'keyframes': keyframes, 'etype': 'image', 'atype': 'none', 'eids': eids}]
+                pids += [kf['id'][1] for kf in keyframes]
                 budget -= 1
-            self.logger.loginfo(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
+            self.log(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")
         except Exception as e:
             self.logger.logerr(f"<build_batch_for_gid.2> Error occurs: {e}")
 
@@ -1950,12 +2074,17 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 if __name__ == "__main__":
     logger = Logger()
 
-    SCENE = "arabic_room"
+    SCENE = "vla_js_chair_2025-12-17-12-17-43"
     if SCENE == "arabic_room":
         instruction = "Find the pillow closest to the book on the stool."
         action = 'find'
         target_name = "pillow closest to the book on the stool"
         candidate_names, reference_names = ['pillow'], ['book', 'stool']
+    elif SCENE == 'vla_js_chair_2025-12-17-12-17-43':
+        instruction = "Find the chair closest to the person."
+        action = 'find'
+        target_name = "chair closest to the person"
+        candidate_names, reference_names = ['chair'], ['person']
     else:
         raise TypeError(f"SCENE must be in ['office_1', 'hotel_room_1', 'chinese_room'], but {SCENE} was given.")
 
@@ -1963,13 +2092,36 @@ if __name__ == "__main__":
     MAP_DIR = os.path.join(DATA_DIR, "offline_map")
     KEYFRAMES_DIR = os.path.join(DATA_DIR, "keyframes")
 
-    tester = BaseVisualGrounder(
+    tester = BaseActiveVisualGrounder(
         logger=logger, action=action, target_name=target_name,
         candidate_names=candidate_names, reference_names=reference_names,
+        use_ros=False
     )
     tester._init_all(logger=tester.logger, use_ros=False)
-    tester._set_task(
-        action, target_name=target_name,
+
+    class Task:
+        def __init__(self, current_step, action, text_instruction):
+            self.current_step = current_step
+            self.start_time = time.time()
+            self.action = action
+            self.text_instruction = text_instruction
+    class Graph:
+        def __init__(self):
+            self.nodes = []
+    class Entity:
+        def __init__(self, target_name=target_name):
+            self.relation_graph = Graph()
+            self.target_name = target_name
+
+    class SubTask:
+        def __init__(self, entity, action):
+            self.entity = entity
+            self.action = action
+
+    subtask = SubTask(entity=Entity(target_name=target_name), action=action)
+    task = Task(current_step=subtask, action=action, text_instruction=instruction)
+    tester._set_task_callback(
+        task, target_name=target_name,
         candidate_names=candidate_names, reference_names=reference_names
     )
 
@@ -1978,7 +2130,9 @@ if __name__ == "__main__":
     map_dir_sorted = sorted(map_dirs, key=os.path.getmtime)
 
     for dir in map_dir_sorted:
-        tester.timer_callback(None, dir=dir)
+        tester.spin_once(None, dir=dir)
+        tester.navigation_loop(1)
+        tester.inference_loop(1)
         # time.sleep(0.1)
 
     print("Done!")

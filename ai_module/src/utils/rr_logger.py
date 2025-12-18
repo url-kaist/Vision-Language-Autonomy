@@ -1,5 +1,5 @@
 import os
-
+import subprocess
 try:
     import rospy
 except ImportError:
@@ -11,6 +11,42 @@ import rerun.blueprint as rrb
 from typing import Dict
 from skimage import color
 
+
+def rotmat_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
+    """3x3 회전행렬 -> quaternion (x,y,z,w)."""
+    # 안정적인 변환 (Ken Shoemake 계열)
+    m = R.astype(np.float64)
+    t = np.trace(m)
+    if t > 0:
+        s = np.sqrt(t + 1.0) * 2
+        w = 0.25 * s
+        x = (m[2,1] - m[1,2]) / s
+        y = (m[0,2] - m[2,0]) / s
+        z = (m[1,0] - m[0,1]) / s
+    else:
+        i = int(np.argmax([m[0,0], m[1,1], m[2,2]]))
+        if i == 0:
+            s = np.sqrt(1.0 + m[0,0] - m[1,1] - m[2,2]) * 2
+            w = (m[2,1] - m[1,2]) / s
+            x = 0.25 * s
+            y = (m[0,1] + m[1,0]) / s
+            z = (m[0,2] + m[2,0]) / s
+        elif i == 1:
+            s = np.sqrt(1.0 + m[1,1] - m[0,0] - m[2,2]) * 2
+            w = (m[0,2] - m[2,0]) / s
+            x = (m[0,1] + m[1,0]) / s
+            y = 0.25 * s
+            z = (m[1,2] + m[2,1]) / s
+        else:
+            s = np.sqrt(1.0 + m[2,2] - m[0,0] - m[1,1]) * 2
+            w = (m[1,0] - m[0,1]) / s
+            x = (m[0,2] + m[2,0]) / s
+            y = (m[1,2] + m[2,1]) / s
+            z = 0.25 * s
+
+    q = np.array([x, y, z, w], dtype=np.float32)
+    q /= (np.linalg.norm(q) + 1e-12)  # Rerun 뷰어에서도 정규화되지만, 안전하게 선정규화 :contentReference[oaicite:2]{index=2}
+    return q
 
 def make_palette(K, n_candidates: int = 2000, seed: int = 0):
     rng = np.random.default_rng(seed)
@@ -42,10 +78,20 @@ class RRLogger:
         full_output_path = osp.join(output_path, "test_logger.rrd")
 
         if save:
-            rr.init(name, spawn=True)
-        else:
             rr.init(name)
             rr.save(full_output_path)
+        else:
+            subprocess.Popen([
+                "rerun",
+                "--serve",
+                "--bind", "0.0.0.0",
+                "--web-viewer-port", "9090",
+                "--port", "9876"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            rr.init(name, spawn=False)
+            rr.connect("127.0.0.1:9876")
 
         self.rr = rr
 
@@ -58,17 +104,19 @@ class RRLogger:
     def log(self, data: Dict, t_sec=None, **kwargs):
         t_sec = self.set_time(t_sec)
         for entity_path, entity in data.items():
-            self.log_single(entity_path, entity, t_sec)
+            self.log_single(entity_path, entity, t_sec, **kwargs)
 
-    def log_single(self, entity_path, entity=None, t_sec=None, **kwargs):
+    def log_single(self, entity_path, entity=None, t_sec=None, level=None, **kwargs):
         t_sec = self.set_time(t_sec)
         if isinstance(entity, str):
-            entity = rr.TextLog(entity)
+            entity = rr.TextLog(entity, level=level)
         elif isinstance(entity, (int, float)):
             entity = rr.Scalar(entity)
-        else:
-            print(f"[WARN] Invalid entity type: {type(entity)}")
+        # else:
+        #     print(f"[WARN] Invalid entity type: {type(entity)}")
         self.rr.log(entity_path, entity, **kwargs)
+
+
 
 
 if __name__ == "__main__":

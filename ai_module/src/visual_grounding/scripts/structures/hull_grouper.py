@@ -124,16 +124,18 @@ class GridGrouper:
         cb = self.group_count.pop(rb, 0)
         self.group_count[r_new] += (ca + cb)
 
-    def fit(self, entities: Entities):
+    def fit(self, entities):
         self._clear_all()
 
-        eids = [eid for eid in entities.ids if eid != -1]
-        entities = entities.get(eids)
-        for eid in entities.keys():
+        eids = [e['id'][1] for e in entities if 'id' in e]
+        for eid in eids:
             self.dsu.add(eid)
 
-        for eid, entity in entities.items():
-            pts = np.asarray(entity.points, float)
+        for entity in entities:
+            attrs = entity.get("_attrs", {})
+            eid = entity['id'][1]
+
+            pts = np.asarray(attrs['points'], float)
             cells = self._cells_set_from_points(pts)
             self.ent_cells[eid] = cells
             for c in cells:
