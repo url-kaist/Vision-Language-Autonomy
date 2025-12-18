@@ -3,7 +3,7 @@
     <arg name="debug" default="false"/>
     <arg name="real_world" default="false"/>
     
-    <arg name="config" default="/ws/external/ai_module/src/sem/config/simulation_gt.json"/>
+    <arg name="config" default="/workspace/ai_module/src/sem/config/simulation_gt.json"/>
 
         <node name="traversable_authority" pkg="traversable_authority" type="traversable_authority_node.py" output="screen">
             <param name="quiet" value="$(arg quiet)"/>

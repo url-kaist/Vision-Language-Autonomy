@@ -34,7 +34,7 @@ from utils import (
 )
 
 scene = "homebuilding2"  # "homebuilding2" #livingroom1 #real
-data_dir = "/ws/external/ai_module/src/sem/config/" + scene + ".json"
+data_dir = "/workspace/ai_module/src/sem/config/" + scene + ".json"
 with open(data_dir, "r") as f:
     data = json.load(f)
 

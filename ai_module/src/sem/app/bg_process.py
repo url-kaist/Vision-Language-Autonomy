@@ -95,7 +95,7 @@ class BGProcessor:
         self.save_occupancy_grid_image(self.occupancy_data, self.map_width, self.map_height)
 
 
-    def save_occupancy_grid_image(self, map_data: list, width: int, height: int, save_dir="/ws/external/occupancy_map"):
+    def save_occupancy_grid_image(self, map_data: list, width: int, height: int, save_dir="/workspace/occupancy_map"):
         os.makedirs(save_dir, exist_ok=True)
         grid_array = np.array(map_data, dtype=np.uint8).reshape((height, width))
 
