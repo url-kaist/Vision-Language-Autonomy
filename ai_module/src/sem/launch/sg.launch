@@ -1,8 +1,10 @@
 <launch>
     <arg name="quiet" default="false"/>
     <arg name="debug" default="false"/>
-    <arg name="real_world" default="false"/>
 
+    <arg name="real_world" default="false"/>
+    <param name="/real_world" value="$(arg real_world)"/>
+  
     <group if="$(arg real_world)">
         <arg name="config" default="/ws/external/ai_module/src/sem/config/real_robot.json"/>
 

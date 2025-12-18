@@ -282,7 +282,7 @@ class SceneGraphProcessor:
         # self.cloud_sub = rospy.Subscriber("/semantic_scan", PointCloud2, self.cloud_callback, queue_size=10)
         # self.image_sub = rospy.Subscriber("/camera/semantic_image", Image, self.sem_image_callback, queue_size=1)
 
-        self.is_real_world = rospy.get_param('~real_world', False)
+        self.is_real_world = rospy.get_param('/real_world', False)
         
         self.rgb_sub = Subscriber("/camera/image", Image)
         self.cloud_sub = Subscriber("/semantic_scan", PointCloud2)

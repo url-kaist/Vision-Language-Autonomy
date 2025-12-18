@@ -1,4 +1,7 @@
 <launch>
+    <arg name="real_world" default="false"/>
+    <param name="/real_world" value="$(arg real_world)"/>
+
     <arg name="quiet" default="false"/>
     <arg name="debug" default="false"/>
 

@@ -23,7 +23,7 @@ class WaypointSelector:
         self.logger = Logger(
             quiet=quiet, prefix='WaypointSelector', log_path="/ws/external/log/exploration/waypoint_selector.log")
 
-        self.is_real_world = rospy.get_param('~real_world', False)
+        self.is_real_world = rospy.get_param('/real_world', False)
         if self.is_real_world:
             self.logger.loginfo("Hello Real World!!")
             self.frame_id = "world"

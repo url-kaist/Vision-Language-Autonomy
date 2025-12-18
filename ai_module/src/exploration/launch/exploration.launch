@@ -1,6 +1,8 @@
 <launch>
     <arg name="quiet" default="false"/>
     <arg name="real_world" default="false"/>
+    <param name="/real_world" value="$(arg real_world)"/>
+
 
 <!-- Exploration -->
     <node pkg="exploration" type="filter_scan.py" name="filter_scan_node" output="screen">

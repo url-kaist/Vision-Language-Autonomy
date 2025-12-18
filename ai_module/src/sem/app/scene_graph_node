@@ -276,7 +276,7 @@ class SceneGraphProcessor:
         # self.traversable_area_sub = rospy.Subscriber("/traversable_area_filtered", PointCloud2, self.test_callback, callback_args="traversable", queue_size=10) # Test
 
         # ROS I/O
-        self.is_real_world = rospy.get_param('~real_world', False)
+        self.is_real_world = rospy.get_param('/real_world', False)
         if self.is_real_world:
             self.is_compressed_image = True
             self.logger.loginfo(f"Hello Real World!!")

@@ -18,7 +18,7 @@ class PathRecorder:
         self.logger = Logger(
             quiet=quiet, prefix='PathRecorder', log_path="/ws/external/log/exploration/path_recorder.log")
         self.logger.log(f"Path Recorder")
-        self.is_real_world = rospy.get_param('~real_world', False)
+        self.is_real_world = rospy.get_param('/real_world', False)
         if self.is_real_world:
             self.logger.loginfo("Hello Real World!!")
             self.frame_id = "world"
