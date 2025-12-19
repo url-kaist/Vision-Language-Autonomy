@@ -34,11 +34,12 @@ if __name__ == "__main__":
     rospy.init_node('visual_grounding')
     node_name = rospy.get_name()
     node_name = node_name.strip('/')
-    logger_cfg = LoggerConfig(
-        quiet=False, prefix=f"ActiveGrounder{node_name.split('_')[-1]}",
-        log_path=os.path.join(LOG_DIR, f'{node_name}.log'),
-        no_intro=False
-    )
+    # logger_cfg = LoggerConfig(
+    #     quiet=False, prefix=f"ActiveGrounder{node_name.split('_')[-1]}",
+    #     log_path=os.path.join(LOG_DIR, f'{node_name}.log'),
+    #     no_intro=False
+    # )
+    logger_cfg = None
     ag = ActiveGrounder(node_name=node_name, logger_cfg=logger_cfg)
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
