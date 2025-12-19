@@ -3,5 +3,7 @@
   "image_topic": "/UGV4/camera/color/image_raw",
   "depth_topic": "/UGV4/camera/depth/image_rect_raw",
   "lidar_topic": "/cloud_registered_body",
-  "odom_topic": "/Odometry"
+  "odom_topic": "/Odometry",
+  "robot_height": 0.6,
+  "robot_height_margin": 0.1
 }

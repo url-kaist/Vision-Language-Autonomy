@@ -131,6 +131,11 @@ class SceneGraphProcessor:
             self.logger.loginfo(f"  {k} : {v}")
         self.logger.loginfo(f"=====================")
 
+        # robot height (body frame z 기준) 설정
+        # - body z ≈ -robot_height 근처 포인트는 로봇 바로 아래/바닥으로 간주해서 제거
+        self.robot_height = float(config.get("robot_height", 0.3))
+        self.robot_height_margin = float(config.get("robot_height_margin", 0.05))
+
         perception_debug_dir = "/ws/external/perception_debug"
         for file_path in glob.glob(os.path.join(perception_debug_dir, "*")):
             if os.path.isfile(file_path):
@@ -154,6 +159,9 @@ class SceneGraphProcessor:
         self.running = True
         self.map_inner_margin = 0.2 # (m)
 
+        # SAM 실행 주기 (트래킹된 object에 대해 N 프레임마다 수행)
+        self.sam_interval = int(config.get("sam_interval", 3))
+
         # data
         self.obj_classes = MATTERPORT_LABELS_160
         self.color_map = {i + 1: color for i, color in enumerate(MATTERPORT_COLOR_MAP_160.values())}
@@ -162,17 +170,21 @@ class SceneGraphProcessor:
         # perception
         # Optional config: /ws/external/ai_module/src/config.json
         # If keys are missing, fall back to defaults without raising KeyError.
-        self.model_size = "l"  # default: m / l / x
-        self.confidence = 0.3  # default YOLO confidence
+        self.model_size = "m"  # default: m / l / x
+        self.confidence = 0.5  # default YOLO confidence
+        self.sam_model_name = "sam_b.pt"
         try:
             with open("/ws/external/ai_module/src/config.json", "r") as f:
                 yolo_config = json.load(f)
             self.model_size = yolo_config.get("YOLO_MODEL_SIZE", self.model_size)
             self.confidence = yolo_config.get("YOLO_CONFIDENCE", self.confidence)
+            self.sam_model_name = yolo_config.get("SAM_MODEL_NAME", self.sam_model_name)
         except Exception as e:
-            self.logger.logwarn(f"[SceneGraph] config.json not found or invalid, "
-                                f"use defaults (size={self.model_size}, conf={self.confidence}). "
-                                f"detail={e}")
+            self.logger.logwarn(
+                f"[SceneGraph] config.json not found or invalid, "
+                f"use defaults (size={self.model_size}, conf={self.confidence}, sam={self.sam_model_name}). "
+                f"detail={e}"
+            )
         try:
             cfg = Config.fromfile("/ws/external/ai_module/src/sem/config/yolo-world_config_" + self.model_size + ".py")
             cfg.load_from = os.path.join(MODEL_WEIGHTS_DIR, f"yolo_weights/yolo-world_{self.model_size}.pth")
@@ -208,10 +220,30 @@ class SceneGraphProcessor:
 
         device = "cuda:0" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "cpu"
         self.logger.loginfo(f"******** Device: {device} **********")
+        # SAM 모델은 config.json의 SAM_MODEL_NAME으로 선택 (예: sam_b.pt, sam_l.pt)
+        sam_name = self.sam_model_name
         try:
-            self.sam_model = SAM(os.path.join(MODEL_WEIGHTS_DIR, "ultralytics/mobile_sam.pt")).to("cuda")
-        except:
-            self.sam_model = SAM("mobile_sam.pt").to(device)
+            sam_path = sam_name
+            if not os.path.isabs(sam_path):
+                # 우선 model_weights/ultralytics/ 아래를 확인
+                candidate = os.path.join(MODEL_WEIGHTS_DIR, "ultralytics", sam_name)
+                if os.path.exists(candidate):
+                    sam_path = candidate
+                else:
+                    # 다음으로 model_weights/ 바로 아래를 확인
+                    candidate2 = os.path.join(MODEL_WEIGHTS_DIR, sam_name)
+                    if os.path.exists(candidate2):
+                        sam_path = candidate2
+
+            self.logger.loginfo(f"[SceneGraph] Load SAM model: {sam_path}")
+            self.sam_model = SAM(sam_path).to(device)
+        except Exception as e:
+            self.logger.logerr(f"[SceneGraph] Failed to load SAM '{sam_name}': {e}. Fallback to mobile_sam.")
+            try:
+                fallback_path = os.path.join(MODEL_WEIGHTS_DIR, "ultralytics/mobile_sam.pt")
+                self.sam_model = SAM(fallback_path).to(device)
+            except Exception:
+                self.sam_model = SAM("mobile_sam.pt").to(device)
         self.sam_model.eval()
 
         # object mapping
@@ -338,7 +370,7 @@ class SceneGraphProcessor:
             if self.is_real_world:
                 print("ApproximateTimeSynchronizer with depth (real world, no lidar)")
                 self.sync_sub = ApproximateTimeSynchronizer(
-                    [self.rgb_sub, self.depth_sub], queue_size=10, slop=0.05
+                    [self.rgb_sub, self.depth_sub], queue_size=10, slop=0.01
                 )
             else:
                 print("ApproximateTimeSynchronizer with depth + lidar")
@@ -354,8 +386,13 @@ class SceneGraphProcessor:
 
 
         self.frame_id = "world" if self.is_real_world else "map"
-        # real_world 에서는 DBSCAN 반경을 줄여 좀 더 타이트하게 클러스터링
-        self.dbscan_eps = 0.2 if self.is_real_world else 0.1
+        # DBSCAN 파라미터
+        if self.use_depth_for_seg:
+            self.dbscan_eps = 0.03
+        elif self.is_real_world:
+            self.dbscan_eps = 0.5
+        else:
+            self.dbscan_eps = 0.2
         self.keyframe_dist = 0.5 if self.is_real_world else 3.0
 
         self.hash_map_pub = rospy.Publisher(
@@ -517,7 +554,7 @@ class SceneGraphProcessor:
                 t1, T1 = self.odom_queue[i + 1]
                 if t0 <= target_stamp <= t1:
                     ratio = float(target_stamp - t0) / float(t1 - t0)
-                    times = [0.0, 1.0]
+                    times = [0.0, 0.5]
                     rotations = Rotation.from_matrix([T0[:3, :3], T1[:3, :3]])
                     slerp = Slerp(times, rotations)
 
@@ -574,6 +611,8 @@ class SceneGraphProcessor:
 
         max_dets = 100
         confidence = 0.3
+        # 입력 해상도 다운샘플링 비율 (1.0보다 작으면 축소)
+        input_downscale = 0.5
         
         BOUNDING_BOX_ANNOTATOR = sv.BoundingBoxAnnotator(thickness=1)
         LABEL_ANNOTATOR = LabelAnnotator(text_padding=4,
@@ -592,7 +631,7 @@ class SceneGraphProcessor:
             stamp, rgb = rgb_queue.get()       # blocking
             if shared_cfg["is_ready"] == False:
                 continue
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
             t0 = time.time()
 
             classnames = shared_cfg["classnames"]
@@ -602,8 +641,16 @@ class SceneGraphProcessor:
                 yolo_model.reparameterize(classnames)
                 shared_cfg["is_add"] = False
 
+            # 입력 해상도 다운샘플링
+            rgb_in = rgb
+            if input_downscale is not None and input_downscale < 1.0:
+                h0, w0 = rgb.shape[:2]
+                new_w = max(1, int(w0 * input_downscale))
+                new_h = max(1, int(h0 * input_downscale))
+                rgb_in = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
             # inference
-            data_info = dict(img_id=0, img=rgb, texts=classnames)
+            data_info = dict(img_id=0, img=rgb_in, texts=classnames)
             data_info = test_pipeline(data_info)
             data_batch = dict(inputs=data_info['inputs'].unsqueeze(0),
                             data_samples=[data_info['data_samples']])
@@ -622,8 +669,12 @@ class SceneGraphProcessor:
                 indices = pred_instances.scores.float().topk(max_dets)[1]
                 pred_instances = pred_instances[indices]
 
-            # pred_instances = pred_instances.cpu().numpy()
             pred_instances = pred_instances.numpy()
+
+            # YOLO는 다운샘플된 해상도 기준으로 bbox를 출력하므로,
+            # 원본 이미지 크기에 맞게 다시 스케일 업
+            if input_downscale is not None and input_downscale < 1.0:
+                pred_instances["bboxes"] /= float(input_downscale)
 
             if 'masks' in pred_instances:
                 masks = pred_instances['masks']
@@ -652,11 +703,11 @@ class SceneGraphProcessor:
                 # cv2.waitKey(1)
                 cv2.imwrite(os.path.join(perception_debug_dir, f"yolo_{stamp}.jpg"), annotated_image)
 
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
             # infer_time = time.time() - t0
 
             # CUDA 텐서를 CPU로 옮겨야 피클 가능
-            print(f"yolo: {infer_time:.3f}")
+            # print(f"yolo: {infer_time:.3f}")
             # results = results.cpu()
             # print(f"yolo: {infer_time:.3f}")
 
@@ -672,6 +723,7 @@ class SceneGraphProcessor:
             (vec[:, 0] * 73856093) ^ (vec[:, 1] * 19349669) ^ (vec[:, 2] * 83492791)
         )
         return hash_key
+
 
     def merge_detections_every_n_iter(self, iter_num, n=10):   # todo
         if iter_num==0 or iter_num%n !=0:
@@ -1210,6 +1262,24 @@ class SceneGraphProcessor:
             bounding_boxes = boxes.xyxy
             labels = np.array(class_ids)
 
+            # SAM 실행 프레임 여부 (N 프레임마다 한 번)
+            run_sam_this_frame = (iter % self.sam_interval == 0)
+            if not run_sam_this_frame:
+                # YOLO 트래킹만 업데이트하고, 무거운 SAM/3D 파이프라인은 건너뜀
+                continue
+
+            # 트래킹된 객체( id >= 0 )만 SAM 대상
+            tracked_indices = [i for i, tid in enumerate(tracking_ids) if tid >= 0]
+            if not tracked_indices:
+                # 트래킹된 객체가 없으면 SAM/3D 작업 생략
+                continue
+
+            tracking_ids = [tracking_ids[i] for i in tracked_indices]
+            confs = [confs[i] for i in tracked_indices]
+            class_ids = [class_ids[i] for i in tracked_indices]
+            bounding_boxes = bounding_boxes[tracked_indices]
+            labels = np.array(class_ids)
+
             if self.is_real_world and (self.yolo_debug_img_pub is not None):
                 vis_now = rospy.Time.now()
                 if (vis_now - self.last_debug_pub_time).to_sec() > 1.0 / self.debug_publish_rate:
@@ -1240,22 +1310,29 @@ class SceneGraphProcessor:
             )
             masks = sam_results[0].masks.data
 
-            # SAM 마스크에 약간의 침식을 적용해서 경계를 더 보수적으로 만듦
+            # SAM 마스크 침식:
+            # - bbox가 어느 정도 이상 클 때만 적용해서
+            #   작은 객체는 과도하게 깎이지 않도록 함
             masks_np = []
             for i, box in enumerate(bounding_boxes):
                 mask_i = masks[i].cpu().numpy().astype(np.uint8)
-                # 박스 폭 기반으로 1D 커널 크기 결정
+                # 박스 크기 기반으로 2D 커널 크기 결정
                 try:
                     box_width = float(box[2] - box[0])
+                    box_height = float(box[3] - box[1])
                 except Exception:
                     box_width = mask_i.shape[1]
-                kernel_width = int(box_width / 5.0)
-                if kernel_width > 10:
-                    kernel = np.ones((1, kernel_width), np.uint8)
-                    eroded_mask = cv2.erode(mask_i, kernel, iterations=1)
-                    masks_np.append(eroded_mask)
+                    box_height = mask_i.shape[0]
+
+                min_side = min(box_width, box_height)
+                kernel_size = 3
+                kernel = np.ones((kernel_size, kernel_size), np.uint8)
+                # threshold 미만(너무 작은 bbox)은 erosion 없이 그대로 사용
+                if min_side < 20:
+                    eroded_mask = cv2.erode(mask_i, kernel, iterations=2)
                 else:
-                    masks_np.append(mask_i)
+                    eroded_mask = cv2.erode(mask_i, kernel, iterations=3)
+                masks_np.append(eroded_mask)
             masks_np = np.array(masks_np)
 
             sam_boxes = []
@@ -1289,9 +1366,11 @@ class SceneGraphProcessor:
                     pose["rotation"],
                     pose["position"],
                     image_src=image.copy(),
-                    depth_scale=0.001,  # RealSense 계열 depth: mm 단위 → m 로 변환
                     cam_to_body_R=self.cam_to_body_R,
                     cam_to_body_t=self.cam_to_body_t,
+                    depth_scale=0.001,  # RealSense 계열 depth: mm 단위 → m 로 변환
+                    robot_height=self.robot_height,
+                    height_margin=self.robot_height_margin,
                 )
             else:
                 # 기존 LiDAR 기반 경로 (fallback)
@@ -1492,10 +1571,12 @@ class SceneGraphProcessor:
 
                 cloud_tmp = obj_cloud.copy()
                 # print(f"self.dbscan_eps {self.dbscan_eps}")
-                # min_samples 를 3으로 올려 더 빡세게 잡음
-                obj_cloud = cluster_dbscan(obj_cloud, self.dbscan_eps, 3)
+                # DBSCAN으로 가장 큰 클러스터만 남기고,
+                # 포인트 수가 충분히 많지 않으면 노이즈로 간주
+                obj_cloud = cluster_dbscan(obj_cloud, self.dbscan_eps, 5)
                 
-                if obj_cloud.shape[0] < 3:
+                # 포인트 개수가 충분히 많지 않으면 object로 사용하지 않음
+                if obj_cloud.shape[0] <= 100:
                     filtered2_num += 1
                     self.missing_detections.append({
                         "id": tracking_id,
@@ -1840,7 +1921,8 @@ class SceneGraphProcessor:
         for key, pts in hash_items:
             for pt in pts:
                 x, y, z, tid, yolo_conf, size_conf = pt
-                if tid != -1:
+                # 트래킹 안 되는 객체(id < 0)는 시각화하지 않음
+                if int(tid) >= 0:
                     rgb = self.get_cached_color(int(tid))
                     points.append([x, y, z, rgb])
 
@@ -1900,6 +1982,9 @@ class SceneGraphProcessor:
     def create_object_markers(self):
         marker_array = MarkerArray()
         for i, (object_id, obj) in enumerate(self.objects.items()):
+            # 트래킹 안 되는 객체(id < 0)는 시각화하지 않음
+            if int(obj.get("id", -1)) < 0:
+                continue
             if "center" not in obj:
                 continue
             if obj["center"] is None:
@@ -2583,6 +2668,11 @@ class SceneGraphProcessor:
                     if instance_id is not None and instance_id in self.objects:
                         obj_info = self.objects[instance_id]
                         pts = obj_info.get("points", None)
+                        # points가 없거나 비어 있는 object는 scene_graph.json에 기록하지 않음
+                        if pts is None or (
+                            isinstance(pts, np.ndarray) and pts.size == 0
+                        ) or (not isinstance(pts, np.ndarray) and hasattr(pts, "__len__") and len(pts) == 0):
+                            continue
                         if isinstance(pts, np.ndarray):
                             pts = pts.tolist()
                         if "points" not in node_entry:
