@@ -196,81 +196,52 @@ class SceneGraph:
         self._lock = threading.Lock()
 
     def update(self, scene_graph, objects, **kwargs) -> None:
-        try:
-            # ROS version
-            for id, data in scene_graph.nodes.items():
-                break # TODO:
-                if 'place' in id:
-                    if not 'image_path' in data.keys():
-                        logging.warning(f"image_path is not in data: {data}")
-                    if not "id" in data:
-                        data['id'] = parse_id(id)
-                    self[parse_id(id)] = Place(data)
-        except:
-            # Python version
-            with self._lock:
-                for data in scene_graph.get('nodes', []):
-                    # try:
-                    #     if 'level' in data:
-                    #         level = str(data.pop('level')).lower()
-                    #     else:
-                    #         level = str(data.pop('type')).lower()  # TODO: 'type' -> 'level'
-                    # except:
-                    #     print("")
-                    #     continue
-                    level = data.pop('level')
+        # try:
+        #     # ROS version
+        #     for data in scene_graph.get('nodes', []):
+        #         level = data.pop('level')
+        #         id = data.pop('id')
+        #         if id < 0:
+        #             continue
+        #         NodeCls = _NODE_LEVEL_TO_CLS[level]
+        #         node = NodeCls(id=id, **data)
+        #         self.G.add_node(node.id, **node.__dict__)
+        #         print(f"Add node: {node}")
+        #
+        # except:
+        #     # Python version
+        with self._lock:
+            for data in scene_graph.get('nodes', []):
+                level = data.pop('level')
+                id = data.pop('id')
+                if id < 0:
+                    continue
 
-                    # # TODO: Remove
-                    # if level in str(NodeLevel.BUILDING).lower():   # Building
-                    #     level = NodeLevel.BUILDING
-                    # elif level in str(NodeLevel.PLACE).lower():    # Place
-                    #     level = NodeLevel.PLACE
-                    # elif level in str(NodeLevel.OBJECT).lower():   # Object
-                    #     level = NodeLevel.OBJECT
-                    # elif level in str(NodeLevel.KEYFRAME).lower(): # Keyframe
-                    #     level = NodeLevel.KEYFRAME
-                    # else:
-                    #     raise TypeError(f"Node level must be in ")
+                NodeCls = _NODE_LEVEL_TO_CLS[level]
+                node = NodeCls(id=id, **data)
+                self.G.add_node(node.id, **node.__dict__)
+                print(f"Add node: {node}")
 
-                    # # TODO: Remove
-                    # if 'id' in data:
-                    #     id = data.pop('id')
-                    # else:
-                    #     id = max((node_id for (lvl, node_id) in self.G.nodes if lvl == level), default=-1) + 1
-                    id = data.pop('id')
-                    if id < 0:
-                        continue
-                    # # TODO: Remove
-                    # if level == NodeLevel.OBJECT:
-                    #     if data.get('instance_id') < 0:
-                    #         print(f"Detection!!! {data}")
-                    #         continue
+            for data in scene_graph.get('edges', []):
+                source = (data['source']['level'], data['source']['id'])
+                target = (data['target']['level'], data['target']['id'])
 
-                    NodeCls = _NODE_LEVEL_TO_CLS[level]
-                    node = NodeCls(id=id, **data)
-                    self.G.add_node(node.id, **node.__dict__)
-                    print(f"Add node: {node}")
+                # TODO: Remove
+                if target[0] == str(NodeLevel.PLACE):
+                    target = (str(NodeLevel.KEYFRAME), target[1])
+                if source[0] == str(NodeLevel.PLACE):
+                    source = (str(NodeLevel.KEYFRAME), source[1])
+                if target[0] == str(NodeLevel.OBJECT) and target[1] < 0:
+                    continue
+                if source[0] == str(NodeLevel.OBJECT) and source[1] < 0:
+                    continue
+                if target[0] == source[0]:
+                    continue
 
-                for data in scene_graph.get('edges', []):
-                    source = (data['source']['level'], data['source']['id'])
-                    target = (data['target']['level'], data['target']['id'])
-
-                    # TODO: Remove
-                    if target[0] == str(NodeLevel.PLACE):
-                        target = (str(NodeLevel.KEYFRAME), target[1])
-                    if source[0] == str(NodeLevel.PLACE):
-                        source = (str(NodeLevel.KEYFRAME), source[1])
-                    if target[0] == str(NodeLevel.OBJECT) and target[1] < 0:
-                        continue
-                    if source[0] == str(NodeLevel.OBJECT) and source[1] < 0:
-                        continue
-                    if target[0] == source[0]:
-                        continue
-
-                    self.G.add_edge(source, target)
-                    self.G.add_edge(target, target)
-                    print(f"Add edge: {source} <-> {target}")
-            print(f"=> Graph: {self.G}")
+                self.G.add_edge(source, target)
+                self.G.add_edge(target, target)
+                print(f"Add edge: {source} <-> {target}")
+        print(f"=> Graph: {self.G}")
 
 
     def get_entity_names(self, names, *args, **kwargs) -> Entities:

@@ -8,16 +8,18 @@ def load_graph_from_shared_memory(shm_name = "scene_graph_shm"):
         shm = shared_memory.SharedMemory(shm_name)
         raw_data = bytes(shm.buf[:])
         graph_data = json.loads(raw_data.decode("utf-8"))
-        G = json_graph.node_link_graph(graph_data)
+        G = graph_data
+        # print(f"graph_data: {graph_data}")
+        # G = node_link_graph(graph_data, link='edges')
         # print(f"Loaded graph with {len(G.nodes)} nodes and {len(G.edges)} edges.")
 
         return G, shm
     
     except FileNotFoundError:
-        # print(f"[Error] Shared memory '{shm_name}' not found.")
+        print(f"[Error] Shared memory '{shm_name}' not found.")
         return None
     except Exception as e:
-        # print(f"[Error] Failed to load from shared memory: {e}")
+        print(f"[Error] Failed to load from shared memory: {e}")
         return None
     
     # finally:
@@ -27,6 +29,99 @@ def load_graph_from_shared_memory(shm_name = "scene_graph_shm"):
     #         print("Shared memory cleaned up.")
     #     except:
     #         pass
+
+from itertools import chain, count
+
+
+def _to_tuple(x):
+    """Converts lists to tuples, including nested lists.
+
+    All other non-list inputs are passed through unmodified. This function is
+    intended to be used to convert potentially nested lists from json files
+    into valid nodes.
+
+    Examples
+    --------
+    >>> _to_tuple([1, 2, [3, 4]])
+    (1, 2, (3, 4))
+    """
+    if not isinstance(x, (tuple, list)):
+        return x
+    return tuple(map(_to_tuple, x))
+def node_key(n: dict) -> str:
+    return f"{n['level']}:{n['id']}"   # 예: "NodeLevel.PLACE:0"
+
+def node_link_graph(
+    data,
+    directed=False,
+    multigraph=True,
+    attrs=None,
+    *,
+    source="source",
+    target="target",
+    name="id",
+    key="key",
+    link="links",
+):
+    if attrs is not None:
+        import warnings
+
+        msg = (
+            "\n\nThe `attrs` keyword argument of node_link_graph is deprecated\n"
+            "and will be removed in networkx 3.2. It is replaced with explicit\n"
+            "keyword arguments: `source`, `target`, `name`, `key` and `link`.\n"
+            "To make this warning go away, and ensure usage is forward\n"
+            "compatible, replace `attrs` with the keywords. "
+            "For example:\n\n"
+            "   >>> node_link_graph(data, attrs={'target': 'foo', 'name': 'bar'})\n\n"
+            "should instead be written as\n\n"
+            "   >>> node_link_graph(data, target='foo', name='bar')\n\n"
+            "in networkx 3.2.\n"
+            "The default values of the keywords will not change.\n"
+        )
+        warnings.warn(msg, DeprecationWarning, stacklevel=2)
+
+        source = attrs.get("source", "source")
+        target = attrs.get("target", "target")
+        name = attrs.get("name", "name")
+        key = attrs.get("key", "key")
+        link = attrs.get("link", "links")
+    # -------------------------------------------------- #
+    multigraph = data.get("multigraph", multigraph)
+    directed = data.get("directed", directed)
+    if multigraph:
+        graph = nx.MultiGraph()
+    else:
+        graph = nx.Graph()
+    if directed:
+        graph = graph.to_directed()
+
+    # Allow 'key' to be omitted from attrs if the graph is not a multigraph.
+    key = None if not multigraph else key
+    graph.graph = data.get("graph", {})
+    c = count()
+    for d in data["nodes"]:
+        node = _to_tuple(d.get(name, next(c)))
+        nodedata = {str(k): v for k, v in d.items() if k != name}
+        graph.add_node(node, **nodedata)
+    for d in data[link]:
+        src = tuple(d[source]) if isinstance(d[source], list) else d[source]
+        tgt = tuple(d[target]) if isinstance(d[target], list) else d[target]
+        src = node_key(src)
+        tgt = node_key(tgt)
+        if not multigraph:
+            edgedata = {str(k): v for k, v in d.items() if k != source and k != target}
+            graph.add_edge(src, tgt, **edgedata)
+        else:
+            ky = d.get(key, None)
+            edgedata = {
+                str(k): v
+                for k, v in d.items()
+                if k != source and k != target and k != key
+            }
+            graph.add_edge(src, tgt, ky, **edgedata)
+    return graph
+
 
         
 def load_object_data_from_shared_memory(shm_name="object_shm"):

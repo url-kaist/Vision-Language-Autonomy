@@ -41,7 +41,7 @@ def build_logger(logger=None, logger_cfg: Optional[LoggerConfig] = None):
 
 
 class Logger:
-    def __init__(self, quiet=False, prefix=None, log_path=None, no_intro=False):
+    def __init__(self, quiet=False, prefix=None, log_path="/ws/external/log/visual_grounding.log", no_intro=False):
         try:
             import rospy
             use_rospy = True
@@ -78,7 +78,7 @@ class Logger:
     def logrich(self, msg, **kwargs):
         self.log(msg, 'info', **kwargs)
 
-    def log(self, msg, level=None, force=False, **kwargs):
+    def log(self, msg, level=None, force=False, name="", **kwargs):
         assert level in [None, 'info', 'warn', 'error', 'debug', 'progress']
 
         if self.log_path:
@@ -88,7 +88,7 @@ class Logger:
 
         if (not self.quiet) or force:
             if self.prefix:
-                msg = f"[{self.prefix}] {msg}"
+                msg = f"[{self.prefix}//{name}] {msg}"
             if level in self.log_funcs:
                 log_fn = self.log_funcs[level]
                 if log_fn.__name__ == 'print':

@@ -132,8 +132,11 @@ class SceneGraphClients(BaseModel):
                 scene_graph, objects = self._get_scene_graph()
                 if (scene_graph is None) or (objects is None):
                     self.logger.logwarn(f"graph or objects is None")
-                    self.logger.logwarn(f"  > graph: {scene_graph}")
-                    self.logger.logwarn(f"  > objects: {objects}")
+                if scene_graph is not None:
+                    self.logger.logwarn(f"  > graph: {scene_graph.keys()}")
+                if objects is not None:
+                    self.logger.logwarn(f"  > objects: {objects.keys()}")
+                if (scene_graph is None) or (objects is None):
                     return
                 self.sg.update(scene_graph, objects)
                 self.logger.logrich(f"Scene Graph: {self.sg}", name="scene_graph")
