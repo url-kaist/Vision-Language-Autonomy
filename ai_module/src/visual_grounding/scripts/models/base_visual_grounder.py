@@ -1124,19 +1124,21 @@ class BaseVisualGrounder(BaseModel):
                 best_confidence = agg_results.get('best_confidence')
                 enough_observation = (self.exploration_status == 'no_frontier')
                 all_inference_done = (self.inference_queue.qsize() == 0) and (self.inference_signal_queue.qsize() == 0) # TODO: If inference becomes asynchronous, this logic must be updated.
+                enough_time_elapsed = (elapsed >= rospy.Duration(2 * 60))
+                has_any_result = (self.agg_results.best_answer is not None)
                 
                 # Determine if ready to answer
                 ## Option1: High confidence & Enough time elapsed
                 ## Option2: Enough observation & All inference is done & Has any result
                 ## Option3: Time is almost up
                 try:
-                    ready_to_answer = (((best_confidence > thres_high and elapsed >= rospy.Duration(5 * 60))
-                                        or (enough_observation and all_inference_done and self.agg_results.best_answer is not None))
+                    ready_to_answer = (((best_confidence > thres_high and enough_time_elapsed)
+                                        or (enough_observation and all_inference_done and has_any_result))
                                        or (remaining_time <= rospy.Duration(30)))  # (sec)
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
                 except:
                     ready_to_answer = (((best_confidence > thres_high and elapsed >= 5 * 60)
-                                        or (enough_observation and all_inference_done and self.agg_results.best_answer is not None))
+                                        or (enough_observation and all_inference_done and has_any_result))
                                        or (remaining_time <= 30))  # (sec)
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
 
@@ -1154,7 +1156,7 @@ class BaseVisualGrounder(BaseModel):
                 else:                    
                     if best_confidence <= thres_high:
                         self.log(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} <= {thres_high}.")
-                    elif elapsed < rospy.Duration(5 * 60):
+                    elif not enough_time_elapsed:
                         self.log(f"<inference_loop.3.2> Let's inference. Not enough time elapsed yet. {int(elapsed.to_sec())} sec passed.")
                     else:
                         self.log(f"<inference_loop.3.2> Let's inference.")
