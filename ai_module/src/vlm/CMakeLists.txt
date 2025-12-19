@@ -28,7 +28,7 @@ find_package(catkin REQUIRED COMPONENTS
 )
 include_directories(
     ${catkin_INCLUDE_DIRS}
-    /ws/external/ai_module/src
+    ${PROJECT_SOURCE_DIR}/..
 )
 
 ## System dependencies are found with CMake's conventions

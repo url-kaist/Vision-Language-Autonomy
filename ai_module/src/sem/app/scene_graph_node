@@ -160,15 +160,19 @@ class SceneGraphProcessor:
         
         
         # perception
+        # Optional config: /ws/external/ai_module/src/config.json
+        # If keys are missing, fall back to defaults without raising KeyError.
+        self.model_size = "l"  # default: m / l / x
+        self.confidence = 0.3  # default YOLO confidence
         try:
             with open("/ws/external/ai_module/src/config.json", "r") as f:
                 yolo_config = json.load(f)
-            self.model_size = yolo_config["YOLO_MODEL_SIZE"] ## m or l or x
-            self.confidence = yolo_config["YOLO_CONFIDENCE"]
+            self.model_size = yolo_config.get("YOLO_MODEL_SIZE", self.model_size)
+            self.confidence = yolo_config.get("YOLO_CONFIDENCE", self.confidence)
         except Exception as e:
-            self.logger.logerr(f"ERROR MSG: {e}")
-            self.model_size = "l" ## m or l or x
-            self.confidence = 0.3
+            self.logger.logwarn(f"[SceneGraph] config.json not found or invalid, "
+                                f"use defaults (size={self.model_size}, conf={self.confidence}). "
+                                f"detail={e}")
         try:
             cfg = Config.fromfile("/ws/external/ai_module/src/sem/config/yolo-world_config_" + self.model_size + ".py")
             cfg.load_from = os.path.join(MODEL_WEIGHTS_DIR, f"yolo_weights/yolo-world_{self.model_size}.pth")
@@ -231,6 +235,11 @@ class SceneGraphProcessor:
         self.place_positions = {}
         self.last_keyframe_id = 0
         self.last_keyframe_pose = None
+
+        # offline_map save control
+        self.offline_map_pose_threshold = 0.5   # [m]
+        self.offline_map_angle_threshold = 30.0 # [deg]
+        self.last_offline_map_pose = None
         
         self.last_current_keyframe_time = 0 # JAY
         self.current_keyframe_time_interval = 1.0 # JAY
@@ -329,7 +338,7 @@ class SceneGraphProcessor:
             if self.is_real_world:
                 print("ApproximateTimeSynchronizer with depth (real world, no lidar)")
                 self.sync_sub = ApproximateTimeSynchronizer(
-                    [self.rgb_sub, self.depth_sub], queue_size=20, slop=0.1
+                    [self.rgb_sub, self.depth_sub], queue_size=10, slop=0.05
                 )
             else:
                 print("ApproximateTimeSynchronizer with depth + lidar")
@@ -457,6 +466,7 @@ class SceneGraphProcessor:
 
         with self.lock:
             self.odom_queue.append((stamp, pose))
+            self.current_pose = pose
 
     def sync_callback(self, img_msg, *args):
         if not self.already_set_classes:
@@ -1357,7 +1367,7 @@ class SceneGraphProcessor:
                         cx_rgb = W_rgb / 2.0
                         cy_rgb = H_rgb / 2.0
 
-                    max_range = 10.0  # [m], 이 이상은 far
+                    max_range = 5.0  # [m], 이 이상은 far
 
                     for pts_body in pts_body_list:
                         if pts_body is None:
@@ -2405,6 +2415,34 @@ class SceneGraphProcessor:
             else:
                 return obj
 
+        # Pose-based throttling: save only if robot moved/rotated enough
+        current_pose = None
+        with self.lock:
+            if hasattr(self, "current_pose"):
+                current_pose = self.current_pose
+            elif self.odom_queue:
+                # Fallback: use the latest pose in the odom queue
+                current_pose = self.odom_queue[-1][1]
+
+            if (
+                current_pose is not None
+                and self.last_offline_map_pose is not None
+            ):
+                dist = get_distance_between_poses(
+                    current_pose, self.last_offline_map_pose
+                )
+                angle = get_angle_between_poses(
+                    current_pose, self.last_offline_map_pose
+                )
+                if (
+                    dist < self.offline_map_pose_threshold
+                    and angle < self.offline_map_angle_threshold
+                ):
+                    self.logger.loginfo(
+                        f"[offline_map] Skip save: moved {dist:.2f} m (th={self.offline_map_pose_threshold:.2f} m), rot {angle:.1f} deg (th={self.offline_map_angle_threshold:.1f} deg)"
+                    )
+                    return EmptyResponse()
+
         # base_dir = '/ws/external/vla_ws/CMU-VLA-Challenge/ai_module/offline_map' #'/ws/external/offline_map'
         base_dir = '/ws/external/offline_map' # TODO: handle this using .json config file
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2670,6 +2708,10 @@ class SceneGraphProcessor:
             shm.close()
             # shm.unlink()
             self.logger.log(f"Saved graph to shared memory '{shm_graph_name}' ({size} bytes)")
+
+            # Update last saved pose for offline_map throttling
+            if current_pose is not None:
+                self.last_offline_map_pose = current_pose
 
         self.logger.loginfo(f'Saved files: {obj_path}, {graph_path}')
         return EmptyResponse()
