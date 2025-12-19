@@ -28,7 +28,7 @@ find_package(catkin REQUIRED COMPONENTS
 )
 include_directories(
     ${catkin_INCLUDE_DIRS}
-    /ws/external/ai_module/src
+    ${PROJECT_SOURCE_DIR}/..
 )
 
 ## System dependencies are found with CMake's conventions
@@ -192,7 +192,7 @@ target_include_directories(manager PRIVATE
 #         ${PCL_LIBRARIES}
 # )
 # target_link_libraries(VLM ${catkin_LIBRARIES} scenegraph)
-target_link_libraries(manager ${catkin_LIBRARIES})
+target_link_libraries(manager ${catkin_LIBRARIES} utils_rrlogger)
 
 
 #############

@@ -19,3 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Source ROS
 RUN echo "source /opt/ros/noetic/setup.bash" >> ~/.bashrc
+
+# Rerun
+RUN python3 -m pip install --no-cache-dir "rerun-sdk<0.20"
+ENV PATH="/home/docker/.local/bin:${PATH}"

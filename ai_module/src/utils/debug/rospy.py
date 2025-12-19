@@ -9,6 +9,8 @@ from std_srvs.srv import Empty, EmptyResponse, Trigger, TriggerResponse
 _PARAM_LOCK = _threading.RLock()
 _PARAMS = {}
 
+def init_node(name):
+    print(name)
 
 def _resolve_param_name(name: str) -> str:
     # 최소 구현: 실제 ROS처럼 이름공간 해석은 생략하고 그대로 사용

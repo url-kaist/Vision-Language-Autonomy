@@ -56,6 +56,7 @@
   <build_depend>user_interface</build_depend>
   <build_depend>visual_grounding</build_depend>
   <build_depend>sem</build_depend>
+  <build_depend>utils</build_depend>
   <build_export_depend>roscpp</build_export_depend>
   <build_export_depend>sensor_msgs</build_export_depend>
   <build_export_depend>std_msgs</build_export_depend>
@@ -67,6 +68,7 @@
   <exec_depend>user_interface</exec_depend>
   <exec_depend>visual_grounding</exec_depend>
   <exec_depend>sem</exec_depend>
+  <exec_depend>utils</exec_depend>
 
 
   <!-- The export tag contains other, unspecified, tags -->

@@ -17,6 +17,8 @@ import random
 import time
 import threading
 import numpy as np
+if not hasattr(np, "int"):
+    np.int = int  # for older networkx that still refers to np.int
 from collections import deque
 import json
 import tf
@@ -35,7 +37,7 @@ from collections import defaultdict
 from multiprocessing import shared_memory
 
 import sys
-sys.path.append("/ws/external/ai_module/src/sem/mmyolo/")
+sys.path.append("/workspace/ai_module/src/sem/mmyolo/")
 from mmengine.config import Config, DictAction
 from mmengine.runner.amp import autocast
 from mmengine.dataset import Compose
@@ -70,9 +72,9 @@ from bg_process import BGProcessor
 from generate_seg_cloud import generate_seg_cloud, generate_sem_cloud, scan2pixels_jackal, generate_seg_comp_cloud_jackal
 
 import sys
-sys.path.append("/ws/external/")
-sys.path.append("/ws/external/ai_module/src/")
-sys.path.append("/ws/external/ai_module/src/sem/")
+sys.path.append("/workspace/")
+sys.path.append("/workspace/ai_module/src/")
+sys.path.append("/workspace/ai_module/src/sem/")
 from sem.srv import SetClasses, SetClassesResponse
 from std_srvs.srv import Trigger, TriggerResponse
 
@@ -80,7 +82,7 @@ import torch
 from ultralytics import SAM
 
 from ai_module.src.utils.logger import Logger
-MODEL_WEIGHTS_DIR = "/ws/external/ai_module/src/model_weights"
+MODEL_WEIGHTS_DIR = "/workspace/ai_module/src/model_weights"
 
 
 scene = "scene"
@@ -109,15 +111,15 @@ class SceneGraphProcessor:
     def __init__(self):
         quiet = rospy.get_param('~quiet', False)
         self.logger = Logger(
-            quiet=quiet, prefix='SceneGraph', log_path="/ws/external/log/scene_graph.log")
-        base_dir = '/ws/external/offline_map'  # TODO: handle this using .json config file
+            quiet=quiet, prefix='SceneGraph', log_path="/workspace/log/scene_graph.log")
+        base_dir = '/workspace/offline_map'  # TODO: handle this using .json config file
         if os.path.exists(base_dir) and os.path.isdir(base_dir):
             shutil.rmtree(base_dir)
         os.makedirs(base_dir, exist_ok=True)
 
         self.debug = rospy.get_param('~debug', False)
         # Load Configuration
-        config_path = rospy.get_param('~config', "/ws/external/ai_module/src/sem/config/simulation.json")
+        config_path = rospy.get_param('~config', "/workspace/ai_module/src/sem/config/simulation.json")
         with open(config_path, "r") as f:
             config = json.load(f)
         self.logger.loginfo(f"=== configuration ===")
@@ -125,7 +127,7 @@ class SceneGraphProcessor:
             self.logger.loginfo(f"  {k} : {v}")
         self.logger.loginfo(f"=====================")
 
-        perception_debug_dir = "/ws/external/perception_debug"
+        perception_debug_dir = "/workspace/perception_debug"
         for file_path in glob.glob(os.path.join(perception_debug_dir, "*")):
             if os.path.isfile(file_path):
                 os.remove(file_path)
@@ -134,7 +136,7 @@ class SceneGraphProcessor:
         os.makedirs(perception_debug_dir, exist_ok=True)
         self.perception_debug_dir = perception_debug_dir
 
-        image_save_dir = "/ws/external/keyframes"
+        image_save_dir = "/workspace/keyframes"
         for file_path in glob.glob(os.path.join(image_save_dir, "*")):
             if os.path.isfile(file_path):
                 os.remove(file_path)
@@ -158,7 +160,7 @@ class SceneGraphProcessor:
         self.model_size = "l" ## m or l or x
         self.confidence = 0.3
         try:
-            cfg = Config.fromfile("/ws/external/ai_module/src/sem/config/yolo-world_config_" + self.model_size + ".py")
+            cfg = Config.fromfile("/workspace/ai_module/src/sem/config/yolo-world_config_" + self.model_size + ".py")
             cfg.load_from = os.path.join(MODEL_WEIGHTS_DIR, f"yolo_weights/yolo-world_{self.model_size}.pth")
 
             # models
@@ -167,7 +169,7 @@ class SceneGraphProcessor:
             self.logger.logerr(f"ERROR MSG: {e}")
             # self.logger.logerr(f"Please download \"yolo_weights/yolo-world_{self.model_size}.pth\""
             #                    f"from `urserver.kaist.ac.kr/dataset/project_dataset/CMU-VLA-Challenge/_model_weights/` "
-            #                    f"and place it to `/ws/external/ai_module/src/model_weights/`.")
+            #                    f"and place it to `/workspace/ai_module/src/model_weights/`.")
         test_pipeline_cfg = get_test_pipeline_cfg(cfg=cfg)
         self.test_pipeline = Compose(test_pipeline_cfg)
         self.classnames = []
@@ -178,7 +180,7 @@ class SceneGraphProcessor:
         device = "cuda:0" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "cpu"
         self.logger.loginfo(f"******** Device: {device} **********")
         try:
-            self.sam_model = SAM("/ws/external/ai_module/src/model_weights/ultralytics/mobile_sam.pt").to(device)
+            self.sam_model = SAM("/workspace/ai_module/src/model_weights/ultralytics/mobile_sam.pt").to(device)
         except:
             self.sam_model = SAM("mobile_sam.pt").to(device)
         self.sam_model.eval()
@@ -1809,7 +1811,7 @@ class SceneGraphProcessor:
             mask_rgb[mask == 1] = [0, 0, 255]
             rgb = cv2.addWeighted(rgb, 1, mask_rgb, 0.5, 0)
 
-        cv2.imwrite("/ws/external/vis/masked_image.png", rgb)
+        cv2.imwrite("/workspace/vis/masked_image.png", rgb)
         
     def publish_hash_map(self):
         with self.lock:
@@ -2306,7 +2308,7 @@ class SceneGraphProcessor:
             else:
                 return obj
 
-        base_dir = '/ws/external/offline_map' # TODO: handle this using .json config file
+        base_dir = '/workspace/offline_map' # TODO: handle this using .json config file
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir = os.path.join(base_dir, timestamp)
         os.makedirs(save_dir, exist_ok=True)

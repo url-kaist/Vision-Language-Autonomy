@@ -131,7 +131,10 @@ class InferenceResultsPerEntity(InferenceResults):
     def update(self, answer, confidence, count, *args, **kwargs):
         ord_no = next(self._order_counter)
 
-        candidate_eids = answer.eids
+        if hasattr(answer, 'eids'):
+            candidate_eids = answer.eids
+        else:
+            candidate_eids = [e['id'][1] for e in answer]# answer.eids
         with self._lock:
             # others = [eid for eid in candidate_eids if str(eid) != str(answer)]
             # other_conf = (1.0 - confidence) / len(others) if others else 0.0

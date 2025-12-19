@@ -148,7 +148,7 @@ class SceneGraphClients(BaseModel):
             if dir:
                 dir = os.path.join(dir.split("/offline_map")[0], "keyframes")
             self.sg.update(scene_graph, objects, dir=dir)
-            self.logger.logrich(f"Scene Graph: {self.sg}", name="scene_graph")
+            # self.logger.logrich(f"Scene Graph: {self.sg}", name="scene_graph")
 
 
 if __name__ == "__main__":

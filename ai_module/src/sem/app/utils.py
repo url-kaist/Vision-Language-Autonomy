@@ -2,8 +2,6 @@ import numpy as np
 import sensor_msgs.point_cloud2 as pc2
 from sklearn.cluster import DBSCAN
 import open3d as o3d
-import std_msgs.msg
-import math
 import random
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial import KDTree

@@ -15,6 +15,8 @@ import random
 import time
 import threading
 import numpy as np
+if not hasattr(np, "int"):
+    np.int = int  # for older networkx that still refers to np.int
 from collections import deque
 import json
 import tf
@@ -49,7 +51,7 @@ from utils import (
 from bg_process import BGProcessor
 
 import sys
-sys.path.append("/ws/external/ai_module/src/")
+sys.path.append("/workspace/ai_module/src/")
 # from sem.srv import SetClasses, SetClassesResponse
 
 import torch
@@ -59,7 +61,7 @@ OBJECTS_TO_FOUND = ["sofa", "pillow"]
 
 class SceneGraphProcessor:
     def __init__(self):
-        self.image_save_dir = "/ws/external/keyframes"
+        self.image_save_dir = "/workspace/keyframes"
         if os.path.exists(self.image_save_dir) and os.path.isdir(self.image_save_dir):
             shutil.rmtree(self.image_save_dir)
         os.makedirs(self.image_save_dir, exist_ok=True)
@@ -280,7 +282,7 @@ class SceneGraphProcessor:
             else:
                 return obj
 
-        base_dir = '/ws/external/offline_map'
+        base_dir = '/workspace/offline_map'
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir = os.path.join(base_dir, timestamp)
         os.makedirs(save_dir, exist_ok=True)

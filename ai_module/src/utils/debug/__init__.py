@@ -660,6 +660,113 @@ else:
 
     cv_bridge.CvBridge = CvBridge
 
+    # --------------------------------------------------------
+    # builtin_interfaces.msg (Time)  [Clock가 의존]
+    # --------------------------------------------------------
+    builtin_interfaces_msg = _mk_mod("builtin_interfaces.msg")
+
+    class Time:
+        __slots__ = ("sec", "nanosec")
+        def __init__(self, sec=0, nanosec=0):
+            self.sec = int(sec)
+            self.nanosec = int(nanosec)
+
+    class Duration:
+        __slots__ = ("sec", "nanosec")
+        def __init__(self, sec=0, nanosec=0):
+            self.sec = int(sec)
+            self.nanosec = int(nanosec)
+
+    builtin_interfaces_msg.Time = Time
+    builtin_interfaces_msg.Duration = Duration
+    _install_stub("builtin_interfaces.msg", builtin_interfaces_msg)
+
+
+    # --------------------------------------------------------
+    # rosgraph_msgs.msg (Clock)
+    # --------------------------------------------------------
+    rosgraph_msgs_msg = _mk_mod("rosgraph_msgs.msg")
+
+    class Clock:
+        """
+        Minimal stub of rosgraph_msgs/Clock
+        Field:
+          - clock: builtin_interfaces/Time
+        """
+        __slots__ = ("clock",)
+        def __init__(self, clock=None):
+            # 실제 ROS에서는 builtin_interfaces.msg.Time 타입
+            self.clock = clock if clock is not None else builtin_interfaces_msg.Time()
+
+        def __repr__(self):
+            c = self.clock
+            return f"Clock(clock=Time(sec={getattr(c,'sec',0)}, nanosec={getattr(c,'nanosec',0)}))"
+
+    rosgraph_msgs_msg.Clock = Clock
+    _install_stub("rosgraph_msgs.msg", rosgraph_msgs_msg)
+
+
+    # --------------------------------------------------------
+    # rospy (minimal stub) - add ROSInterruptException
+    # --------------------------------------------------------
+    if not _try_import("rospy"):
+        rospy_mod = _mk_mod("rospy")
+
+        # Base rospy exceptions
+        class ROSException(Exception):
+            pass
+
+        class ROSInterruptException(KeyboardInterrupt):
+            """
+            rospy.ROSInterruptException is typically raised on shutdown / interrupt.
+            In rospy, it inherits from ROSException in some contexts, but for shim
+            purposes KeyboardInterrupt-like behavior is acceptable.
+            """
+            pass
+
+        # Some code uses rospy.exceptions.ROSInterruptException
+        rospy_exceptions_mod = _mk_mod("rospy.exceptions")
+        rospy_exceptions_mod.ROSException = ROSException
+        rospy_exceptions_mod.ROSInterruptException = ROSInterruptException
+
+        # Export on rospy
+        rospy_mod.ROSException = ROSException
+        rospy_mod.ROSInterruptException = ROSInterruptException
+        rospy_mod.exceptions = rospy_exceptions_mod
+
+        # Common no-op helpers often referenced
+        def is_shutdown():
+            return False
+
+        def signal_shutdown(reason=""):
+            # permissive: just store reason
+            rospy_mod._shutdown_reason = str(reason)
+
+        rospy_mod.is_shutdown = is_shutdown
+        rospy_mod.signal_shutdown = signal_shutdown
+
+        _install_stub("rospy", rospy_mod)
+        _install_stub("rospy.exceptions", rospy_exceptions_mod)
+
+    else:
+        # rospy exists but may be partial; patch missing attributes defensively
+        import rospy as rospy_mod  # type: ignore
+
+        if not hasattr(rospy_mod, "ROSInterruptException"):
+            class ROSInterruptException(KeyboardInterrupt):
+                pass
+            rospy_mod.ROSInterruptException = ROSInterruptException
+
+        if not hasattr(rospy_mod, "exceptions"):
+            rospy_exceptions_mod = _mk_mod("rospy.exceptions")
+            rospy_exceptions_mod.ROSInterruptException = rospy_mod.ROSInterruptException
+            rospy_mod.exceptions = rospy_exceptions_mod
+            _install_stub("rospy.exceptions", rospy_exceptions_mod)
+        else:
+            # ensure rospy.exceptions.ROSInterruptException exists
+            if not hasattr(rospy_mod.exceptions, "ROSInterruptException"):
+                rospy_mod.exceptions.ROSInterruptException = rospy_mod.ROSInterruptException
+
 # ------------------------------------------------------------
 # Done: after importing this module, your normal imports work:
 # from nav_msgs.msg import Path, Odometry, OccupancyGrid
