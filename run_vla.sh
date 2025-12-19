@@ -67,7 +67,8 @@ tmux send-keys -t "$P2" "bash -lc 'cd $WORKDIR && sleep ${DELAY} && ./launch.sh 
 # 질문 publish는 "입력만" 해두고, 사용자가 Enter 치게
 # tmux send-keys -t "$P3" "rostopic pub -1 /challenge_question std_msgs/String \"data: 'Find the pillow closest to the book on the stool.'\""
 
-tmux send-keys -t "$P3" "bash -lc 'cd $WORKDIR && rostopic pub -1 /challenge_question std_msgs/String \"data: '\''Find the pillow closest to the book on the stool.'\''\"'"
+tmux send-keys -t "$P3" \
+  "rostopic pub -1 /challenge_question std_msgs/String \"data: \\\"Find the chair with a blue seat.\\\"\""
 
 
 # 레이아웃 정리
