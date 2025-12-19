@@ -267,6 +267,8 @@ def _generate_seg_comp_cloud_from_depth(
     cam_to_body_R: Optional[np.ndarray] = None,
     cam_to_body_t: Optional[np.ndarray] = None,
     depth_scale: float = 1.0,
+    robot_height: Optional[float] = None,
+    height_margin: float = 0.05,
 ):
     """
     depth 기반으로 mask별 포인트 클라우드 생성.
@@ -390,6 +392,19 @@ def _generate_seg_comp_cloud_from_depth(
         ys_rgb_f = ys_rgb_f[valid_depth]
         d = d[valid_depth].astype(np.float32)
 
+        # --- Per-pixel occlusion: 같은 (u,v) 픽셀에 대해
+        #     가장 가까운 depth만 사용 (한 프레임 내 occlusion 처리)
+        uv = np.stack([xs_rgb_f, ys_rgb_f], axis=1)  # (N, 2) [x, y]
+        key = uv[:, 1] * W + uv[:, 0]               # 고유 픽셀 인덱스
+        sort_idx = np.argsort(d)                    # depth 작은 순서
+        key_sorted = key[sort_idx]
+        _, unique_indices = np.unique(key_sorted, return_index=True)
+        best_indices = sort_idx[unique_indices]
+
+        xs_rgb_f = xs_rgb_f[best_indices]
+        ys_rgb_f = ys_rgb_f[best_indices]
+        d = d[best_indices]
+
         # --- RGB 카메라 좌표계로 back-projection ---
         X = (xs_rgb_f - cx_rgb) * d / fx_rgb
         Y = (ys_rgb_f - cy_rgb) * d / fy_rgb
@@ -399,6 +414,20 @@ def _generate_seg_comp_cloud_from_depth(
         # camera → body → world
         pts_body = pts_cam @ cam_to_body_R.T + cam_to_body_t
         pts_world = pts_body @ R_b2w.T + t_b2w
+
+        # 로봇 높이 기반 필터링:
+        # body 좌표계에서 z ≈ -robot_height 인 포인트는
+        # 로봇 바로 아래/바닥 근처로 보고 제거
+        if robot_height is not None and robot_height > 0.0:
+            z_body = pts_body[:, 2]
+            keep = np.abs(z_body + float(robot_height)) > float(height_margin)
+            if not np.any(keep):
+                continue
+            pts_body = pts_body[keep]
+            pts_world = pts_world[keep]
+            xs_rgb_f = xs_rgb_f[keep]
+            ys_rgb_f = ys_rgb_f[keep]
+            d = d[keep]
 
         obj_cloud_world_list.append(pts_world.astype(np.float32))
         pts_body_list.append(pts_body.astype(np.float32))
