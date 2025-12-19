@@ -610,8 +610,6 @@ class SceneGraphProcessor:
         """별도 프로세스에서 YOLO 추론만 담당"""
 
         max_dets = 100
-        confidence = 0.3
-        # 입력 해상도 다운샘플링 비율 (1.0보다 작으면 축소)
         input_downscale = 0.5
         
         BOUNDING_BOX_ANNOTATOR = sv.BoundingBoxAnnotator(thickness=1)
@@ -728,7 +726,7 @@ class SceneGraphProcessor:
     def merge_detections_every_n_iter(self, iter_num, n=10):   # todo
         if iter_num==0 or iter_num%n !=0:
             return
-        print("merge_detections_every_n_iter", n)
+        # print("merge_detections_every_n_iter", n)
 
         updated_detections = {}
         used_ids = set()
@@ -854,7 +852,7 @@ class SceneGraphProcessor:
                     affected_pts[old_id].append(f"{old_point[0]}_{old_point[1]}_{old_point[2]}")
                     continue
             self.map_hash[key] = [new_point]
-        print(f"override_points: affected_ids: {affected_ids} pts: {len(points)}")
+        # print(f"override_points: affected_ids: {affected_ids} pts: {len(points)}")
 
         # 2. affected id의 points 재계산
         for affected_id in affected_ids:
@@ -927,7 +925,7 @@ class SceneGraphProcessor:
         dist = get_distance_between_poses(cur_pose, prev_pose)
         # angle = get_angle_between_poses(cur_pose, prev_pose)
 
-        self.logger.log(f"[KEYFRAME] Distance from last keyframe: {dist:.2f} m (threshold: {keyframe_dist} m)")
+        # self.logger.log(f"[KEYFRAME] Distance from last keyframe: {dist:.2f} m (threshold: {keyframe_dist} m)")
         return dist > keyframe_dist #  or angle > keyframe_deg
     def pose_changed_enough(self, cur_pose, prev_pose, keyframe_dist=0.1, keyframe_deg=0.1):
         if self.last_keyframe_pose is None:
@@ -935,7 +933,7 @@ class SceneGraphProcessor:
         dist = get_distance_between_poses(cur_pose, prev_pose)
         angle = get_angle_between_poses(cur_pose, prev_pose)
 
-        self.logger.log(f"[KEYFRAME] Distance from last keyframe: {dist:.2f} m (threshold: {keyframe_dist} m)")
+        # self.logger.log(f"[KEYFRAME] Distance from last keyframe: {dist:.2f} m (threshold: {keyframe_dist} m)")
         return dist > keyframe_dist  or angle > keyframe_deg
 
     def nearby_keyframes_exist(self, position, threshold=0.1):
@@ -975,7 +973,7 @@ class SceneGraphProcessor:
                                position=position)
         if image is not None:
             cv2.imwrite(self.image_path.format(cur_place_node), image)
-            self.logger.log(f"Saved keyframe image: {self.image_path.format(cur_place_node)}")
+            # self.logger.log(f"Saved keyframe image: {self.image_path.format(cur_place_node)}")
         self.sg_graph.add_node(cur_place_node,
                                type="place",
                                position=place_center,
@@ -1048,7 +1046,7 @@ class SceneGraphProcessor:
         # Save image if provided
         if image is not None:
             cv2.imwrite(self.image_path.format(cur_place_node), image)
-            self.logger.log(f"Saved keyframe image: {self.image_path.format(cur_place_node)}")
+            # self.logger.log(f"Saved keyframe image: {self.image_path.format(cur_place_node)}")
 
 
     def add_object_nodes_for_place_node(self, keyframe_id, detections, missing_detections):
@@ -1199,7 +1197,7 @@ class SceneGraphProcessor:
                 rospy.sleep(0.01)
                 continue
 
-            self.logger.log(f"\n--- Iteration {iter} ---")
+            # self.logger.log(f"\n--- Iteration {iter} ---")
             self.merge_detections_every_n_iter(iter, 5)
             iter += 1
             stamp, boxes = self.get_latest_blocking(self.yolo_queue)
@@ -1510,7 +1508,7 @@ class SceneGraphProcessor:
                     msg.header.frame_id = "camera"
                     self.yolo_debug_img_pub.publish(msg)
                     self.last_debug_pub_time = vis_now
-                    self.logger.loginfo("publish depth_seg_reproj_debug")
+                    # self.logger.loginfo("publish depth_seg_reproj_debug")
             
             for i, tracking_id in enumerate(tracking_ids):
                 if tracking_id == -1:
@@ -1805,7 +1803,7 @@ class SceneGraphProcessor:
             if self.keyframe_counter == 0 \
                     or (self.pose_changed_enough(cur_pose, self.last_keyframe_pose)):
                 
-                self.logger.log("======= Pose Change Enough =======")
+                # self.logger.log("======= Pose Change Enough =======")
                 self.prev_objects = len(self.objects)
                 # self.new_detection_signal = False
 
@@ -1836,7 +1834,7 @@ class SceneGraphProcessor:
             t6 = time.time()
 
             # self.logger.log(f"graph: {t21 - t1:.3f}, {t2 - t21:.3f}, model: {t3 - t2:.3f}, proj: {t4 - t3:.3f}, merge: {t5 - t4:.3f}, pub: {t6 - t5:.3f}, total: {t6 - t1:.3f} sec")
-            self.logger.log(f"time: {t6 - t1:3f} s")
+            # self.logger.log(f"time: {t6 - t1:3f} s")
 
             # torch cuda empty
             torch.cuda.empty_cache()
@@ -1880,7 +1878,7 @@ class SceneGraphProcessor:
                         cv2.LINE_AA)
         os.makedirs("/ws/external/vis", exist_ok=True)
         cv2.imwrite(f"/ws/external/vis/bbox_by_kf_{kf_id}.jpg", image)
-        print(f"Saved bbox_by_kf_{kf_id}.jpg")
+        # print(f"Saved bbox_by_kf_{kf_id}.jpg")
 
     def show_yolosam_image(self, rgb, boxes, masks, tracking_ids):
         for  i, box in enumerate(boxes):
@@ -2500,8 +2498,11 @@ class SceneGraphProcessor:
             else:
                 return obj
 
-        # Pose-based throttling: save only if robot moved/rotated enough
+        # Pose-based throttling for **disk** offline_map 저장만 제어.
+        # SceneGraphClients는 shared memory를 항상 기대하므로,
+        # SHM 쓰기는 항상 수행하고, 디스크 저장만 threshold로 스킵한다.
         current_pose = None
+        save_to_disk = True
         with self.lock:
             if hasattr(self, "current_pose"):
                 current_pose = self.current_pose
@@ -2523,20 +2524,25 @@ class SceneGraphProcessor:
                     dist < self.offline_map_pose_threshold
                     and angle < self.offline_map_angle_threshold
                 ):
+                    save_to_disk = False
                     self.logger.loginfo(
-                        f"[offline_map] Skip save: moved {dist:.2f} m (th={self.offline_map_pose_threshold:.2f} m), rot {angle:.1f} deg (th={self.offline_map_angle_threshold:.1f} deg)"
+                        f"[offline_map] Skip disk save: moved {dist:.2f} m (th={self.offline_map_pose_threshold:.2f} m), rot {angle:.1f} deg (th={self.offline_map_angle_threshold:.1f} deg)"
                     )
-                    return EmptyResponse()
 
         # base_dir = '/ws/external/vla_ws/CMU-VLA-Challenge/ai_module/offline_map' #'/ws/external/offline_map'
         base_dir = '/ws/external/offline_map' # TODO: handle this using .json config file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = os.path.join(base_dir, timestamp)
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir = None
+        if save_to_disk:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_dir = os.path.join(base_dir, timestamp)
+            os.makedirs(save_dir, exist_ok=True)
         with self.lock:
-            # pcd_path = os.path.join(save_dir, 'hash_pointcloud.pcd')
-            obj_path = os.path.join(save_dir, 'objects.json')
-            graph_path = os.path.join(save_dir, 'scene_graph.json')
+            obj_path = None
+            graph_path = None
+            if save_dir is not None:
+                # pcd_path = os.path.join(save_dir, 'hash_pointcloud.pcd')
+                obj_path = os.path.join(save_dir, 'objects.json')
+                graph_path = os.path.join(save_dir, 'scene_graph.json')
 
             # Save point cloud data
             # pts_list = []
@@ -2587,8 +2593,9 @@ class SceneGraphProcessor:
                 }
             # Convert numpy types and save the objects JSON
             json_objects = convert_numpy_types(serializable_objects)
-            with open(obj_path, 'w') as f:
-                json.dump(json_objects, f, indent=2)
+            if obj_path is not None:
+                with open(obj_path, 'w') as f:
+                    json.dump(json_objects, f, indent=2)
 
             shm_obj_name = "object_shm"
             json_str = json.dumps(json_objects)
@@ -2778,8 +2785,9 @@ class SceneGraphProcessor:
 
             # Convert numpy types and save the graph JSON
             json_graph = convert_numpy_types(graph_data)
-            with open(graph_path, 'w') as f:
-                json.dump(json_graph, f, indent=2)
+            if graph_path is not None:
+                with open(graph_path, 'w') as f:
+                    json.dump(json_graph, f, indent=2)
 
             shm_graph_name = "scene_graph_shm"
             json_str = json.dumps(json_graph)
@@ -2799,11 +2807,14 @@ class SceneGraphProcessor:
             # shm.unlink()
             self.logger.log(f"Saved graph to shared memory '{shm_graph_name}' ({size} bytes)")
 
-            # Update last saved pose for offline_map throttling
-            if current_pose is not None:
+            # Update last saved pose for offline_map throttling (디스크 저장한 경우만)
+            if save_to_disk and current_pose is not None:
                 self.last_offline_map_pose = current_pose
 
-        self.logger.loginfo(f'Saved files: {obj_path}, {graph_path}')
+        if save_to_disk and obj_path is not None and graph_path is not None:
+            self.logger.loginfo(f'Saved files: {obj_path}, {graph_path}')
+        else:
+            self.logger.loginfo('[offline_map] Only shared memory updated (disk save skipped).')
         return EmptyResponse()
 
     def save_graph_to_shared_memory(self, graph: nx.Graph, shm_name="scene_graph_shm"):
