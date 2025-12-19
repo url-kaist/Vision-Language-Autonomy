@@ -93,6 +93,7 @@ class RRLogger:
             rr.init(name, spawn=False)
 
             prefix_sg = "SG"
+            log_root = "VG/"
             blueprint = rrb.Blueprint(
                 rrb.Horizontal(
                     # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
@@ -111,7 +112,43 @@ class RRLogger:
                         ),
                         rrb.SelectionPanel(),
                     ),
-                )
+                ),
+                
+                # rrb.TextLogView(
+                # name="Logs",
+                # origin="/",
+                # contents=[f"{log_root}/**"],
+                # ),
+                
+                rrb.Vertical(
+                    rrb.Horizontal(
+                        rrb.TextLogView(
+                            name="VG/default",
+                            origin="/",
+                            contents=[f"{log_root}/default/**"],
+                        ),
+                        rrb.TextLogView(
+                            name="VG/main",
+                            origin="/",
+                            contents=[f"{log_root}/main/**"],
+                        ),
+                        column_shares=[1, 1],
+                    ),
+                    rrb.Horizontal(
+                        rrb.TextLogView(
+                            name="VG/inference",
+                            origin="/",
+                            contents=[f"{log_root}/inference/**"],
+                        ),
+                        rrb.TextLogView(
+                            name="VG/nav",
+                            origin="/",
+                            contents=[f"{log_root}/nav/**"],
+                        ),
+                        column_shares=[1, 1],
+                    ),
+                    row_shares=[1, 1],
+                ),
             )
             rr.send_blueprint(blueprint, make_active=True)
             rr.connect("127.0.0.1:9876")
