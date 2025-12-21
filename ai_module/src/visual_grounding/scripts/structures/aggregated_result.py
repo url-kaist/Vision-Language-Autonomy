@@ -2,7 +2,7 @@ import itertools
 import math
 import threading
 from typing import List, Any, Tuple, Union, Dict
-
+from ai_module.src.visual_grounding.scripts.structures.answer import Answer
 
 # -------------------- helpers --------------------
 def _sigmoid(x: float) -> float:
@@ -162,15 +162,55 @@ class InferenceResultsPerEntity(InferenceResults):
         for eid in eids:
             self.num_queries[eid] = self.num_queries.get(eid, 0) + 1
 
+class InferenceResultsPerEntityCount(InferenceResults):
+    _order_counter = itertools.count()
+
+    def __init__(self, id=0, *args, **kwargs):
+        super().__init__(id=id, *args, **kwargs)
+        self.num_queries = {}
+
+    def update(self, answer, confidence, count, *args, **kwargs):
+        ord_no = next(self._order_counter)
+
+        if hasattr(answer, 'eids'):
+            candidate_eids = answer.eids
+        else:
+            candidate_eids = [e['id'][1] for e in answer]# answer.eids
+        with self._lock:
+            for eid in candidate_eids:
+                if str(eid) != str(answer):
+                    continue
+                conf = confidence
+
+                if eid not in self.results:
+                    combined = self._combine(self.prior, conf)
+                    self.results[eid] = {
+                        "confidence": _clip01(combined),
+                        "count": count,
+                        "order": ord_no,
+                    }
+                else:
+                    prev = self.results[eid]
+                    prev["confidence"] = _clip01(self._combine(prev["confidence"], conf))
+                    prev["count"] += count
+                    prev["order"] = ord_no
+        # self._prune()
+
+    # ---------- 업데이트 ----------
+    def inc_queries(self, eids: Union[List[int], Tuple[int]] = []) -> None:
+        for eid in eids:
+            self.num_queries[eid] = self.num_queries.get(eid, 0) + 1
 
 class AggregatedResult:
-    def __init__(self, min_query=5, inference_cfg=None, action=None, *args, **kwargs):
+    def __init__(self, min_query=5, inference_cfg=None, action=None, etype=None, *args, **kwargs):
         self.min_query = min_query
         self.inference_cfg = inference_cfg or {}
         self.action = action
+        self.etype = etype
 
         self.results: Dict[int, InferenceResults] = {}
         self.results_by_entity = InferenceResultsPerEntity(**inference_cfg)
+        self.results_by_entity_count = InferenceResultsPerEntityCount(**inference_cfg)
 
         self._scheduled: Dict[int, int] = {}
         self._scheduled_by_entity: Dict[int, int] = {}
@@ -187,14 +227,34 @@ class AggregatedResult:
             ]
             return f"AggResults(#={n}) (conf/count/order):\n" + "\n".join(lines)
         elif self.action == 'count':
-            n = len(self.results)
-            if n == 0:
-                return "AggResults(#=0)"
-            lines = [
-                f"  > GID[{gid}]: BestAns={r.best_answer} ({r.best_confidence:.2f})"
-                for gid, r in sorted(self.results.items(), key=lambda x: x[0])
-            ]
-            return f"AggResults(#={n}) BestAnswer (conf/count):\n" + "\n".join(lines)
+            if self.etype == 'object':
+                ready = self._all_entities_ready()
+                th = self._count_object_threshold()
+                selected = self._selected_object_eids()
+                n = len(self.results_by_entity_count.results)
+
+                lines = [
+                    f"  > EID[{eid}] q={self.results_by_entity_count.num_queries.get(eid,0)}/{self.min_query} "
+                    f"conf={d.get('confidence',0.0):.2f} cnt={d.get('count',0)} ord={d.get('order',0)}"
+                    for eid, d in sorted(self.results_by_entity_count.results.items(), key=lambda x: x[0])
+                ]
+
+                head = (
+                    f"AggResults(#={n}) ready={ready} th={th} "
+                    f"predicted_count={len(selected)} (#eids={n})"
+                )
+                head += f" selected={selected}"
+
+                return head + ("\n" + "\n".join(lines) if lines else "")
+            else:
+                n = len(self.results)
+                if n == 0:
+                    return "AggResults(#=0)"
+                lines = [
+                    f"  > GID[{gid}]: BestAns={r.best_answer} ({r.best_confidence:.2f})"
+                    for gid, r in sorted(self.results.items(), key=lambda x: x[0])
+                ]
+                return f"AggResults(#={n}) BestAnswer (conf/count):\n" + "\n".join(lines)
         else:
             raise NotImplementedError(f"self.action must be in ['find', 'count'], but {self.action} was given.")
 
@@ -243,6 +303,7 @@ class AggregatedResult:
                 self.generate(gid, answer.eids)
             self.results[gid].update(answer, confidence, count, *args, **kwargs)
             self.results_by_entity.update(answer, confidence, count, *args, **kwargs)
+            self.results_by_entity_count.update(answer, confidence, count, *args, **kwargs)
 
     # ---------- 예약/완료 ----------
     def schedule(self, gid: int, n: int = 1, data=None) -> None:
@@ -266,6 +327,7 @@ class AggregatedResult:
         with self._lock:
             self.results[gid].inc_queries(n)
             self.results_by_entity.inc_queries(eids=eids)
+            self.results_by_entity_count.inc_queries(eids=eids)
 
     # ---------- 조회 ----------
     @property
@@ -276,7 +338,10 @@ class AggregatedResult:
             if self.action == 'find':
                 return self.results_by_entity.best_confidence
             elif self.action == 'count':
-                return max([d.best_confidence for d in self.results.values()])
+                if self.etype == 'object':
+                    return 1.0 if self._all_entities_ready() else 0.0
+                else:
+                    return max([d.best_confidence for d in self.results.values()])
             else:
                 raise NotImplementedError(f"self.action must be in ['find', 'count'], but {self.action} was given.")
 
@@ -286,7 +351,10 @@ class AggregatedResult:
             if self.action == 'find':
                 results = self.results_by_entity.results
             elif self.action == 'count':
-                results = self.results
+                if self.etype == 'object':
+                    return Answer(count=len(self._selected_object_eids()))
+                else:
+                    results = self.results
             else:
                 raise NotImplementedError(f"self.action must be in ['find', 'count'], but {self.action} was given.")
         if not results:
@@ -318,3 +386,19 @@ class AggregatedResult:
                 "best_answer": self.best_answer,
                 "best_confidence": self.best_confidence,
             }
+
+    # ---------- count object ----------
+    def _all_entities_ready(self) -> bool:
+        eids = list(self.results_by_entity_count.results.keys())
+        if not eids:
+            return False
+        return all(self.results_by_entity_count.num_queries.get(eid, 0) >= self.min_query for eid in eids)
+    
+    def _count_object_threshold(self) -> float:
+        return float(self.inference_cfg.get("count_obj_thres", 0.5))
+
+    def _selected_object_eids(self) -> List[int]:
+        th = self._count_object_threshold()
+        items = self.results_by_entity_count.results  # eid -> {confidence,count,order}
+        selected = [eid for eid, d in items.items() if d.get("confidence", 0.0) >= th]
+        return selected
