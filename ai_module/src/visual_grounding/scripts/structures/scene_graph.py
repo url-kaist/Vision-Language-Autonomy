@@ -350,13 +350,66 @@ class SceneGraph:
 
         image_height, image_width, _ = kf_attrs['image'].shape
         xs, ys = self.project_pts(pts_world, pose, image_size=(image_height, image_width))
-
+        
+        if xs is None or ys is None or len(xs) == 0 or len(ys) == 0:
+            return None
+        
         u_min, v_min, u_max, v_max = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
         return (u_min, v_min, u_max, v_max)
 
+    def render_object_minimal(
+        self,
+        scope: Literal["all", "candidate", "related"] = "related",
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Return JSON-able dict:
+        { "<eid>": {"level": <str>, "id": <int>, "name": <str|None>, "centroid": <list|None>} }
+        Only OBJECT nodes are included.
+        """
 
+        def _passes_scope(obj_attrs: dict) -> bool:
+            n = obj_attrs.get("name", None)
+            cn = obj_attrs.get("class_name", None)
+
+            if scope == "all":
+                return True
+            if scope == "candidate":
+                return (n in self.candidate_names) or (cn in self.candidate_names)
+            if scope == "related":
+                return (n in self.related_names) or (cn in self.related_names)
+            raise ValueError(f"Unknown scope: {scope}")
+
+        out: Dict[str, Dict[str, Any]] = {}
+
+        with self._lock:
+            for (level, eid), data in self.G.nodes(data=True):
+                # only object nodes
+                if level != str(NodeLevel.OBJECT):
+                    continue
+
+                attrs = data.get("_attrs", {}) or {}
+                if not _passes_scope(attrs):
+                    continue
+
+                name = attrs.get("name", None)
+                centroid = attrs.get("centroid", None)
+
+                # ensure JSON-serializable
+                if hasattr(centroid, "tolist"):
+                    centroid = centroid.tolist()
+
+                out[str(int(eid))] = {
+                    "level": level,          # e.g. "NodeLevel. OBJECT"
+                    "id": int(eid),          # e.g. 17
+                    "name": name,            # e.g. "chair"
+                    "centroid": centroid,    # e.g. [x,y,z]
+                }
+
+        return out
+        
+        
 if __name__ == "__main__":
-    DATA_DIR = "/ws/external/test_data/offline_map"
+    DATA_DIR = "/ws/external/offline_map"
     dirs = [os.path.join(DATA_DIR, d) for d in os.listdir(DATA_DIR)
             if os.path.isdir(os.path.join(DATA_DIR, d))]
     dir_sorted = sorted(dirs, key=os.path.getmtime)
@@ -365,7 +418,7 @@ if __name__ == "__main__":
         'candidate': {'show': True, 'color': 'blue'},
     }
 
-    sg = SceneGraph(candidate_names='pillow', reference_names=['sofa'])
+    sg = SceneGraph(candidate_names=['fire extinguisher'], reference_names=['TV'])
     for dir in dir_sorted:
         with open(os.path.join(dir, 'scene_graph.json'), 'r', encoding='utf-8') as f:
             scene_graph = json.load(f)
@@ -373,8 +426,98 @@ if __name__ == "__main__":
             objects = json.load(f)
         sg.update(scene_graph, objects)
 
-        for kf_id, kf in sg.keyframes.items():
-            kf.annotate(styles, node_name='test', suffix='_annotated_global')
+        # for kf_id, kf in sg.keyframes.items():
+        #     kf.annotate(styles, node_name='test', suffix='_annotated_global')
+        from ai_module.src.utils.visualizer import Visualizer
+
+        visualizer = Visualizer()
+
+        for etype in ['object']:
+            for (level, id), kf in sg.G.nodes(data=True):
+                if level == str(NodeLevel.KEYFRAME):
+                    attrs = kf.get('_attrs', {})
+
+                    image = attrs['image'].copy()
+                    H, W = image.shape[:2]
+                    fname = attrs['fname']
+                    detections = attrs['detections']
+                    if etype == 'detection':
+                        for det in detections:
+                            is_object = det['id'] > 0
+                            if not is_object:
+                                continue
+
+                            is_candidate = (det['name'] in sg.candidate_names)
+                            is_reference = (det['name'] in sg.reference_names)
+                            if is_candidate:
+                                style = styles.get('candidate', {'show': False})
+                                if not style['show']:
+                                    continue
+                                color = style.get('color', 'green')
+                            elif is_reference:
+                                style = styles.get('reference', {'show': False})
+                                if not style['show']:
+                                    continue
+                                color = style.get('color', 'blue')
+                            else:
+                                continue
+
+                            bbox = det['bbox']
+                            color = visualizer._parse_color(color)
+                            u_min, v_min, u_max, v_max = bbox
+                            u_min, v_min, u_max, v_max = int(u_min), int(v_min), int(u_max), int(v_max)
+                            top_left, bottom_right = (u_min, v_min), (u_max, v_max)
+
+                            cv2.rectangle(image, top_left, bottom_right, color=color, thickness=2)
+                            cv2.putText(
+                                image, f"{det['id']}", (u_min, v_min - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+                            )
+                    elif etype == 'object':
+                        # eids = self.sg.pid2eids.get(id, [])
+                        for (elevel, eid), entity in sg.G.nodes(data=True):
+                            if elevel == str(NodeLevel.OBJECT):
+                                # if eid in eids:
+                                bbox = sg.project_entity_bbox(entity, kf)
+
+                                if bbox is None:
+                                    continue
+
+                                e_attrs = entity.get("_attrs", {})
+
+                                is_candidate = (e_attrs['name'] in sg.candidate_names)
+                                is_reference = (e_attrs['name'] in sg.reference_names)
+
+                                if is_candidate:
+                                    style = styles.get('candidate', {'show': False})
+                                    if not style['show']:
+                                        continue
+                                    color = style.get('color', 'green')
+                                elif is_reference:
+                                    style = styles.get('reference', {'show': False})
+                                    if not style['show']:
+                                        continue
+                                    color = style.get('color', 'blue')
+                                else:
+                                    continue
+
+                                color = visualizer._parse_color(color)
+                                u_min, v_min, u_max, v_max = bbox
+                                u_min, v_min, u_max, v_max = int(u_min), int(v_min), int(u_max), int(v_max)
+                                top_left, bottom_right = (u_min, v_min), (u_max, v_max)
+
+                                if u_max < 0 or v_max < 0 or u_min >= W or v_min >= H:
+                                    continue
+
+                                cv2.rectangle(image, top_left, bottom_right, color=color, thickness=2)
+                                cv2.putText(
+                                    image, f"{eid}", (u_min, v_min - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+                                )
+                    else:
+                        raise NotImplementedError("No implementation for other etypes")
+                    save_path = sg.save_path(etype, fname)
+                    success = cv2.imwrite(save_path, image)
 
         time.sleep(0.1)
 

@@ -268,6 +268,7 @@ class BaseVisualGrounder(BaseModel):
                 'hint': None,       # ['reference_object', 'none']
                 'is_plural': None,  # [None, True, False]
                 'previous_history': "",
+                'render_sg': None
             },
             'construct_message': {
                 'resize': [1024, 1024],
@@ -593,9 +594,16 @@ class BaseVisualGrounder(BaseModel):
 
         """ LLM Client """
         self.default_inference_options['prompt'].update({'action': action, 'rtype': 'inference'})
+        # if self.action == 'count' and self.etypes == ['object']:
+        #     self.default_inference_options['prompt'].update({'render_sg': 'object'})
         self.default_inference_options['image']['suffix'] = '_annotated_global'
         self.default_validate_options['prompt'].update({'action': action, 'rtype': 'validate'})
         self.default_validate_options['image']['suffix'] = '_annotated_inference'
+        
+        self.log("<standby.options> default_inference_options:\n" +
+                json.dumps(self.default_inference_options, ensure_ascii=False, indent=2))
+        self.log("<standby.options> default_validate_options:\n" +
+                json.dumps(self.default_validate_options, ensure_ascii=False, indent=2))        
 
         self.prompt_renderer = PromptRenderer(description=self.target_name)
         self.system_instruction_renderer = SystemInstructionRenderer()
@@ -662,6 +670,7 @@ class BaseVisualGrounder(BaseModel):
                         attrs = kf.get('_attrs', {})
 
                         image = attrs['image'].copy()
+                        H, W = image.shape[:2]
                         fname = attrs['fname']
                         detections = attrs['detections']
                         if etype == 'detection':
@@ -697,39 +706,46 @@ class BaseVisualGrounder(BaseModel):
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
                                 )
                         elif etype == 'object':
-                            eids = self.sg.pid2eids.get(id, [])
+                            # eids = self.sg.pid2eids.get(id, [])
                             for (elevel, eid), entity in self.sg.G.nodes(data=True):
                                 if elevel == str(NodeLevel.OBJECT):
-                                    if eid in eids:
-                                        bbox = self.sg.project_entity_bbox(entity, kf)
-                                        e_attrs = entity.get("_attrs", {})
+                                    #if eid in eids:
+                                    bbox = self.sg.project_entity_bbox(entity, kf)
+                                    
+                                    if bbox is None:
+                                        continue
+                                    
+                                    e_attrs = entity.get("_attrs", {})
 
-                                        is_candidate = (e_attrs['name'] in self.sg.candidate_names)
-                                        is_reference = (e_attrs['name'] in self.sg.reference_names)
+                                    is_candidate = (e_attrs['name'] in self.sg.candidate_names)
+                                    is_reference = (e_attrs['name'] in self.sg.reference_names)
 
-                                        if is_candidate:
-                                            style = styles.get('candidate', {'show': False})
-                                            if not style['show']:
-                                                continue
-                                            color = style.get('color', 'green')
-                                        elif is_reference:
-                                            style = styles.get('reference', {'show': False})
-                                            if not style['show']:
-                                                continue
-                                            color = style.get('color', 'blue')
-                                        else:
+                                    if is_candidate:
+                                        style = styles.get('candidate', {'show': False})
+                                        if not style['show']:
                                             continue
+                                        color = style.get('color', 'green')
+                                    elif is_reference:
+                                        style = styles.get('reference', {'show': False})
+                                        if not style['show']:
+                                            continue
+                                        color = style.get('color', 'blue')
+                                    else:
+                                        continue
 
-                                        color = visualizer._parse_color(color)
-                                        u_min, v_min, u_max, v_max = bbox
-                                        u_min, v_min, u_max, v_max = int(u_min), int(v_min), int(u_max), int(v_max)
-                                        top_left, bottom_right = (u_min, v_min), (u_max, v_max)
+                                    color = visualizer._parse_color(color)
+                                    u_min, v_min, u_max, v_max = bbox
+                                    u_min, v_min, u_max, v_max = int(u_min), int(v_min), int(u_max), int(v_max)
+                                    top_left, bottom_right = (u_min, v_min), (u_max, v_max)
+                                    
+                                    if u_max < 0 or v_max < 0 or u_min >= W or v_min >= H:
+                                        continue
 
-                                        cv2.rectangle(image, top_left, bottom_right, color=color, thickness=2)
-                                        cv2.putText(
-                                            image, f"{eid}", (u_min, v_min - 10),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
-                                        )
+                                    cv2.rectangle(image, top_left, bottom_right, color=color, thickness=2)
+                                    cv2.putText(
+                                        image, f"{eid}", (u_min, v_min - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+                                    )
                         else:
                             raise NotImplementedError("No implementation for other etypes")
                         save_path = self.sg.save_path(etype, fname)
@@ -750,7 +766,7 @@ class BaseVisualGrounder(BaseModel):
         self.updated_resource = True
 
     def select_keyframes(
-            self, entity_type='object', w_cov=1.0, w_area=1.0, alpha=0.5, target_eids=None,
+            self, entity_type='object', w_cov=1.0, w_area=1.0, w_rel=0.2, alpha=0.5, target_eids=None,
             min_kfs=None, max_kfs=10, iter_margin=5, *args, **kwargs
     ):
         with self.sg_lock:
@@ -758,6 +774,7 @@ class BaseVisualGrounder(BaseModel):
         etype = 'all' if entity_type == 'image' else entity_type
 
         # --- candidate ids 준비 ---
+        related_eids = set([entity['id'][1] for entity in sg.get_related_entities(etype)])
         try:
             if target_eids is None:
                 target_eids = set(sg.get_related_entities(etype).ids) # TODO: Need to check
@@ -855,6 +872,7 @@ class BaseVisualGrounder(BaseModel):
 
                 num_uncovered_tgts = len(uncovered_target_eids)
                 max_area = 0.0
+                max_rel = 0
                 tmp_stats = {}  # {pid: (c, a, covered_eids_now), ...}
                 for pid, kf in kfs_with_targets.items():
                     covered_eids_now = pid2target_eids.get(pid, ()) & uncovered_target_eids
@@ -866,15 +884,24 @@ class BaseVisualGrounder(BaseModel):
                         a += _entity_area(kf, pid, eid, sg=self.sg)
                     if a > max_area:
                         max_area = a
-                    tmp_stats[pid] = (c, a, covered_eids_now)
+                        
+                    eids_here = pid2eids.get(pid, [])
+                    related_eids_here = set(eids_here) & set(related_eids)
+                    rel_cnt = len(related_eids_here)
+                    max_rel = max(max_rel, rel_cnt)
+                    tmp_stats[pid] = (c, a, rel_cnt, covered_eids_now)
 
                 if not tmp_stats:
                     self.log(f"<select_keyframes.4> tmp_stats is None", level='warn')
                     break
 
                 best_pid, best_score = None, float("-inf")
-                for pid, (c, a, _) in tmp_stats.items():
-                    base = w_cov * c + (w_area * (a / max_area) if max_area > 0 else 0.0)
+                for pid, (c, a, rel_cnt, _) in tmp_stats.items():
+                    base = (
+                        w_cov * c
+                        + (w_area * (a / max_area) if max_area > 0 else 0.0)
+                        + (w_rel * (rel_cnt / max_rel) if max_rel > 0 else 0)
+                    )
                     cnt = self.kf_counts.get(pid, 0)  # TODO
                     seen = 1.0 / (1.0 + alpha * cnt)
                     score = base * seen
@@ -886,7 +913,7 @@ class BaseVisualGrounder(BaseModel):
                         break
 
                 selected_pids.append(best_pid)
-                _, _, covered_eids_best = tmp_stats[best_pid]
+                _, _, _, covered_eids_best = tmp_stats[best_pid]
                 uncovered_target_eids.difference_update(covered_eids_best)
                 self.kf_counts[best_pid] = self.kf_counts.get(best_pid, 0) + 1
                 kfs_with_targets.pop(best_pid, None)
@@ -981,7 +1008,13 @@ class BaseVisualGrounder(BaseModel):
                 if etype == 'image':
                     data += [{'keyframes': kfs, 'etype': 'image', 'gid': gid, 'eids': eids} for kfs in keyframes.to_list()]
                 else:
-                    data += [{'keyframes': keyframes, 'etype': etype, 'gid': gid, 'eids': eids}]
+                    if self.default_inference_options['prompt']['render_sg'] == 'object':
+                        obj_json = self.sg.render_object_minimal(scope="related") 
+                        data += [{'keyframes': keyframes, 'etype': etype, 'gid': gid, 'eids': eids, 'sg': obj_json}]
+                    else:
+                        data += [{'keyframes': keyframes, 'etype': etype, 'gid': gid, 'eids': eids}]
+
+
                 num_kfs[etype] = len(keyframes)
             self.logger.loginfo(f"<process.4> Selected KFs: {num_kfs}\n"
                                 f"  > eids: {eids}")
@@ -1212,33 +1245,47 @@ class BaseVisualGrounder(BaseModel):
                         try:
                             etype = result.get('entity_type')
                             target_ids = result.get('target_ids', [])
+                            candidate_eids_in_kfs = result.get('data').get('candidate_eids_in_kfs', [])
                             answers = []
+                            non_answers = []
                             if self.action == 'count':
                                 count = len(target_ids)
                                 if count == 0:
                                     answer = None
                                     answers.append(answer)
-                                if self.etypes == ['object']:
-                                    target_entities = []
-                                    
-                                    target_ids = [int(t) for t in target_ids]
-                                    for (level, id), data in self.sg.G.nodes(data=True):
-                                        if level == str(NodeLevel.OBJECT):
-                                            if id in target_ids:
-                                                target_entities.append(data)
-                                                
-                                    self.log(f"<inference_loop.4.3.{_}> len(target_entities): {len(target_entities)}")
-                                           
-                                    result['data'].update({'pid2eids': self.sg.pid2eids})     
-                                    for target_entity in target_entities:
-                                        answer = Answer(object=target_entity, data=result['data'])
-                                        self.log(f"<inference_loop.4.3.{_}> target_entity: {target_entity}")
-                                        self.rr_log(f"<inference_loop.4.3.{_}> target_entity: {target_entity}", panel='inference')
-                                        answers.append(answer)
-
                                 else:
-                                    answer = Answer(count=count, data=result['data'])
-                                    answers.append(answer)
+                                    if self.etypes == ['object']:
+                                        target_ids = [int(t) for t in target_ids]
+                                        non_target_ids = list(set(candidate_eids_in_kfs) - set(target_ids))
+                                        self.log(f"<inference_loop.4.3.{_}> non_target_ids: {non_target_ids}")
+
+                                        target_entities = []
+                                        non_target_entities = []
+                                        for (level, id), data in self.sg.G.nodes(data=True):
+                                            if level == str(NodeLevel.OBJECT):
+                                                if id in target_ids:
+                                                    target_entities.append(data)
+                                                elif id in non_target_ids:
+                                                    non_target_entities.append(data)
+                                                    
+                                        self.log(f"<inference_loop.4.3.{_}> len(target_entities): {len(target_entities)}")
+                                        self.log(f"<inference_loop.4.3.{_}> len(non_target_entities): {len(non_target_entities)}")
+                                            
+                                        result['data'].update({'pid2eids': self.sg.pid2eids})     
+                                        for target_entity in target_entities:
+                                            answer = Answer(object=target_entity, data=result['data'])
+                                            self.log(f"<inference_loop.4.3.{_}> target_entity: {target_entity}")
+                                            self.rr_log(f"<inference_loop.4.3.{_}> target_entity: {target_entity}", panel='inference')
+                                            answers.append(answer)
+                                            
+                                        for non_target_entity in non_target_entities:
+                                            non_answer = Answer(object=non_target_entity, data=result['data'])
+                                            self.log(f"<inference_loop.4.3.{_}> non_target_entity: {non_target_entity}")
+                                            self.rr_log(f"<inference_loop.4.3.{_}> non_target_entity: {non_target_entity}", panel='inference')
+                                            non_answers.append(non_answer)
+                                    else:
+                                        answer = Answer(count=count, data=result['data'])
+                                        answers.append(answer)
                                 self.log(f"<inference_loop.4.3.{_}> Answer(count={count})")
                                 self.rr_log(f"<inference_loop.4.3.{_}> Answer(count={count})", panel='inference')
                             elif self.action == 'find':
@@ -1276,6 +1323,13 @@ class BaseVisualGrounder(BaseModel):
                                     self.log(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
                                 else:
                                     self.log(f"<inference_loop.4.4.{_}> No updated agg_results")
+                                    
+                            for non_answer in non_answers:
+                                if non_answer is not None:
+                                    self.agg_results.update(gid=gid, answer=non_answer, confidence=1 - get_confidence(etype))
+                                    self.log(f"<inference_loop.4.4.{_}> Update agg_results (non-target) <- {non_answer}")
+                                else:
+                                    self.log(f"<inference_loop.4.4.{_}> No updated agg_results (non-target)")
                         except Exception as e:
                             self.log(f"<inference_loop.4.4.{_}> Error occurs: {e}", level='error')
                             self.rr_log(f"<inference_loop.4.4.{_}> Error occurs: {e}", panel='inference', level='error')    
@@ -1424,26 +1478,17 @@ class BaseVisualGrounder(BaseModel):
 
             phase = 1
             keyframes = input_data['keyframes']
-
-            candidate_eids_in_kfs = [] # TODO: Need to check
-            pid2eids = self.sg.pid2eids
-            for kf in keyframes:
-                pid = kf['id'][1]
-                if pid is not None:
-                    eids = pid2eids[pid]
-                    filtered_eids = [
-                        eid for (level, eid), entity in self.sg.G.nodes(data=True)
-                        if (level == str(NodeLevel.OBJECT))
-                           and (eid in eids)
-                           and (entity.get("_attrs", {})['name'] in self.sg.candidate_names)
-                    ]
-                    candidate_eids_in_kfs += filtered_eids
+            candidate_eids_in_kfs = input_data.get('candidate_eids_in_kfs', [])
+            sg = input_data.get('sg', None)
 
             options = input_data.get('options', self.default_options)
             previous_history = options['prompt']['previous_history']  # TODO
 
             # Prepare the prompt and system instruction
-            prompt = self.prompt_renderer.render(**options['prompt'], anno_ids=candidate_eids_in_kfs)
+            if sg:
+                prompt = self.prompt_renderer.render(**options['prompt'], anno_ids=candidate_eids_in_kfs, sg=sg)
+            else:
+                prompt = self.prompt_renderer.render(**options['prompt'], anno_ids=candidate_eids_in_kfs)
             system_instruction = self.system_instruction_renderer.render(**options['prompt'])
             images, image_paths = self.get_images(keyframes, **options['image']) # TODO: FIX
             self.log(f"<query_worker.1> Prepare the input data")
@@ -1455,6 +1500,23 @@ class BaseVisualGrounder(BaseModel):
                 message = client.construct_message(prompt, images, system_instruction, **options['construct_message'])
             end_time = time.time()
             self.log(f"<query_worker.2> Construct message with client")
+            
+            
+            # ---- DEBUG: save query images by query time ----
+            # query_ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())  # 예: 20251223_003636
+            # debug_dir = os.path.join("/ws/external/query_images", query_ts)
+            # os.makedirs(debug_dir, exist_ok=True)
+
+            # import shutil
+            # saved = []
+            # for p in (image_paths or []):
+            #     try:
+            #         if p and os.path.exists(p):
+            #             dst = os.path.join(debug_dir, os.path.basename(p))
+            #             shutil.copy2(p, dst)
+            #             saved.append(dst)
+            #     except Exception as _e:
+            #         pass
 
             phase = 3
             response_text, _, _ = self._get_response_with_retry(
@@ -1551,10 +1613,33 @@ class BaseVisualGrounder(BaseModel):
 
             suffix = options['image']['suffix']
             options['image'].update({'suffix': f"{suffix}_{etype}"})
+            
+            # Get candidate entity ids in keyframes
+            candidate_eids_in_kfs = [] # TODO: Need to check
+            pid2eids = self.sg.pid2eids
+            for kf in keyframes:
+                pid = kf['id'][1]
+                if pid is not None:
+                    eids = pid2eids.get(pid, None)
+                    if eids is None:
+                        self.log(f"<inference.2> pid {pid} not in pid2eids (skip kf)", level='warn')
+                        continue
+                    filtered_eids = [
+                        eid for (level, eid), entity in self.sg.G.nodes(data=True)
+                        if (level == str(NodeLevel.OBJECT))
+                           and (eid in eids)
+                           and (entity.get("_attrs", {})['name'] in self.sg.candidate_names)
+                    ]
+                    candidate_eids_in_kfs += filtered_eids
+            candidate_eids_in_kfs = sorted(set(candidate_eids_in_kfs))
+
             data_list = [{
                 'keyframes': keyframes,  # TODO: need to check
                 'options': options,
+                'candidate_eids_in_kfs': candidate_eids_in_kfs,
+                'sg': kwargs.get('sg', None)
             }]
+
             self.log(f"<inference.2> options and data_list are ready.")
         except Exception as e:
             self.log(f"<inference.2> Error occurs: {e}")
@@ -1805,7 +1890,11 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 # MAIN LOOP
     def process(self, **kwargs):
         self.log(f"<process.0> Start")
-        self.update_resource(**kwargs)
+        try:
+            self.update_resource(**kwargs)
+        except Exception as e:
+            self.log(f"<process.0> Error occurs: {e}", level='error')
+            self.rr_log(f"<process.0> Error occurs: {e}", panel='main', level='error')
 
         # Select Group ID
         num_queries_required = 1 # self.agg_results.min_query
@@ -1882,11 +1971,22 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     self.agg_results.schedule(gid, n=len(data), data=data)
                     self.log(
                         "<process.3> Put data to inference_queue:\n" +
-                        "\n".join([f"  > pids: {', '.join(map(str, [kf['id'][1] for kf in d['keyframes']]))}, etype: {d['etype']}, atype: {d['atype']}, eids: {d['eids']}" for d in data])
+                        "\n".join([
+                            f"  > pids: {', '.join(map(str, [kf['id'][1] for kf in d['keyframes']]))}, "
+                            f"etype: {d['etype']}, atype: {d['atype']}, eids: {d['eids']}"
+                            + (f", sg_nobj: {len(d.get('sg', {}))}" if isinstance(d.get('sg', None), dict) else "")
+                            for d in data
+                        ])
                     )
+
                     self.rr_log(
                         "<process.3> Put data to inference_queue:\n" +
-                        "\n".join([f"  > pids: {', '.join(map(str, [kf['id'][1] for kf in d['keyframes']]))}, etype: {d['etype']}, atype: {d['atype']}, eids: {d['eids']}" for d in data]),
+                        "\n".join([
+                            f"  > pids: {', '.join(map(str, [kf['id'][1] for kf in d['keyframes']]))}, "
+                            f"etype: {d['etype']}, atype: {d['atype']}, eids: {d['eids']}"
+                            + (f", sg_nobj: {len(d.get('sg', {}))}" if isinstance(d.get('sg', None), dict) else "")
+                            for d in data
+                        ]),
                         panel='main'
                     )
                 except queue.Full:
@@ -2277,10 +2377,14 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
             etype = 'object'
             while budget > 0 and (etype in self.etypes):
-                keyframes = self.select_keyframes(entity_type=etype, target_eids=eids, min_kfs=1, max_kfs=10)
+                keyframes = self.select_keyframes(entity_type=etype, target_eids=eids, min_kfs=5, max_kfs=10)
                 if len(keyframes) == 0:
                     break
-                data += [{'keyframes': keyframes, 'etype': etype, 'atype': 'object_box_id', 'eids': eids}]
+                if self.default_inference_options['prompt']['render_sg'] == 'object':
+                    obj_json = self.sg.render_object_minimal(scope="related") 
+                    data += [{'keyframes': keyframes, 'etype': etype, 'atype': 'object_box_id', 'eids': eids, 'sg': obj_json}]
+                else:
+                    data += [{'keyframes': keyframes, 'etype': etype, 'atype': 'object_box_id', 'eids': eids}]
                 pids += [kf['id'][1] for kf in keyframes]
                 budget -= 1
             self.log(f"<build_batch_for_gid.1> Budget({etype}): {budget} ({'ok' if etype in self.etypes else 'no'})")

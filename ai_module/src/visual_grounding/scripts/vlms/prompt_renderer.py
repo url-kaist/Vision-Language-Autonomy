@@ -1,6 +1,6 @@
 import logging
 from typing import Literal, List, Dict, Tuple, Union
-
+import json
 
 class Rtype:
     INFERENCE = "inference"
@@ -121,6 +121,23 @@ class PromptRenderer:
             fmt = format_list(contents, numbered_levels={1})
             return f"{task}\n" + "\n".join(fmt)
 
+    def _render_sg_context(self, sg: dict) -> str:
+        """
+        sg: output of render_object_minimal, like:
+            { "17": {"level":"OBJECT","id":17,"name":"chair","centroid":[...]} , ... }
+        """
+        if not sg:
+            return ""
+
+        # keep deterministic order
+        keys = sorted(sg.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x))
+
+        return "SceneGraph context:\n" + json.dumps(
+            {k: sg[k] for k in keys},
+            ensure_ascii=False,
+            indent=2
+        )
+
     def _render_procedure(self, action: str, atype: str, hint: str, is_plural=None, anno_ids=None, **kwargs):
         """
         Procedure:
@@ -179,6 +196,13 @@ class PromptRenderer:
             ]
         elif atype == Atype.POINT_ID: raise NotImplementedError("Need to implement the procedure for point_id(atype).")
         else: raise TypeError(make_error_atype(atype))
+
+        sg = kwargs.get("sg", None)
+        if sg is not None:
+            steps += [
+                "Use both the image and the provided SceneGraph context together to make your decision.",
+                "Treat SceneGraph object nodes (especially name label) as noisy hints that may be wrong; prefer visual evidence from the image when there is any conflict, and use SceneGraph only as supporting context."
+            ]
 
         if hint == Hint.REFERENCE_OBJECT:
             steps += [
@@ -273,6 +297,11 @@ class PromptRenderer:
             self._render_procedure(action, atype, hint, is_plural=is_plural, anno_ids=anno_ids, **kwargs),
             self._render_example(action, atype, hint, is_plural=is_plural, anno_ids=anno_ids, **kwargs),
         ]
+        
+        sg = kwargs.get('sg', None)
+        if sg:
+            sections.append(self._render_sg_context(sg))
+        
         fmt = [s.strip() for s in sections if s and s.strip()]
         return "\n\n".join(fmt)
 
