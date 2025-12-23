@@ -70,7 +70,8 @@ def make_palette(K, n_candidates: int = 2000, seed: int = 0):
 
 class RRLogger:
     timeline = "ros_time"
-    def __init__(self, output_path="/ws/external/log", name="rerun_example", max_colors=100, save=False):
+    def __init__(self, output_path="/ws/external/log", name="debug", max_colors=100, save=False):
+        print(f"*************** NAME: {name} ***************")
         self.palette = make_palette(K=max_colors)
 
         if not osp.exists(output_path):
@@ -99,8 +100,8 @@ class RRLogger:
                     # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
                     rrb.Spatial3DView(
                         name="SceneGraph 3D",
-                        origin=prefix_sg,
-                        contents=[f"{prefix_sg}/**"],
+                        origin="/",
+                        contents=[f"SG/**"],
                     ),
 
                     # (2) 우측 패널: 2D 이미지 + 선택 패널
