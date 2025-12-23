@@ -7,10 +7,72 @@ from ai_module.src.utils.timer import Timer, Stats
 from ai_module.src.utils.visualizer import _color_palette
 from ai_module.src.visual_grounding.scripts.structures.entity import Entities
 from ai_module.src.visual_grounding.scripts.structures.dsu import DSU
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.patches as patches
+from dataclasses import dataclass
+from ai_module.src.visual_grounding.scripts.utils.utils_active_perception import visible_edges_from_pose, visualize_visibility
 
+def _visible_arcs_from_mask(mask: np.ndarray):
+    """
+    mask: (M,) bool for edges
+    return: list of (start_idx, end_idx) inclusive along CW (in index space)
+            여기서는 'index 증가 방향'을 CW로 간주해도 됩니다.
+            (CCW/CW는 일관되게만 쓰면 OK)
+    """
+    M = len(mask)
+    if M == 0 or not mask.any():
+        return []
+
+    # 원형 처리: 시작점을 'False 다음 True' 지점으로 잡아 선형화
+    prev = np.roll(mask, 1)
+    starts = np.where((~prev) & mask)[0]
+    if len(starts) == 0:
+        # 전부 True
+        return [(0, M - 1)]
+
+    s0 = int(starts[0])
+    m2 = np.concatenate([mask[s0:], mask[:s0]])
+
+    arcs = []
+    i = 0
+    while i < M:
+        if not m2[i]:
+            i += 1
+            continue
+        j = i
+        while j < M and m2[j]:
+            j += 1
+        # [i, j-1] is a True run in m2
+        a = (s0 + i) % M
+        b = (s0 + (j - 1)) % M
+        arcs.append((a, b))
+        i = j
+    return arcs
+
+def _idx_in_arc(i: int, a: int, b: int, M: int) -> bool:
+    """index 증가 방향으로 a->b 구간(원형)에 i가 포함되면 True."""
+    if a <= b:
+        return a <= i <= b
+    return (i >= a) or (i <= b)
+def _idx_in_cw_arc(i: int, a: int, b: int, M: int) -> bool:
+    """
+    arc: a -> b 를 index 증가 방향으로 따라갈 때 포함되면 True (원형)
+    """
+    if a <= b:
+        return a <= i <= b
+    else:
+        # wrap-around
+        return (i >= a) or (i <= b)
+def _pt_sig(p, ndigits=4):
+    return tuple(np.round(np.asarray(p, dtype=np.float32), ndigits))
 
 NEI8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 
+def _edge_signature(p0, p1, ndigits=4):
+    a = tuple(np.round(p0, ndigits))
+    b = tuple(np.round(p1, ndigits))
+    return (a, b) if a <= b else (b, a)
 
 def build_offsets(radius_cells: int, metric: str = "euclid") -> list:
     """
@@ -87,6 +149,13 @@ class GridGrouper:
         self.group_count = defaultdict(int)  # {root_id: count}
         self.eid_count = defaultdict(int)  # {eid: count}
 
+        # hull cache
+        self._group_hulls_cache = None  # 마지막 계산된 group_hulls 결과
+        self._hulls_dirty = True  # update()/fit() 후 True
+
+        # visibility cache
+        self._visible_edges_cache = {}  # gid -> visible edge mask / segments
+
     def _clear_all(self):
         self.grid.clear()
         self.ent_cells.clear()
@@ -147,14 +216,15 @@ class GridGrouper:
                 for (dx, dy) in self.offsets:
                     cc = (cx + dx, cy + dy)
                     for j in self.grid.get(cc, ()):
-                        if j == eid or j in seen:
+                        if j == eid or j in seen: # 동일 entity거나 이미 처리했거나
                             continue
-                        if self.dsu.root(eid) == self.dsu.root(j):
+                        if self.dsu.root(eid) == self.dsu.root(j): #
                             continue
                         self._union_with_count(eid, j)
                         self.stats['unions'] += 1
                         seen.add(j)
 
+        self._hulls_dirty = True # 다음에 hull은 다시 계산해야 함
         return self
 
     def update(self, entities):
@@ -211,6 +281,7 @@ class GridGrouper:
                         self._union_with_count(eid, j)
                         self.stats['unions'] += 1
                         seen.add(j)
+        self._hulls_dirty = True # 다음에 hull은 다시 계산해야 함
 
     def groups(self, gid=None) -> List[List[int]]:
         roots = defaultdict(list)
@@ -249,9 +320,72 @@ class GridGrouper:
                     break
         return b
 
+    def update_visibility(self, agent_pose, fov_rad=None, max_range=None):
+        hulls = self.group_hulls()
+        # self._visible_edges_cache.clear()
+
+        for item in hulls:
+            gid = item['gid']
+            hull = np.asarray(item['hull'], np.float32)
+            M = len(hull)
+            if hull is None or M < 2:
+                item['edge_visible'] = np.zeros(0, dtype=bool)
+                item['edge_segs'] = None
+                continue
+
+            new_sigs = [
+                _edge_signature(hull[i], hull[(i + 1) % M])
+                for i in range(M)
+            ]
+
+            old_sigs = item.get('edge_sigs', [])
+            old_vis = item.get('edge_visible', np.zeros(0, bool))
+            old_segs = item.get('edge_segs', np.empty((0, 2, 2), np.float32))
+
+            old_sig_to_idx = {s: i for i, s in enumerate(old_sigs)}
+
+            # --- 현재 프레임 visibility 계산 (전체 hull에 대해 한 번만) ---
+            vis, segs, _ = visible_edges_from_pose(
+                hull,
+                agent_pose,
+                fov_rad=fov_rad,
+                max_range=max_range,
+            )
+            # visualize_visibility(hull, agent_pose, segs, fov_rad, max_range, save_path='/ws/external/vis/visibility_debug3.jpg')
+
+            # --- 새 edge_visible ---
+            new_edge_visible = np.zeros(M, dtype=bool)
+            new_edge_segs = []
+
+            # ---- 1) 변하지 않은 edge는 그대로 복사 ----
+            for i, sig in enumerate(new_sigs):
+                cur_vis = vis[i]
+
+                if sig in old_sig_to_idx:
+                    j = old_sig_to_idx[sig]
+                    new_edge_visible[i] = old_vis[j] or cur_vis # OR 누적
+                else: # 새 edge
+                    new_edge_visible[i] = cur_vis
+
+                if new_edge_visible[i]:
+                    p0, p1 = hull[i], hull[(i+1) % M]
+                    new_edge_segs.append([p0, p1])
+
+            # ---- cache 업데이트 ----
+            # self._visible_edges_cache[gid] = {'vis': vis, 'segs': segs}
+            item['edge_visible'] = new_edge_visible
+            item['edge_segs'] = np.asarray(new_edge_segs, dtype=np.float32)
+            item['edge_sigs'] = new_sigs
+
     def group_hulls(self, use_boundary: bool = True):
+        if not self._hulls_dirty and self._group_hulls_cache is not None:
+            return self._group_hulls_cache
+
+        # ---- old cache snapshot (for carry-over) ----
+        old_cache = self._group_hulls_cache or []
+        old_by_gid = {it["gid"]: it for it in old_cache}
+
         res = []
-        cs = float(self.cell_size)
         for gid, eids in enumerate(self.groups()):
             cells = set()
             for eid in eids:
@@ -259,7 +393,100 @@ class GridGrouper:
             if use_boundary:
                 cells = self.boundary_cells(cells)
             hull_xy = self.hull_from_cells(cells)
-            res.append({'gid': gid, 'members': eids, 'hull': hull_xy})
+            M = len(hull_xy)
+
+            # new signatures
+            new_sigs = []
+            for i in range(M):
+                p0 = hull_xy[i]
+                p1 = hull_xy[(i + 1) % M]
+                new_sigs.append(_edge_signature(p0, p1))
+
+            # ---- default (fresh) ----
+            new_edge_visible = np.zeros(M, dtype=bool)
+            new_edge_segs = []
+
+            # ---- carry over from old if possible ----
+            old_item = old_by_gid.get(gid)
+            if old_item is not None:
+                old_sigs = old_item.get("edge_sigs", [])
+                old_vis = old_item.get("edge_visible", np.zeros(0, dtype=bool))
+
+                # old visible edges as a set of signatures (so we can rebuild segs robustly)
+                old_visible_sig_set = set()
+                if len(old_sigs) == len(old_vis):
+                    old_visible_sig_set = {s for s, v in zip(old_sigs, old_vis) if v}
+
+                old_sig_to_idx = {s: i for i, s in enumerate(old_sigs)}
+
+                # --- Ver 1 ---
+                # for i, sig in enumerate(new_sigs):
+                #     # visibility carry-over for unchanged edges
+                #     j = old_sig_to_idx.get(sig)
+                #     if j is not None and j < len(old_vis):
+                #         new_edge_visible[i] = bool(old_vis[j])
+                #
+                #     # segs carry-over by visibility (do NOT rely on old_item['edge_segs'] geometry)
+                #     if sig in old_visible_sig_set:
+                #         p0, p1 = hull_xy[i], hull_xy[(i + 1) % M]
+                #         new_edge_segs.append([p0, p1])
+                # --- Ver 2 ---
+                # 2) 이전 visible edge들의 vertex(끝점) sig 집합
+                # old_visible_vertex_set = set()
+                # for s in old_visible_sig_set:
+                #     a, b = s  # each is point signature tuple
+                #     old_visible_vertex_set.add(a)
+                #     old_visible_vertex_set.add(b)
+                # for i, sig in enumerate(new_sigs):
+                #     # (A) 완전히 동일 edge면 기존 visibility 유지
+                #     j = old_sig_to_idx.get(sig)
+                #     if j is not None and j < len(old_vis):
+                #         new_edge_visible[i] = bool(old_vis[j])
+                #
+                #     # (B) 동일 edge가 아닌데, "예전에 보였던 면이 변형된 것"이면 그냥 True 처리
+                #     if j is None:
+                #         p0_sig = _pt_sig(hull_xy[i])
+                #         p1_sig = _pt_sig(hull_xy[(i + 1) % M])
+                #         if (p0_sig in old_visible_vertex_set) or (p1_sig in old_visible_vertex_set):
+                #             new_edge_visible[i] = True
+                #
+                #     if new_edge_visible[i]:
+                #         p0, p1 = hull_xy[i], hull_xy[(i + 1) % M]
+                #         new_edge_segs.append([p0, p1])
+                # --- Ver 3: visible 구간(arc) 기반 carry-over ---
+                old_arcs = []
+                if len(old_sigs) == len(old_vis) and len(old_vis) > 0:
+                    old_arcs = _visible_arcs_from_mask(old_vis)
+
+                for i, sig in enumerate(new_sigs):
+                    j = old_sig_to_idx.get(sig)
+
+                    # (A) 동일 edge면 기존 visibility 유지
+                    if j is not None and j < len(old_vis):
+                        new_edge_visible[i] = bool(old_vis[j])
+                    else:
+                        # (B) edge가 변했으면: "예전에 보였던 구간 사이"면 그냥 True
+                        for (a, b) in old_arcs:
+                            if _idx_in_arc(i, a, b, M):
+                                new_edge_visible[i] = True
+                                break
+
+                    if new_edge_visible[i]:
+                        p0, p1 = hull_xy[i], hull_xy[(i + 1) % M]
+                        new_edge_segs.append([p0, p1])
+
+            res.append({
+                "gid": gid,
+                "members": eids,
+                "hull": hull_xy,
+                "edge_visible": new_edge_visible,
+                "edge_segs": np.asarray(new_edge_segs, dtype=np.float32) if new_edge_segs else None,
+                "edge_sigs": new_sigs,
+            })
+
+        self._group_hulls_cache = res
+        self._hulls_dirty = False
+
         return res
 
     def mark_group_processed_by_eid(self, eid: int, inc: int = 1):
@@ -364,3 +591,204 @@ class GridGrouper:
         if out_path:
             cv2.imwrite(out_path, vis)
         return vis
+
+    def visualize_grid(self, save_path=None):
+        cell_dict = self.grid
+        cell_size = 1.0
+        id_to_points = defaultdict(list)
+
+        for (x, y), id_set in cell_dict.items():
+            for obj_id in id_set:
+                id_to_points[obj_id].append((x, y))
+
+        # ---- discrete colormap for object ids ----
+        obj_ids = sorted(id_to_points.keys())
+        cmap = cm.get_cmap("tab10", len(obj_ids))  # categorical
+        id_to_color = {
+            obj_id: cmap(i) for i, obj_id in enumerate(obj_ids)
+        }
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+
+        for obj_id, pts in id_to_points.items():
+            color = id_to_color[obj_id]
+            for (x, y) in pts:
+                # grid cell
+                rect = patches.Rectangle(
+                    (x, y),
+                    cell_size, cell_size,
+                    facecolor=color, edgecolor='black',
+                    linewidth=0.5, alpha=0.6
+                )
+                ax.add_patch(rect)
+
+                # object id text
+                ax.text(
+                    x + cell_size / 2,
+                    y + cell_size / 2,
+                    str(obj_id),
+                    ha="center", va="center",
+                    fontsize=9, color='black',
+                )
+
+        # ---- grid 느낌을 살리는 설정 ----
+        ax.set_aspect("equal")
+
+        xs = [x for (x, y) in cell_dict.keys()]
+        ys = [y for (x, y) in cell_dict.keys()]
+
+        ax.set_xlim(min(xs) - 1, max(xs) + cell_size + 1)
+        ax.set_ylim(min(ys) - 1, max(ys) + cell_size + 1)
+
+        ax.set_xticks(range(int(min(xs)), int(max(xs)) + 2))
+        ax.set_yticks(range(int(min(ys)), int(max(ys)) + 2))
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_title("Grid-style visualization grouped by object id")
+
+        legend_patches = [
+            patches.Patch(color=id_to_color[obj_id], label=f"id={obj_id}")
+            for obj_id in obj_ids
+        ]
+        ax.legend(handles=legend_patches, loc="upper right")
+
+        if save_path is not None:
+            plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        else:
+            plt.show()
+
+    def visualize_group_hulls(self, save_path=None, padding_ratio=0.2):
+        cluster_infos = self.group_hulls()
+
+        # ---- gid → color ----
+        gids = sorted({c["gid"] for c in cluster_infos})
+        cmap = cm.get_cmap("tab10", len(gids))
+        gid_to_color = {gid: cmap(i) for i, gid in enumerate(gids)}
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+
+        # ---- 모든 hull 좌표 수집 ----
+        all_pts = []
+
+        for c in cluster_infos:
+            hull = np.asarray(c["hull"], dtype=np.float32)
+            all_pts.append(hull)
+
+            poly = patches.Polygon(
+                hull,
+                closed=True,
+                facecolor=gid_to_color[c["gid"]],
+                edgecolor="black",
+                linewidth=1.5,
+                alpha=0.6,
+                label=f"gid={c['gid']}"
+            )
+            ax.add_patch(poly)
+
+            # centroid label
+            cx, cy = hull.mean(axis=0)
+            ax.text(cx, cy, f"gid={c['gid']}",
+                    ha="center", va="center",
+                    fontsize=10, fontweight="bold")
+
+        all_pts = np.vstack(all_pts)  # (N, 2)
+
+        # ---- axis range with padding (핵심) ----
+        xmin, ymin = all_pts.min(axis=0)
+        xmax, ymax = all_pts.max(axis=0)
+
+        dx = xmax - xmin
+        dy = ymax - ymin
+
+        # hull이 거의 점인 경우 대비
+        dx = max(dx, 1e-3)
+        dy = max(dy, 1e-3)
+
+        pad_x = dx * padding_ratio
+        pad_y = dy * padding_ratio
+
+        ax.set_xlim(xmin - pad_x, xmax + pad_x)
+        ax.set_ylim(ymin - pad_y, ymax + pad_y)
+
+        # ---- styling ----
+        ax.set_aspect("equal")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_title("Convex hull visualization (auto-scaled)")
+        ax.grid(True, linestyle="--", linewidth=0.5)
+
+        # ---- legend dedup ----
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
+
+        if save_path:
+            plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        else:
+            plt.show()
+
+    def visualize_grid_with_hulls(self, save_path=None):
+        cell_dict = self.grid
+        clusters = self.group_hulls()
+        cell_size = self.cell_size
+
+        fig, ax = plt.subplots(figsize=(7, 7))
+
+        # 1) grid cells (배경)
+        id_to_points = defaultdict(list)
+        for (x, y), ids in cell_dict.items():
+            for obj_id in ids:
+                id_to_points[obj_id].append((x * cell_size, y * cell_size))
+
+        obj_ids = sorted(id_to_points.keys())
+        cmap_id = cm.get_cmap("tab10", max(len(obj_ids), 1))
+        id_color = {oid: cmap_id(i) for i, oid in enumerate(obj_ids)}
+
+        for oid, pts in id_to_points.items():
+            for (x, y) in pts:
+                ax.add_patch(
+                    patches.Rectangle(
+                        (x, y), cell_size, cell_size,
+                        facecolor=id_color[oid],
+                        edgecolor="black",
+                        linewidth=0.3,
+                        alpha=0.25,
+                    )
+                )
+
+        # 2) hull polygons (전경)
+        gids = sorted({c["gid"] for c in clusters})
+        cmap_gid = cm.get_cmap("tab10", max(len(gids), 1))
+        gid_color = {gid: cmap_gid(i) for i, gid in enumerate(gids)}
+
+        for c in clusters:
+            hull = np.asarray(c["hull"], dtype=np.float32)
+            if hull.size == 0:
+                continue
+            ax.add_patch(
+                patches.Polygon(
+                    hull, closed=True,
+                    facecolor=gid_color[c["gid"]],
+                    edgecolor="black",
+                    linewidth=2.0,
+                    alpha=0.45,
+                )
+            )
+
+        # 3) 축 자동 스케일 (grid+hull 포함), grid 느낌
+        ax.set_aspect("equal")
+        ax.relim()
+        ax.autoscale_view()
+        ax.grid(True, linestyle="--", linewidth=0.5)
+
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_title("Grid + Group Hulls (overlay)")
+
+        if save_path:
+            plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        else:
+            plt.show()
+

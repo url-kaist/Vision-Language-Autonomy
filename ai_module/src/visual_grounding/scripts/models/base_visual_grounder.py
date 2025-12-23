@@ -64,6 +64,14 @@ from visual_grounding.srv import SetSubplans, SetSubplansResponse
 from std_srvs.srv import Trigger, TriggerResponse
 from ai_module.src.utils.rr_logger import RRLogger, rotmat_to_quat_xyzw
 
+
+def theta_from_agent_pose(orientation):
+    qx, qy, qz, qw = orientation
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    theta = np.arctan2(siny_cosp, cosy_cosp)
+    return theta
+
 ANSWER_TYPE = {'find': Marker, 'count': Int32}
 ANSWER_TOPIC_NAME = {'find': 'selected_object_marker', 'count': '/numerical_response'}
 
@@ -90,6 +98,20 @@ def save_path_xy(path_xy: np.ndarray, base_dir="/ws/external/offline_map", name=
     np.save(save_path, path_xy)
     return save_path
 
+
+def save_pose(position, orientation, base_dir="/ws/external/offline_map"):
+    subdirs = [d for d in glob.glob(os.path.join(base_dir, "*")) if os.path.isdir(d)]
+    if not subdirs:
+        return
+    latest_dir = max(subdirs, key=os.path.getmtime)
+
+    # 저장 파일 이름 (timestamp 기반)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    save_path = os.path.join(latest_dir, f"position_{timestamp}.npy")
+    np.save(save_path, position)
+    save_path = os.path.join(latest_dir, f"orientation_{timestamp}.npy")
+    np.save(save_path, orientation)
+    return save_path
 
 class Status(str, Enum):
     WAITING = "Waiting"
@@ -231,6 +253,7 @@ class PriorityDispatcher:
 class BaseVisualGrounder(BaseModel):
 # INIT
     def __init__(self, node_name=None, is_real_world=False, logger=None, *args, **kwargs):
+        self.rr_logger = RRLogger()
         super().__init__(logger=logger, *args, **kwargs)
 
         """ Core """
@@ -292,7 +315,6 @@ class BaseVisualGrounder(BaseModel):
         """ Initialization """
         self._init_all(*args, **kwargs)
 
-        self.rr_logger = RRLogger()
 
     def _init_all(self, *args, **kwargs):
         self._init_vars(*args, **kwargs)
@@ -529,7 +551,7 @@ class BaseVisualGrounder(BaseModel):
         if action == 'find':
             return ['object'] # , 'image']
         elif action == 'count':
-            return ['image']  # 'object',
+            return ['object']  # 'object', 'image'
         else:
             return ['all']
 
@@ -620,26 +642,31 @@ class BaseVisualGrounder(BaseModel):
                 })
             elif level == str(NodeLevel.KEYFRAME):
                 pose = np.array(attrs['pose'], dtype=np.float32)
-                R, t = pose[:3, :3], pose[:3, 3]
+
+                R_w2b, t_w2b = pose[:3, :3], pose[:3, 3]
+                R_c2b, t_c2b = self.sg.cam_to_body_R, self.sg.cam_to_body_t
+                R_w2c = R_w2b @ R_c2b
+                t_w2c = t_w2b + (R_w2b @ t_c2b)
                 self.rr_logger.log({
-                    entity_path: rr.Transform3D(
-                        translation=t, quaternion=rotmat_to_quat_xyzw(R)
+                    f"SG/camera": rr.Transform3D(
+                        translation=t_w2c, quaternion=rotmat_to_quat_xyzw(R_w2c)
                     )
                 })
+
+                # pinhole
                 height, width, _ = attrs['image'].shape
-                fx_rgb = 606.040283203125
-                fy_rgb = 606.2955932617188
-                cx_rgb = 328.3797912597656
-                cy_rgb = 245.35792541503906
-                intrinsics = np.array([[fx_rgb, 0, cx_rgb], [0, fy_rgb, cy_rgb], [0, 0, 1]])
                 self.rr_logger.log({
-                    entity_path: rr.Pinhole(
-                        resolution=[width, height], image_from_camera=intrinsics, camera_xyz=rr.ViewCoordinates.RDF,
+                    f"SG/camera":
+                        rr.Pinhole(
+                        resolution=[width, height],
+                        image_from_camera=self.sg.rgb_K,
+                        camera_xyz=rr.ViewCoordinates.RDF,
                     )
                 })
                 self.rr_logger.log({
-                    entity_path: rr.EncodedImage(path=attrs['image_path'])
+                    f"SG/camera": rr.EncodedImage(path=attrs['image_path'])
                 })
+
 
 
 
@@ -1142,7 +1169,10 @@ class BaseVisualGrounder(BaseModel):
                 best_confidence = agg_results.get('best_confidence')
                 enough_observation = (self.exploration_status == 'no_frontier')
                 all_inference_done = (self.inference_queue.qsize() == 0) and (self.inference_signal_queue.qsize() == 0) # TODO: If inference becomes asynchronous, this logic must be updated.
-                enough_time_elapsed = (elapsed >= rospy.Duration(2 * 60))
+                try:
+                    enough_time_elapsed = (elapsed >= rospy.Duration(2 * 60))
+                except:
+                    enough_time_elapsed = (elapsed >= 2 * 60)
                 has_any_result = (self.agg_results.best_answer is not None)
                 
                 # Determine if ready to answer
@@ -1155,8 +1185,8 @@ class BaseVisualGrounder(BaseModel):
                                        or (remaining_time <= rospy.Duration(30)))  # (sec)
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
                     self.rr_log(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='inference')
-                except:
-                    ready_to_answer = (((best_confidence > thres_high and elapsed >= enough_time_elapsed)
+                except Exception as e:
+                    ready_to_answer = (((best_confidence > thres_high and enough_time_elapsed)
                                         or (enough_observation and all_inference_done and has_any_result))
                                        or (remaining_time <= 30))  # (sec)
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
@@ -1238,8 +1268,8 @@ class BaseVisualGrounder(BaseModel):
                                                 target_entity.append(data)
                                     result['data'].update({'pid2eids': self.sg.pid2eids})
                                     answer = Answer(object=target_entity[0], data=result['data'])
-                                    self.log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {target_entity}")
-                                    self.rr_log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {target_entity}", panel='inference')
+                                    self.log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {[e['id'] for e in target_entity]}")
+                                    self.rr_log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {[e['id'] for e in target_entity]}", panel='inference')
                             else:
                                 raise NotImplementedError(f"action must be in ['count'], but {self.action} was given.")
                         except Exception as e:
@@ -1250,6 +1280,57 @@ class BaseVisualGrounder(BaseModel):
                             if answer is not None:
                                 self.agg_results.update(gid=gid, answer=answer, confidence=get_confidence(etype))
                                 self.log(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
+                                eids = self.agg_results.results_by_entity.results.keys()
+                                best_confidence = self.agg_results.best_confidence
+                                eids_with_best_confidence = [eid for eid, data in self.agg_results.results_by_entity.results.items()
+                                                             if data['confidence'] == best_confidence]
+                                if self.action == 'find':
+                                    for (level, id), data in self.sg.G.nodes(data=True):
+                                        if level == str(NodeLevel.OBJECT):
+                                            if id in eids:
+                                                entity_path = f"SG/nodes/{str(level)}/{id}"
+                                                attrs = data.get('_attrs', {})
+
+                                                agg_result = self.agg_results.results_by_entity.results[id]
+                                                confidence = agg_result['confidence']
+                                                count = agg_result['count']
+                                                order = agg_result['order']
+
+                                                centers = np.array([attrs['centroid']], dtype=np.float32)  # (1, 3)
+                                                half_sizes = np.array([attrs['extent']], dtype=np.float32) * 0.5
+                                                quaternions = rotmat_to_quat_xyzw(np.array(attrs['R'])).reshape(1, 4)
+                                                colors = self.rr_logger.palette[int(str(id).split('_')[-1])]
+                                                self.rr_logger.log({
+                                                    entity_path: rr.AnyValues(confidence=f"{confidence:.2f}", count=count),
+                                                })
+                                                label_pos = copy.deepcopy(centers)
+                                                label_pos[:, 2] = 1.5
+                                                self.rr_logger.log({
+                                                    f"{entity_path}/confidence/anchor": rr.Points3D(
+                                                        positions=label_pos,
+                                                        radii=0.08 if id in eids_with_best_confidence else 0.04,
+                                                        colors=colors,
+                                                    )
+                                                })
+                                                self.rr_logger.log({
+                                                    f"{entity_path}/confidence/label": rr.Points3D(
+                                                        positions=label_pos,
+                                                        radii=0.001,
+                                                        labels=[f"{confidence:.2f}"],
+                                                        colors=(255, 255, 255),  # white
+                                                    )
+                                                })
+                                                strips = [np.stack([c, l], axis=0) for c, l in zip(centers, label_pos)]
+                                                rr.log(
+                                                    f"{entity_path}/entity-confidence",
+                                                    rr.LineStrips3D(
+                                                        strips=strips,
+                                                        radii=0.01,
+                                                        colors=colors,
+                                                    )
+                                                )
+                                elif self.action == 'count':
+                                    print("")
                             else:
                                 self.log(f"<inference_loop.4.4.{_}> No updated agg_results")
                         except Exception as e:
@@ -1640,7 +1721,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         super()._init_subscribers(*args, **kwargs)
         
         """ Robot current state """
-        self.odom_sub = rospy.Subscriber("/state_estimation", Odometry, self._odom_callback, queue_size=20)
+        self.odom_sub = rospy.Subscriber("/Odometry", Odometry, self._odom_callback, queue_size=20)
 
         """ Traversable area """
         self.traversable_points = None
@@ -1692,8 +1773,10 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
             "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
         }
-        if self.debug:  # TODO: debug: Save the path_xy
-            _ = save_path_xy(self.agent_pose['position'], base_dir="/ws/external/offline_map", name="agent_pose")
+        if True:  # TODO: debug: Save the path_xy
+            offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
+            # _ = save_path_xy(self.agent_pose['position'], base_dir=offline_map_dir, name="agent_pose")
+            _ = save_pose(self.agent_pose['position'], self.agent_pose['orientation'], base_dir=offline_map_dir)
 
     def _traversable_area_callback(self, msg) -> None:
         if self.traversable_points is None:
@@ -1705,7 +1788,8 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.occupancy_grid = CustomOccupancyGrid(msg)
         if self.debug:
             filename = f"occupancy_grid_{datetime.now().strftime('%Y%m%d_%H%M%S')}.npz"
-            save_path = os.path.join("/ws/external/offline_map/", filename)
+            offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
+            save_path = os.path.join(offline_map_dir, filename)
             self.occupancy_grid.save_npz(save_path)
 
     def _robot_path_callback(self, msg):
@@ -1719,8 +1803,9 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         # else:
         #     self.path_xy = np.zeros((0, 2), dtype=float)
 
-        if self.debug:  # TODO: debug: Save the path_xy
-            _ = save_path_xy(self.path_xy, base_dir="/ws/external/offline_map", name="path_xy")
+        if True:  # TODO: debug: Save the path_xy
+            offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
+            _ = save_path_xy(self.path_xy, base_dir=offline_map_dir, name="path_xy")
 
     def _exploration_status_callback(self, msg):
         self.exploration_status = msg.data
@@ -1776,6 +1861,27 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
     def process(self, **kwargs):
         self.log(f"<process.0> Start")
         self.update_resource(**kwargs)
+        if 'dir' in kwargs:
+            def load_latest_agent_pose(dir_path: str, name: str='agent_pose_'):
+                pose_files = [
+                    os.path.join(dir_path, f)
+                    for f in os.listdir(dir_path)
+                    if f.startswith(name) and f.endswith(".npy")
+                ]
+                if not pose_files:
+                    return None, None
+
+                latest_path = max(pose_files, key=os.path.getmtime)  # 가장 오래된 파일
+                pose = np.load(latest_path)
+                return pose, latest_path
+
+            # self.agent_pose, _ = load_latest_agent_pose(kwargs['dir'])
+            position, _ = load_latest_agent_pose(kwargs['dir'], name='position')
+            orientation, _ = load_latest_agent_pose(kwargs['dir'], name='orientation')
+            self.agent_pose = {'position': position, 'orientation': orientation}
+            print(f"self.agent_pose: {self.agent_pose}")
+
+            self.log(f"<process.0> Read agent_pose from {_}")
 
         # Select Group ID
         num_queries_required = 1 # self.agg_results.min_query
@@ -1928,15 +2034,74 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             else:
                 group_hulls_bef = self.hull_grouper.group_hulls()
                 self.hull_grouper.update(related_objects)
-
-            # self.hull_grouper.visualize(
-            #     image=np.ones((1000, 1000, 3), dtype=np.uint8) * 255,
-            #     meta={'xmin': -1, 'ymax': 4, 'scale': 100, 'pad':0},
-            # )
+            # self.hull_grouper.visualize_grid("/ws/external/vis/hull_grouper-grid.jpg")
 
             now = rospy.Time.now()
             updated_time_diff = now - self.last_update_time_path_points
+
+            # ---
+            if self.agent_pose is not None:
+                if self.agent_pose['position'] is not None and self.agent_pose['orientation'] is not None:
+                    def quat_xyzw_to_R(qx, qy, qz, qw) -> np.ndarray:
+                        """ROS quaternion order: (x,y,z,w) -> 3x3 rotation matrix."""
+                        x, y, z, w = float(qx), float(qy), float(qz), float(qw)
+
+                        xx, yy, zz = x * x, y * y, z * z
+                        xy, xz, yz = x * y, x * z, y * z
+                        wx, wy, wz = w * x, w * y, w * z
+
+                        R = np.array([
+                            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+                            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+                            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+                        ], dtype=np.float32)
+                        return R
+
+                    def body_pose_to_camera_xytheta(
+                            pos_xyz, quat_xyzw,
+                            cam_to_body_R, cam_to_body_t,
+                    ) -> np.ndarray:
+                        """
+                        Inputs:
+                          pos_xyz: (3,) body position in world
+                          quat_xyzw: (4,) body orientation in world (ROS order x,y,z,w)
+                          cam_to_body_R: (3,3) R_b_c (camera -> body)
+                          cam_to_body_t: (3,)  t_b_c (camera origin expressed in body frame)
+                        Output:
+                          camera_pose_xytheta: (3,) [x_cam_world, y_cam_world, theta_cam_world]
+                        """
+                        px, py, pz = map(float, pos_xyz)
+                        qx, qy, qz, qw = quat_xyzw
+
+                        # world <- body
+                        R_w_b = quat_xyzw_to_R(qx, qy, qz, qw)
+                        p_w_b = np.array([px, py, pz], dtype=np.float32)
+
+                        # body <- cam  (given)
+                        R_b_c = np.asarray(cam_to_body_R, dtype=np.float32)
+                        t_b_c = np.asarray(cam_to_body_t, dtype=np.float32).reshape(3)
+
+                        # world <- cam
+                        R_w_c = R_w_b @ R_b_c
+                        p_w_c = p_w_b + (R_w_b @ t_b_c)
+
+                        # yaw(theta) from R_w_c (world XY plane, +X 기준 CCW)
+                        theta = float(np.arctan2(R_w_c[1, 0], R_w_c[0, 0]))
+
+                        return np.array([p_w_c[0], p_w_c[1], theta], dtype=np.float32)
+
+                    cam_pose = body_pose_to_camera_xytheta(
+                        self.agent_pose['position'],
+                        self.agent_pose['orientation'],
+                        self.sg.cam_to_body_R,
+                        self.sg.cam_to_body_t
+                    )
+
+                    self.hull_grouper.update_visibility(
+                        cam_pose, fov_rad=self.sg.fov_x, max_range=self.sg.max_range)
             group_hulls = self.hull_grouper.group_hulls()
+            # self.hull_grouper.visualize_group_hulls("/ws/external/vis/hull_grouper-group_hulls.jpg")
+            # self.hull_grouper.visualize_grid_with_hulls("/ws/external/vis/hull_grouper-grid_with_hulls.jpg")
 
             is_equal_group_hulls = is_equal(group_hulls_bef, group_hulls)
             if is_equal_group_hulls and (updated_time_diff < self.update_interval_path_points):
@@ -1954,6 +2119,44 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             for _, group in enumerate(group_hulls): # TODO: Add traversable_area
                 hull_xy = group['hull']
                 gid = group['gid']
+                edge_visible = group['edge_visible']
+
+                if hull_xy.size == 0:
+                    continue
+
+                # Visualize
+                M = len(hull_xy)
+                z = np.full((M, 1), self.sg.z_const, dtype=np.float32)
+                hull_xyz = np.hstack([hull_xy, z])
+                hull_xyz = np.vstack([hull_xyz, hull_xyz[0]])
+
+                vis_segs = {
+                    True: {
+                        'name': 'visible',
+                        'color': (0, 255, 0), # green
+                        'segs': []
+                    },
+                    False: {
+                        'name': 'non_visible',
+                        'color': (255, 0, 0), # red
+                        'segs': []
+                    },
+                }
+                # vis_segs, nvis_segs = [], []
+                for i in range(M):
+                    p0, p1 = hull_xyz[i], hull_xyz[(i + 1) % M]
+                    vis_segs[edge_visible[i]]['segs'].append(np.stack([p0, p1], axis=0))
+                for k, v in vis_segs.items():
+                    name, segs, color = v['name'], v['segs'], v['color']
+                    if len(segs) > 0:
+                        self.rr_logger.log({
+                            f"SG/groups/{gid}/{name}":
+                                rr.LineStrips3D(segs, colors=[color], radii=[0.03])
+                        })
+                # self.rr_logger.log({
+                #     f'SG/groups/{gid}/hull':
+                #         rr.LineStrips3D([hull_xyz], colors=[self.rr_logger.palette[int(gid)]], radii=[0.02])
+                # })
 
                 nearest_points = find_closest_point(hull_xy, self.traversable_points)
                 if nearest_points.shape[1] == 2:
@@ -2280,8 +2483,10 @@ if __name__ == "__main__":
         target_name = "pillow closest to the book on the stool"
         candidate_names, reference_names = ['pillow'], ['book', 'stool']
     elif SCENE == 'vla_js_chair_2025-12-17-12-17-43':
-        instruction = "Find the chair with a blue seat."
-        action = 'find'
+        # instruction = "Find the chair with a blue seat."
+        # action = 'find'
+        instruction = "How many chairs with a blue seat."
+        action = 'count'
         target_name = "chair with a blue seat"
         candidate_names, reference_names = ['chair'], []
     else:
