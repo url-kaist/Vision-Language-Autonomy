@@ -35,8 +35,6 @@ import open3d as o3d
 from scipy.spatial.transform import Rotation, Slerp
 from collections import defaultdict
 
-from multiprocessing import shared_memory
-
 import sys
 sys.path.append("/ws/external/ai_module/src/sem/mmyolo/")
 
@@ -97,6 +95,22 @@ scene = "scene"
 import multiprocessing as mp
 import queue as pyqueue
 mp.set_start_method('spawn', force=True)
+
+from multiprocessing import shared_memory
+
+
+def cleanup_shared_memory():
+    for shm_name in ("object_shm", "scene_graph_shm"):
+        try:
+            shm = shared_memory.SharedMemory(name=shm_name)
+            shm.close()
+            shm.unlink()
+            print(f"[cleanup_shared_memory] Deleted shared memory '{shm_name}'")
+        except FileNotFoundError:
+            print(f"[cleanup_shared_memory] No such file named '{shm_name}'")
+            pass
+        except Exception:
+            pass
 
 class LabelAnnotator(sv.LabelAnnotator):
 
@@ -269,8 +283,8 @@ class SceneGraphProcessor:
         self.last_keyframe_pose = None
 
         # offline_map save control
-        self.offline_map_pose_threshold = 0.5   # [m]
-        self.offline_map_angle_threshold = 30.0 # [deg]
+        self.offline_map_pose_threshold = float(config.get("offline_map_pose_threshold", 0.3))   # [m]
+        self.offline_map_angle_threshold = float(config.get("offline_map_angle_threshold", 20.0)) # [deg]
         self.last_offline_map_pose = None
         
         self.last_current_keyframe_time = 0 # JAY
@@ -373,7 +387,7 @@ class SceneGraphProcessor:
             if self.is_real_world:
                 print("ApproximateTimeSynchronizer with depth (real world, no lidar)")
                 self.sync_sub = ApproximateTimeSynchronizer(
-                    [self.rgb_sub, self.depth_sub], queue_size=10, slop=0.01
+                    [self.rgb_sub, self.depth_sub], queue_size=15, slop=0.05
                 )
             else:
                 print("ApproximateTimeSynchronizer with depth + lidar")
@@ -396,7 +410,14 @@ class SceneGraphProcessor:
             self.dbscan_eps = 0.5
         else:
             self.dbscan_eps = 0.2
-        self.keyframe_dist = 0.5 if self.is_real_world else 3.0
+
+        # keyframe / pose 변화 임계값 (config에서 설정 가능)
+        if self.is_real_world:
+            self.keyframe_dist = float(config.get("keyframe_dist_real", 0.5))
+            self.keyframe_angle_deg = float(config.get("keyframe_angle_deg_real", 10.0))
+        else:
+            self.keyframe_dist = float(config.get("keyframe_dist_sim", 3.0))
+            self.keyframe_angle_deg = float(config.get("keyframe_angle_deg_sim", 10.0))
 
         self.hash_map_pub = rospy.Publisher(
             "/hash_map", PointCloud2, queue_size=1
@@ -926,17 +947,19 @@ class SceneGraphProcessor:
             del self.objects[new_id]
 
 
-    def position_changed_enough(self, cur_pose, prev_pose, keyframe_dist=1.5, keyframe_deg=400.0):
+    # def position_changed_enough(self, cur_pose, prev_pose, keyframe_dist=1.5, keyframe_deg=400.0):
+    #     if self.last_keyframe_pose is None:
+    #         return True
+    #     dist = get_distance_between_poses(cur_pose, prev_pose)
+    #     return dist > keyframe_dist #  or angle > keyframe_deg
+    
+    def pose_changed_enough(self, cur_pose, prev_pose, keyframe_dist=None, keyframe_deg=None):
         if self.last_keyframe_pose is None:
             return True
-        dist = get_distance_between_poses(cur_pose, prev_pose)
-        # angle = get_angle_between_poses(cur_pose, prev_pose)
-
-        # self.logger.log(f"[KEYFRAME] Distance from last keyframe: {dist:.2f} m (threshold: {keyframe_dist} m)")
-        return dist > keyframe_dist #  or angle > keyframe_deg
-    def pose_changed_enough(self, cur_pose, prev_pose, keyframe_dist=0.1, keyframe_deg=0.1):
-        if self.last_keyframe_pose is None:
-            return True
+        if keyframe_dist is None:
+            keyframe_dist = self.keyframe_dist
+        if keyframe_deg is None:
+            keyframe_deg = self.keyframe_angle_deg
         dist = get_distance_between_poses(cur_pose, prev_pose)
         angle = get_angle_between_poses(cur_pose, prev_pose)
 
@@ -1200,14 +1223,16 @@ class SceneGraphProcessor:
         iter = 0
         while self.running and not rospy.is_shutdown():
             if not self.already_set_classes:
-                self.logger.log(f"Wait for classes...")
+                # self.logger.log(f"Wait for classes...")
                 rospy.sleep(0.01)
                 continue
 
-            # self.logger.log(f"\n--- Iteration {iter} ---")
+            self.logger.log(f"--- Iteration {iter} ---")
             self.merge_detections_every_n_iter(iter, 5)
             iter += 1
+            t0 = time.time()
             stamp, boxes = self.get_latest_blocking(self.yolo_queue)
+            yolo_time = time.time() - t0
             with self.lock:
                 synced_data = self.sync_queue.pop(stamp, None)
             if synced_data is None:
@@ -1310,6 +1335,7 @@ class SceneGraphProcessor:
                     # 여기서는 YOLO 박스만 그리고, depth 기반 포인트 투영은
                     # 아래에서 obj_clouds_world 결과를 가지고 다시 그린다.
 
+            t2 = time.time()
             sam_results = self.sam_model.predict(
                 image.copy(), bboxes=bounding_boxes, verbose=False,
             )
@@ -1786,7 +1812,7 @@ class SceneGraphProcessor:
                         "bbox": bounding_box,
                         # "bboxes": bounding_box, # DSHONG
                     })
-                    print(f"{tracking_id} bounding_box {bounding_box}")
+                    # print(f"{tracking_id} bounding_box {bounding_box}")
 
             self.logger.log(f"\033[94m✅ -1: {track_fail_num}, all: {all_num}, filtered: {filtered1_num}, {filtered2_num}, {filtered3_num}, {filtered4_num}, tracked: {tracked_num}, diff_cls: {diff_cls_num}, merged: {merged_num}, new: {new_detected_num}\033[0m")
             
@@ -1810,7 +1836,7 @@ class SceneGraphProcessor:
             if self.keyframe_counter == 0 \
                     or (self.pose_changed_enough(cur_pose, self.last_keyframe_pose)):
                 
-                # self.logger.log("======= Pose Change Enough =======")
+                self.logger.log("======= Pose Change Enough =======")
                 self.prev_objects = len(self.objects)
                 # self.new_detection_signal = False
 
@@ -1840,8 +1866,16 @@ class SceneGraphProcessor:
             self.object_markers = self.create_object_markers()
             t6 = time.time()
 
-            # self.logger.log(f"graph: {t21 - t1:.3f}, {t2 - t21:.3f}, model: {t3 - t2:.3f}, proj: {t4 - t3:.3f}, merge: {t5 - t4:.3f}, pub: {t6 - t5:.3f}, total: {t6 - t1:.3f} sec")
-            # self.logger.log(f"time: {t6 - t1:3f} s")
+            self.logger.log(
+                "[timing] "
+                f"yolo={yolo_time:.3f}s "
+                f"prep={t2 - t1:.3f}s "
+                f"sam={t3 - t2:.3f}s "
+                f"seg3d={t4 - t3:.3f}s "
+                f"merge={t5 - t4:.3f}s "
+                f"markers={t6 - t5:.3f}s "
+                f"total={t6 - t1:.3f}s"
+            )
 
             # torch cuda empty
             torch.cuda.empty_cache()
@@ -2888,6 +2922,7 @@ class SceneGraphProcessor:
 
 
 if __name__ == "__main__":
+    cleanup_shared_memory()
     rospy.init_node("scene_graph_processor")
     processor = SceneGraphProcessor()
     rospy.spin()

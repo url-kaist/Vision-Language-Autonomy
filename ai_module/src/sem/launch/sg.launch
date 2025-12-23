@@ -2,7 +2,7 @@
     <arg name="quiet" default="false"/>
     <arg name="debug" default="false"/>
 
-    <arg name="real_world" default="false"/>
+    <arg name="real_world" default="true"/>
     <param name="/real_world" value="$(arg real_world)"/>
   
     <group if="$(arg real_world)">
@@ -14,10 +14,10 @@
         <remap from="/state_estimation" to="/Odometry"/>
         <remap from="/camera/depth_image" to="/UGV4/camera/depth/image_rect_raw"/>
 
-        <node name="traversable_authority" pkg="traversable_authority" type="traversable_authority_node.py" output="screen">
+        <!-- <node name="traversable_authority" pkg="traversable_authority" type="traversable_authority_node.py" output="screen">
             <param name="quiet" value="$(arg quiet)"/>
             <param name="real_world" value="$(arg real_world)"/>
-        </node>
+        </node> -->
         <node pkg="sem" type="scene_graph_node" name="scene_graph_node" output="screen" required="true">
             <param name="quiet" value="$(arg quiet)"/>
             <param name="config" value="$(arg config)"/>
