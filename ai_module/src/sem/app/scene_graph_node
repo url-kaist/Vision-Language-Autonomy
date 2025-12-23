@@ -116,7 +116,7 @@ class SceneGraphProcessor:
         quiet = rospy.get_param('~quiet', False)
         self.logger = Logger(
             quiet=quiet, prefix='SceneGraph', log_path="/ws/external/log/scene_graph.log")
-        base_dir = '/ws/external/offline_map'  # TODO: handle this using .json config file
+        base_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
         if os.path.exists(base_dir) and os.path.isdir(base_dir):
             shutil.rmtree(base_dir)
         os.makedirs(base_dir, exist_ok=True)
@@ -351,7 +351,10 @@ class SceneGraphProcessor:
                 self.rgb_sub = Subscriber("/camera/image", Image)
             if self.use_depth_for_seg:
                 self.logger.loginfo(f"Depth sync enabled (real), topic=/camera/depth_image")
-                self.depth_sub = Subscriber("/camera/depth_image", Image)
+                if self.is_compressed_image:
+                    self.depth_sub = Subscriber("/camera/depth_image/compressed", Image)
+                else:
+                    self.depth_sub = Subscriber("/camera/depth_image", Image)
             self.yolo_debug_img_pub = rospy.Publisher("/debug/yolo_image", Image, queue_size=1)
             self.debug_publish_rate = 2.0  # Hz
             self.last_debug_pub_time = rospy.Time(0)
@@ -531,7 +534,11 @@ class SceneGraphProcessor:
                 return
 
             try:
-                depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
+                if self.is_compressed_image:
+                    np_arr = np.frombuffer(depth_msg.data, np.uint8)
+                    depth = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                else:
+                    depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
             except Exception:
                 depth = None
         else:
@@ -554,7 +561,7 @@ class SceneGraphProcessor:
                 t1, T1 = self.odom_queue[i + 1]
                 if t0 <= target_stamp <= t1:
                     ratio = float(target_stamp - t0) / float(t1 - t0)
-                    times = [0.0, 0.5]
+                    times = [0.0, 1.0]
                     rotations = Rotation.from_matrix([T0[:3, :3], T1[:3, :3]])
                     slerp = Slerp(times, rotations)
 
@@ -2530,7 +2537,7 @@ class SceneGraphProcessor:
                     )
 
         # base_dir = '/ws/external/vla_ws/CMU-VLA-Challenge/ai_module/offline_map' #'/ws/external/offline_map'
-        base_dir = '/ws/external/offline_map' # TODO: handle this using .json config file
+        base_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
         save_dir = None
         if save_to_disk:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

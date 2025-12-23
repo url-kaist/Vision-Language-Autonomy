@@ -42,7 +42,7 @@ class SceneGraphClients(BaseModel):
         # get_scene_graph
         self.scene_graph_shm_name = "scene_graph_shm"
         self.scene_graph_obj_shm_name = "object_shm"
-        self.offline_map_dir = "/ws/external/offline_map"
+        self.offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
 
         if use_ros:
             for func_name, client in self.clients.items():

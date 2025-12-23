@@ -104,7 +104,7 @@ if __name__ == "__main__":
     )
     active_clients = ActiveClients(logger_cfg=logger_cfg, use_ros=False)
 
-    DATA_DIR = "/ws/external/offline_map"
+    DATA_DIR = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
     dirs = [os.path.join(DATA_DIR, d) for d in os.listdir(DATA_DIR)
             if os.path.isdir(os.path.join(DATA_DIR, d))]
     dir_sorted = sorted(dirs, key=os.path.getmtime)

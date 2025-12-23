@@ -176,6 +176,18 @@ class SceneGraph:
         )
         self.cam_to_body_t = np.zeros(3, dtype=np.float32)
 
+        self.image_height, self.image_width = 480, 640
+        self.z_const = -0.40
+        self.max_range = 8.0
+
+    @property
+    def fov_x(self):
+        return 2 * np.arctan(self.image_width / (2 * self.fx_rgb))
+
+    @property
+    def fov_y(self):
+        return 2 * np.arctan(self.image_height / (2 * self.fy_rgb))
+
     def save_path(self, etype, fname='', suffix=''):
         save_path = os.path.join(self.save_dir, etype)
         if not os.path.exists(save_path):
@@ -196,21 +208,7 @@ class SceneGraph:
         self._lock = threading.Lock()
 
     def update(self, scene_graph, objects, **kwargs) -> None:
-        # try:
-        #     # ROS version
-        #     for data in scene_graph.get('nodes', []):
-        #         level = data.pop('level')
-        #         id = data.pop('id')
-        #         if id < 0:
-        #             continue
-        #         NodeCls = _NODE_LEVEL_TO_CLS[level]
-        #         node = NodeCls(id=id, **data)
-        #         self.G.add_node(node.id, **node.__dict__)
-        #         print(f"Add node: {node}")
-        #
-        # except:
-        #     # Python version
-        with self._lock:
+        with (self._lock):
             for data in scene_graph.get('nodes', []):
                 level = data.pop('level')
                 id = data.pop('id')
@@ -219,6 +217,12 @@ class SceneGraph:
 
                 NodeCls = _NODE_LEVEL_TO_CLS[level]
                 node = NodeCls(id=id, **data)
+
+                if level == str(NodeLevel.KEYFRAME) and \
+                    (self.image_width is None or self.image_height is None):
+                    image = cv2.imread(data['image_path'])
+                    self.image_height, self.image_width = image.shape[:-1]
+
                 self.G.add_node(node.id, **node.__dict__)
                 print(f"Add node: {node}")
 
