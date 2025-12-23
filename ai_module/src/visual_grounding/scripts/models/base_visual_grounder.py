@@ -53,7 +53,8 @@ except:
     sys.path.append("/ws/external/ai_module/src/utils/debug")
     import ai_module.src.utils.debug
     import rospy
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, CompressedImage
+from sensor_msgs.msg import Image as RosImage
 from nav_msgs.msg import Path
 from nav_msgs.msg import Odometry
 from nav_msgs.msg import OccupancyGrid
@@ -63,6 +64,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from visual_grounding.srv import SetSubplans, SetSubplansResponse
 from std_srvs.srv import Trigger, TriggerResponse
 from ai_module.src.utils.rr_logger import RRLogger, rotmat_to_quat_xyzw
+from cv_bridge import CvBridge
 
 
 def theta_from_agent_pose(orientation):
@@ -394,7 +396,11 @@ class BaseVisualGrounder(BaseModel):
     def _init_subscribers(self, *args, **kwargs):
         # Subscribe to active nodes topic from manager    
         self.active_nodes_sub = rospy.Subscriber("/active_nodes", String, self._active_nodes_callback, queue_size=1)
-        
+        self.logger.loginfo(f"Init subscribers: /active_node")
+        # self.rgb_sub = rospy.Subscriber("/UGV4/camera/color/image_raw", Image, self._img_callback, queue_size=1)
+        self.rgb_sub = rospy.Subscriber("/UGV4/camera/color/image_raw", RosImage, self._img_callback, queue_size=1)
+        self.logger.loginfo(f"Init subscribers: /UGV4/camera/color/image_raw")
+
         # Subscribe to system start time (latched)
         self.system_start_time_sub = rospy.Subscriber(
             "/system_start_time", Clock, self._system_start_time_callback, queue_size=1
@@ -512,6 +518,27 @@ class BaseVisualGrounder(BaseModel):
         self.system_start_ros = msg.clock
         self.system_start_received = True
 
+
+    def _img_callback(self, msg):
+        try:
+            self.log(f"IMAGE CALLBACK) COMPRESSED?")
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        except:
+            self.log(f"IMAGE CALLBACK) RAW?")
+            bgr = CvBridge().imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        self.rr_logger.log({'obs/rgb': rr.Image(image=rgb)})
+        if self.debug:
+            offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
+            subdirs = [d for d in glob.glob(os.path.join(offline_map_dir, "*")) if os.path.isdir(d)]
+            if not subdirs:
+                return
+            latest_dir = max(subdirs, key=os.path.getmtime)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            save_path = os.path.join(latest_dir, f"rgb_{timestamp}.jpg")
+            cv2.imwrite(save_path, rgb)
 # PROPERTIES
     @property
     def confidence_threshold(self):
@@ -1773,7 +1800,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
             "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
         }
-        if True:  # TODO: debug: Save the path_xy
+        if self.debug:  # TODO: debug: Save the path_xy
             offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
             # _ = save_path_xy(self.agent_pose['position'], base_dir=offline_map_dir, name="agent_pose")
             _ = save_pose(self.agent_pose['position'], self.agent_pose['orientation'], base_dir=offline_map_dir)
@@ -1862,7 +1889,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.log(f"<process.0> Start")
         self.update_resource(**kwargs)
         if 'dir' in kwargs:
-            def load_latest_agent_pose(dir_path: str, name: str='agent_pose_'):
+            def load_latest_data(dir_path: str, name: str='agent_pose_'):
                 pose_files = [
                     os.path.join(dir_path, f)
                     for f in os.listdir(dir_path)
@@ -1872,15 +1899,20 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     return None, None
 
                 latest_path = max(pose_files, key=os.path.getmtime)  # 가장 오래된 파일
-                pose = np.load(latest_path)
-                return pose, latest_path
+                if latest_path.endswith("jpg"):
+                    data = cv2.imread(latest_path)
+                else:
+                    data = np.load(latest_path)
+                return data, latest_path
 
             # self.agent_pose, _ = load_latest_agent_pose(kwargs['dir'])
-            position, _ = load_latest_agent_pose(kwargs['dir'], name='position')
-            orientation, _ = load_latest_agent_pose(kwargs['dir'], name='orientation')
+            position, _ = load_latest_data(kwargs['dir'], name='position')
+            orientation, _ = load_latest_data(kwargs['dir'], name='orientation')
             self.agent_pose = {'position': position, 'orientation': orientation}
             print(f"self.agent_pose: {self.agent_pose}")
 
+            rgb, _ = load_latest_data(kwargs['dir'], name='rgb')
+            self.rr_logger.log({'obs/rgb': rr.Image(rgb)})
             self.log(f"<process.0> Read agent_pose from {_}")
 
         # Select Group ID
@@ -2324,7 +2356,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
         try:
             if len(current_path_points) == 0:
-                current_eids = set(self.hull_grouper.dsu.idx.keys()) & set(self.sg.get_candidate_entities('all').ids)
+                current_eids = set(self.hull_grouper.dsu.idx.keys()) & set(self.sg.get_candidate_entities())
                 if self.action == 'find':
                     unprocessed_eids = [eid for eid in current_eids
                                         if self.agg_results.results_by_entity.num_queries.get(eid, 0) <= 0]

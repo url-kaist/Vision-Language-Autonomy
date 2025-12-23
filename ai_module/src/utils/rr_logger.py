@@ -107,6 +107,11 @@ class RRLogger:
                     # (2) 우측 패널: 2D 이미지 + 선택 패널
                     rrb.Vertical(
                         rrb.Spatial2DView(
+                            name="Observation",
+                            origin="/",
+                            contents=[f"obs/**"],
+                        ),
+                        rrb.Spatial2DView(
                             name="Keyframe Image",
                             origin=f"{prefix_sg}",
                             contents=[f"{prefix_sg}/nodes/NodeLevel.KEYFRAME/**"],
@@ -114,13 +119,7 @@ class RRLogger:
                         rrb.SelectionPanel(),
                     ),
                 ),
-                
-                # rrb.TextLogView(
-                # name="Logs",
-                # origin="/",
-                # contents=[f"{log_root}/**"],
-                # ),
-                
+
                 rrb.Vertical(
                     rrb.Horizontal(
                         rrb.TextLogView(
