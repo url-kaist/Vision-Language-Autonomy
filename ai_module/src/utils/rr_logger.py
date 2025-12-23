@@ -96,34 +96,31 @@ class RRLogger:
             prefix_sg = "SG"
             log_root = "VG/"
             blueprint = rrb.Blueprint(
-                rrb.Horizontal(
-                    # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
-                    rrb.Spatial3DView(
-                        name="SceneGraph 3D",
-                        origin="/",
-                        contents=[f"SG/**"],
-                    ),
-
-                    # (2) 우측 패널: 2D 이미지 + 선택 패널
-                    rrb.Vertical(
-                        rrb.Spatial2DView(
-                            name="Observation",
+                rrb.Vertical(
+                    rrb.Horizontal(
+                        # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
+                        rrb.Spatial3DView(
+                            name="SceneGraph 3D",
                             origin="/",
-                            contents=[f"obs/**"],
+                            contents=[f"SG/**"],
                         ),
-                        rrb.Spatial2DView(
-                            name="Keyframe Image",
-                            origin=f"{prefix_sg}",
-                            contents=[f"{prefix_sg}/nodes/NodeLevel.KEYFRAME/**"],
+
+                        # (2) 우측 패널: 2D 이미지 + 선택 패널
+                        rrb.Vertical(
+                            rrb.Spatial2DView(
+                                name="Observation",
+                                origin="/",
+                                contents=[f"obs/**"],
+                            ),
+                            rrb.Spatial2DView(
+                                name="Keyframe Image",
+                                origin=f"{prefix_sg}",
+                                contents=[f"{prefix_sg}/nodes/NodeLevel.KEYFRAME/**"],
+                            ),
+                            rrb.SelectionPanel(),
                         ),
-                        rrb.SelectionPanel(),
                     ),
                     rrb.Horizontal(
-                        # rrb.TextLogView(
-                        #     name="VG/summary",
-                        #     origin="/",
-                        #     contents=[f"{log_root}/summary/**"],
-                        # ),
                         rrb.Vertical(
                             rrb.TextLogView(
                                 name="VG/summary/task",
@@ -144,9 +141,8 @@ class RRLogger:
                         ),
                         column_shares=[1, 1],
                     ),
-
-                    row_shares=[1, 1],
                 ),
+                # row_shares=[1, 1],
 
                 rrb.Vertical(
                     rrb.Horizontal(
