@@ -78,6 +78,12 @@ class EntityType:
 make_error_etype = lambda etype: f"entity_type must be in {list(EntityType.values())}, but {etype} was given."
 
 
+def fmt(v, placeholder="-"):
+    if v is None:
+        return placeholder
+    s = str(v)
+    return s if s.strip() else placeholder
+
 def save_path_xy(path_xy: np.ndarray, base_dir="/ws/external/offline_map", name="path_xy"):
     subdirs = [d for d in glob.glob(os.path.join(base_dir, "*")) if os.path.isdir(d)]
     if not subdirs:
@@ -424,11 +430,11 @@ class BaseVisualGrounder(BaseModel):
             self.logger.loginfo(f"Reference names: {self.reference_names}")
             self.logger.loginfo(f"Related names: {self.related_names}")
             
-            self.rr_log(f"Instruction: \"{req.text_instruction}\"", panel='default')
-            self.rr_log(f"Action: \"{subtask.action}\"", panel='default')
-            self.rr_log(f"Target Name: \"{subtask.entity.target_name}\"", panel='default')
-            self.rr_log(f"Candidate names: {self.candidate_names}", panel='default')
-            self.rr_log(f"Reference names: {self.reference_names}", panel='default')
+            self.rr_log(f"Instruction: \"{req.text_instruction}\"", panel=['default', 'summary/task'])
+            self.rr_log(f"Action: \"{subtask.action}\"", panel=['default', 'summary/task'])
+            self.rr_log(f"Target Name: \"{subtask.entity.target_name}\"", panel=['default', 'summary/task'])
+            self.rr_log(f"Candidate names: {self.candidate_names}", panel=['default', 'summary/task'])
+            self.rr_log(f"Reference names: {self.reference_names}", panel=['default', 'summary/task'])
             return SetSubplansResponse(success=True, message=self.status)
         else:
             return SetSubplansResponse(success=False, message=self.status)
@@ -441,7 +447,7 @@ class BaseVisualGrounder(BaseModel):
         self.logger.logrich(f"Target Name: ", name='target_name')
         self.logger.logrich(f"Inference: ", name='inference')
         self.logger.log("Visual grounding node has been reset.")
-        self.rr_log("Visual grounding node has been reset.", panel='default')
+        self.rr_log("Visual grounding node has been reset.", panel=['default', 'summary/task'])
         
         return TriggerResponse(success=True, message="Visual grounding node has been reset.")
 
@@ -561,12 +567,25 @@ class BaseVisualGrounder(BaseModel):
     def spin_once(self, event, **kwargs):
         self.log_status()
         
-        current_main_state = ""
-        current_main_state += f"Status: {self.status} | "
-        current_main_state += f"#inference_queue={len(self.inference_queue.queue)} | "
-        current_main_state += f"Answer: {self.answer} | "
-        current_main_state += f"MinQuery: {self.agg_results.min_query}"
-        self.rr_log(current_main_state, panel='main')
+        # current_main_state = ""
+        # current_main_state += f"Status: {self.status} | "
+        # current_main_state += f"#inference_queue={len(self.inference_queue.queue)} | "
+        # current_main_state += f"Answer: {self.answer} | "
+        # current_main_state += f"MinQuery: {self.agg_results.min_query}"
+        
+        status = fmt(self.status)
+        nq = fmt(self.agg_results.min_query)
+        ans = fmt(self.answer)
+
+        n_infer = len(self.inference_queue.queue)
+
+        current_main_state = (
+            f"Status: {status:<10} | "
+            f"#inferQ: {n_infer:>4d} | "
+            f"Answer: {ans:<10}"
+        )
+        
+        self.rr_log(current_main_state, panel=['main', 'summary/status'])
         if self.status == Status.STANDBY:
             self.log_status()
             self.standby()
@@ -1131,6 +1150,7 @@ class BaseVisualGrounder(BaseModel):
                     agg_results = self.agg_results.snapshot()
                 self.log(f"<inference_loop.2> AggResults: {self.agg_results}")
                 self.rr_log(f"<inference_loop.2> AggResults: {self.agg_results}", panel='inference')
+                self.rr_log(f"AggResults: {self.agg_results}", panel='summary/status')
             except Exception as e:
                 self.log(f"<inference_loop.2> Error occurs: {e}", level='error')
                 self.rr_log(f"<inference_loop.2> Error occurs: {e}", panel='inference', level='error')
@@ -1155,38 +1175,46 @@ class BaseVisualGrounder(BaseModel):
                                        or (remaining_time <= rospy.Duration(30)))  # (sec)
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
                     self.rr_log(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='inference')
+                    self.rr_log(f"Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='summary/status')
                 except:
                     ready_to_answer = (((best_confidence > thres_high and elapsed >= enough_time_elapsed)
                                         or (enough_observation and all_inference_done and has_any_result))
                                        or (remaining_time <= 30))  # (sec)
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
                     self.rr_log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='inference')
+                    self.rr_log(f"Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='summary/status')
 
                 if ready_to_answer:
                     self.answer_result = self.agg_results.best_answer  # TODO
                     self.answer_the_question(self.answer_result)
-                    self.rr_log(f"Answer: {self.answer_result}", panel='default')
+                    self.rr_log(f"Answer: {self.answer_result}", panel=['default', 'summary/task'])
                     
                     if best_confidence > thres_high:
                         self.log(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} > {thres_high}.")
                         self.rr_log(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} > {thres_high}.", panel='inference')
+                        self.rr_log(f"Answer the final result. Confidence: {best_confidence} > {thres_high}.", panel='summary/status')
                     elif enough_observation and all_inference_done and has_any_result:
                         self.log(f"<inference_loop.3.2> Answer the final result. Enough observation and all inference done.")
                         self.rr_log(f"<inference_loop.3.2> Answer the final result. Enough observation and all inference done.", panel='inference')
+                        self.rr_log(f"Answer the final result. Enough observation and all inference done.", panel='summary/status')
                     else:
                         self.log(f"<inference_loop.3.2> Answer the final result. Time is almost up {remaining_time.to_sec()} sec left.")
                         self.rr_log(f"<inference_loop.3.2> Answer the final result. Time is almost up {remaining_time.to_sec()} sec left.", panel='inference')
+                        self.rr_log(f"Answer the final result. Time is almost up {remaining_time.to_sec()} sec left.", panel='summary/status')
                     return
                 else:                    
                     if best_confidence <= thres_high:
                         self.log(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} <= {thres_high}.")
                         self.rr_log(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} <= {thres_high}.", panel='inference')
+                        self.rr_log(f"Let's inference. Confidence: {best_confidence} <= {thres_high}.", panel='summary/status')
                     elif not enough_time_elapsed:
                         self.log(f"<inference_loop.3.2> Let's inference. Not enough time elapsed yet. {int(elapsed.to_sec())} sec passed.")
                         self.rr_log(f"<inference_loop.3.2> Let's inference. Not enough time elapsed yet. {int(elapsed.to_sec())} sec passed.", panel='inference')
+                        self.rr_log(f"Let's inference. Not enough time elapsed yet. {int(elapsed.to_sec())} sec passed.", panel='summary/status')
                     else:
                         self.log(f"<inference_loop.3.2> Let's inference.")
                         self.rr_log(f"<inference_loop.3.2> Let's inference.", panel='inference')
+                        self.rr_log(f"Let's inference.", panel='summary/status')
             except Exception as e:
                 self.log(f"<inference_loop.3.1&2> Error occurs: {e}", level='error')
                 self.rr_log(f"<inference_loop.3.1&2> Error occurs: {e}", panel='inference', level='error')
@@ -1219,14 +1247,17 @@ class BaseVisualGrounder(BaseModel):
                                     answer = Answer(count=count, data=result['data'])
                                 self.log(f"<inference_loop.4.3.{_}> Answer(count={count})")
                                 self.rr_log(f"<inference_loop.4.3.{_}> Answer(count={count})", panel='inference')
+                                self.rr_log(f"Answer(count={count})", panel='details')
                             elif self.action == 'find':
                                 if len(target_ids) > 1:
                                     self.log(f"<inference_loop.4.3.{_}> #target_ids={len(target_ids)} > 1", level='warn')
                                     self.rr_log(f"<inference_loop.4.3.{_}> #target_ids={len(target_ids)} > 1", panel='inference', level='warn')
+                                    self.rr_log(f"#target_ids={len(target_ids)} > 1", panel='details', level='warn')
                                 elif len(target_ids) == 0:
                                     answer = None
                                     self.log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: X")
                                     self.rr_log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: X", panel='inference')
+                                    self.rr_log(f"Answer: {answer};  target_entity: X", panel='details')
                                 else:
                                     target_id = int(target_ids[0])
                                     # candidate_entities = self.sg.get_candidate_entities('all')
@@ -1240,6 +1271,7 @@ class BaseVisualGrounder(BaseModel):
                                     answer = Answer(object=target_entity[0], data=result['data'])
                                     self.log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {target_entity}")
                                     self.rr_log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {target_entity}", panel='inference')
+                                    self.rr_log(f"Answer: {answer};  target_entity: {target_entity}", panel='details')
                             else:
                                 raise NotImplementedError(f"action must be in ['count'], but {self.action} was given.")
                         except Exception as e:
@@ -1465,27 +1497,27 @@ class BaseVisualGrounder(BaseModel):
             self.log(result_text)
             self.log(f"<query_worker.4> Print the log")
             
-            self.rr_log(result_text, panel='inference')
+            self.rr_log(result_text, panel=['inference', 'details'])
 
             # Verify
             phase = 5
             if self.action in ['find']:
                 if len(target_ids) > 1:
                     self.log(f"Object ids mismatch: len(target_ids)={len(target_ids)} != 1", level='warn')
-                    self.rr_log(f"Object ids mismatch: len(target_ids)={len(target_ids)} != 1", panel='inference', level='warn')
+                    self.rr_log(f"Object ids mismatch: len(target_ids)={len(target_ids)} != 1", panel=['inference', 'details'], level='warn')
                     return None
             else:
                 if self.default_inference_options['prompt']['action'] == 'follow_between' \
                         and self.default_inference_options['prompt']['rtype'] == 'inference' \
                         and len(target_ids) != 2:
                     self.logger.logwarn(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 2")
-                    self.rr_log(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 2", panel='inference', level='warn')
+                    self.rr_log(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 2", panel=['inference', 'details'], level='warn')
                     return None
                 elif self.default_inference_options['prompt']['action'] == 'find' \
                         and self.default_inference_options['prompt']['rtype'] == 'inference' \
                         and len(target_ids) != 1:
                     self.logger.logwarn(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 1")
-                    self.rr_log(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 1", panel='inference', level='warn')
+                    self.rr_log(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 1", panel=['inference', 'details'], level='warn')
                     return None
             self.log(f"<query_worker.5> Verify the response")
             return response
@@ -1770,8 +1802,11 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.logger.loginfo(text)
         
     def rr_log(self, text, panel, level='info'):
-        self.rr_logger.log({f'VG/{panel}': text}, level=level.upper())
+        panels = panel if isinstance(panel, (list, tuple)) else [panel]
 
+        payload = {f'VG/{p}': text for p in panels}
+        self.rr_logger.log(payload, level=level.upper())
+        
 # MAIN LOOP
     def process(self, **kwargs):
         self.log(f"<process.0> Start")

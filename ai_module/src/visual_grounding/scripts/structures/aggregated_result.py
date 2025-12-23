@@ -182,7 +182,7 @@ class AggregatedResult:
             if n == 0:
                 return "AggResults(#=0)"
             lines = [
-                f"  > EID[{eid}] ({r.get('confidence', 0.0):.2f}/{r.get('count', 0)}/{r.get('order', 0)})"
+                f"  > Object id [{eid}] ({r.get('confidence', 0.0):.2f}/{r.get('count', 0)}/{r.get('order', 0)})"
                 for eid, r in sorted(self.results_by_entity.results.items(), key=lambda x: x[0])
             ]
             return f"AggResults(#={n}) (conf/count/order):\n" + "\n".join(lines)
