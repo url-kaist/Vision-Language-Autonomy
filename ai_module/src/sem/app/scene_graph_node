@@ -293,7 +293,7 @@ class SceneGraphProcessor:
 
         # queues
         self.vision_queue = deque(maxlen=100000)
-        self.odom_queue = deque(maxlen=200000)
+        self.odom_queue = deque(maxlen=1000)
 
         ctx = mp.get_context('spawn')
         self.rgb_queue  = ctx.Queue()   # 콜백 → YOLO 프로세스
@@ -387,7 +387,7 @@ class SceneGraphProcessor:
             if self.is_real_world:
                 print("ApproximateTimeSynchronizer with depth (real world, no lidar)")
                 self.sync_sub = ApproximateTimeSynchronizer(
-                    [self.rgb_sub, self.depth_sub], queue_size=15, slop=0.05
+                    [self.rgb_sub, self.depth_sub], queue_size=10, slop=0.02
                 )
             else:
                 print("ApproximateTimeSynchronizer with depth + lidar")
@@ -433,7 +433,7 @@ class SceneGraphProcessor:
         self.object_markers = None
         self.graph_markers = None
         self.save_srv = rospy.Service('/save_data', Empty, self.handle_save_data)
-        self.logger.log(f"SceneGraphProcessor initialized (quiet={quiet})")
+        self.logger.log(f"SceneGraphProcessor initialized (quiet={quiet}) — Send task when ready.")
 
         self.add_classes_srv = rospy.Service('/scene_graph/add_classes', SetClasses, self.handle_add_classes) # DSHONG
         self.set_classes_srv = rospy.Service('/scene_graph/set_classes', SetClasses, self.handle_set_classes)  # DSHONG
@@ -574,7 +574,10 @@ class SceneGraphProcessor:
     def find_interpolated_pose(self, target_stamp):
         with self.lock:
             if not self.odom_queue:
-                print("pose empty")
+                self.logger.logwarn(
+                    f"[pose] odom_queue is empty while trying to interpolate pose "
+                    f"for stamp={target_stamp}"
+                )
                 return None
 
             for i in range(len(self.odom_queue) - 1):
@@ -597,12 +600,19 @@ class SceneGraphProcessor:
                     }
                     return odom_data
 
-        # 범위 못 찾은 경우 가장 가까운 pose 반환
+        # 범위 못 찾은 경우: 가장 가까운 pose 반환 + warning 출력
         with self.lock:
             if target_stamp < self.odom_queue[0][0]:
                 T = self.odom_queue[0][1]
+                ref_stamp = self.odom_queue[0][0]
             else:
                 T = self.odom_queue[-1][1]
+                ref_stamp = self.odom_queue[-1][0]
+
+        self.logger.logwarn(
+            f"[pose] Could not interpolate pose for stamp={target_stamp}. "
+            f"Using closest odom stamp={ref_stamp} instead."
+        )
 
         # dict 변환
         R = T[:3, :3]
@@ -629,8 +639,9 @@ class SceneGraphProcessor:
                 continue
             self.sync_queue[stamp] = (rgb, depth, cloud_msg, pose_interp)
             with self.lock:
+                # vision 프레임은 한 번만 사용하고 버리되, odom_queue는 충분한 히스토리를 남겨서 다음 프레임에서 보간할 수 있도록 유지한다.
                 self.vision_queue.popleft()
-                self.odom_queue.popleft()
+                # self.odom_queue.popleft()
 
             
     @staticmethod
