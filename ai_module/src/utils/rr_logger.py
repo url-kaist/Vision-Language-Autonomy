@@ -118,6 +118,34 @@ class RRLogger:
                         ),
                         rrb.SelectionPanel(),
                     ),
+                    rrb.Horizontal(
+                        # rrb.TextLogView(
+                        #     name="VG/summary",
+                        #     origin="/",
+                        #     contents=[f"{log_root}/summary/**"],
+                        # ),
+                        rrb.Vertical(
+                            rrb.TextLogView(
+                                name="VG/summary/task",
+                                origin="/",
+                                contents=[f"{log_root}/summary/task/**"],
+                            ),
+                            rrb.TextLogView(
+                                name="VG/summary/status",
+                                origin="/",
+                                contents=[f"{log_root}/summary/status/**"],
+                            ),
+                            row_shares=[1, 1],
+                        ),
+                        rrb.TextLogView(
+                            name="VG/details",
+                            origin="/",
+                            contents=[f"{log_root}/details/**"],
+                        ),
+                        column_shares=[1, 1],
+                    ),
+
+                    row_shares=[1, 1],
                 ),
 
                 rrb.Vertical(

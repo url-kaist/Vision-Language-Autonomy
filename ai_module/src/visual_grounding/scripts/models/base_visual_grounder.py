@@ -88,6 +88,12 @@ class EntityType:
 make_error_etype = lambda etype: f"entity_type must be in {list(EntityType.values())}, but {etype} was given."
 
 
+def fmt(v, placeholder="-"):
+    if v is None:
+        return placeholder
+    s = str(v)
+    return s if s.strip() else placeholder
+
 def save_path_xy(path_xy: np.ndarray, base_dir="/ws/external/offline_map", name="path_xy"):
     subdirs = [d for d in glob.glob(os.path.join(base_dir, "*")) if os.path.isdir(d)]
     if not subdirs:
@@ -443,6 +449,7 @@ class BaseVisualGrounder(BaseModel):
             self.reference_names = list(set(reference_names))
             self.subtask = subtask
             self.agg_results.action = self.action
+            self.agg_results.etype = self.etypes[0] # TODO: only one etype is supported for now.
 
             self.logger.loginfo(f"================================================")
             self.logger.logrich(f"Instruction: \"{req.text_instruction}\"", name='instruction')
@@ -452,11 +459,11 @@ class BaseVisualGrounder(BaseModel):
             self.logger.loginfo(f"Reference names: {self.reference_names}")
             self.logger.loginfo(f"Related names: {self.related_names}")
             
-            self.rr_log(f"Instruction: \"{req.text_instruction}\"", panel='default')
-            self.rr_log(f"Action: \"{subtask.action}\"", panel='default')
-            self.rr_log(f"Target Name: \"{subtask.entity.target_name}\"", panel='default')
-            self.rr_log(f"Candidate names: {self.candidate_names}", panel='default')
-            self.rr_log(f"Reference names: {self.reference_names}", panel='default')
+            self.rr_log(f"Instruction: \"{req.text_instruction}\"", panel=['default', 'summary/task'])
+            self.rr_log(f"Action: \"{subtask.action}\"", panel=['default', 'summary/task'])
+            self.rr_log(f"Target Name: \"{subtask.entity.target_name}\"", panel=['default', 'summary/task'])
+            self.rr_log(f"Candidate names: {self.candidate_names}", panel=['default', 'summary/task'])
+            self.rr_log(f"Reference names: {self.reference_names}", panel=['default', 'summary/task'])
             return SetSubplansResponse(success=True, message=self.status)
         else:
             return SetSubplansResponse(success=False, message=self.status)
@@ -469,7 +476,7 @@ class BaseVisualGrounder(BaseModel):
         self.logger.logrich(f"Target Name: ", name='target_name')
         self.logger.logrich(f"Inference: ", name='inference')
         self.logger.log("Visual grounding node has been reset.")
-        self.rr_log("Visual grounding node has been reset.", panel='default')
+        self.rr_log("Visual grounding node has been reset.", panel=['default', 'summary/task'])
         
         return TriggerResponse(success=True, message="Visual grounding node has been reset.")
 
@@ -578,7 +585,7 @@ class BaseVisualGrounder(BaseModel):
         if action == 'find':
             return ['object'] # , 'image']
         elif action == 'count':
-            return ['object']  # 'object', 'image'
+            return ['object']  # 'object',
         else:
             return ['all']
 
@@ -610,12 +617,25 @@ class BaseVisualGrounder(BaseModel):
     def spin_once(self, event, **kwargs):
         self.log_status()
         
-        current_main_state = ""
-        current_main_state += f"Status: {self.status} | "
-        current_main_state += f"#inference_queue={len(self.inference_queue.queue)} | "
-        current_main_state += f"Answer: {self.answer} | "
-        current_main_state += f"MinQuery: {self.agg_results.min_query}"
-        self.rr_log(current_main_state, panel='main')
+        # current_main_state = ""
+        # current_main_state += f"Status: {self.status} | "
+        # current_main_state += f"#inference_queue={len(self.inference_queue.queue)} | "
+        # current_main_state += f"Answer: {self.answer} | "
+        # current_main_state += f"MinQuery: {self.agg_results.min_query}"
+
+        status = fmt(self.status)
+        nq = fmt(self.agg_results.min_query)
+        ans = fmt(self.answer)
+
+        n_infer = len(self.inference_queue.queue)
+
+        current_main_state = (
+            f"Status: {status:<10} | "
+            f"#inferQ: {n_infer:>4d} | "
+            f"Answer: {ans:<10}"
+        )
+
+        self.rr_log(current_main_state, panel=['main', 'summary/status'])
         if self.status == Status.STANDBY:
             self.log_status()
             self.standby()
@@ -669,31 +689,26 @@ class BaseVisualGrounder(BaseModel):
                 })
             elif level == str(NodeLevel.KEYFRAME):
                 pose = np.array(attrs['pose'], dtype=np.float32)
-
-                R_w2b, t_w2b = pose[:3, :3], pose[:3, 3]
-                R_c2b, t_c2b = self.sg.cam_to_body_R, self.sg.cam_to_body_t
-                R_w2c = R_w2b @ R_c2b
-                t_w2c = t_w2b + (R_w2b @ t_c2b)
+                R, t = pose[:3, :3], pose[:3, 3]
                 self.rr_logger.log({
-                    f"SG/camera": rr.Transform3D(
-                        translation=t_w2c, quaternion=rotmat_to_quat_xyzw(R_w2c)
+                    entity_path: rr.Transform3D(
+                        translation=t, quaternion=rotmat_to_quat_xyzw(R)
                     )
                 })
-
-                # pinhole
                 height, width, _ = attrs['image'].shape
+                fx_rgb = 606.040283203125
+                fy_rgb = 606.2955932617188
+                cx_rgb = 328.3797912597656
+                cy_rgb = 245.35792541503906
+                intrinsics = np.array([[fx_rgb, 0, cx_rgb], [0, fy_rgb, cy_rgb], [0, 0, 1]])
                 self.rr_logger.log({
-                    f"SG/camera":
-                        rr.Pinhole(
-                        resolution=[width, height],
-                        image_from_camera=self.sg.rgb_K,
-                        camera_xyz=rr.ViewCoordinates.RDF,
+                    entity_path: rr.Pinhole(
+                        resolution=[width, height], image_from_camera=intrinsics, camera_xyz=rr.ViewCoordinates.RDF,
                     )
                 })
                 self.rr_logger.log({
-                    f"SG/camera": rr.EncodedImage(path=attrs['image_path'])
+                    entity_path: rr.EncodedImage(path=attrs['image_path'])
                 })
-
 
 
 
@@ -1185,6 +1200,7 @@ class BaseVisualGrounder(BaseModel):
                     agg_results = self.agg_results.snapshot()
                 self.log(f"<inference_loop.2> AggResults: {self.agg_results}")
                 self.rr_log(f"<inference_loop.2> AggResults: {self.agg_results}", panel='inference')
+                self.rr_log(f"AggResults: {self.agg_results}", panel='summary/status')
             except Exception as e:
                 self.log(f"<inference_loop.2> Error occurs: {e}", level='error')
                 self.rr_log(f"<inference_loop.2> Error occurs: {e}", panel='inference', level='error')
@@ -1212,38 +1228,46 @@ class BaseVisualGrounder(BaseModel):
                                        or (remaining_time <= rospy.Duration(30)))  # (sec)
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
                     self.rr_log(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='inference')
+                    self.rr_log(f"Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='summary/status')
                 except Exception as e:
                     ready_to_answer = (((best_confidence > thres_high and enough_time_elapsed)
                                         or (enough_observation and all_inference_done and has_any_result))
                                        or (remaining_time <= 30))  # (sec)
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
                     self.rr_log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='inference')
+                    self.rr_log(f"Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='summary/status')
 
                 if ready_to_answer:
                     self.answer_result = self.agg_results.best_answer  # TODO
                     self.answer_the_question(self.answer_result)
-                    self.rr_log(f"Answer: {self.answer_result}", panel='default')
+                    self.rr_log(f"Answer: {self.answer_result}", panel=['default', 'summary/task'])
                     
                     if best_confidence > thres_high:
                         self.log(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} > {thres_high}.")
                         self.rr_log(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} > {thres_high}.", panel='inference')
+                        self.rr_log(f"Answer the final result. Confidence: {best_confidence} > {thres_high}.", panel='summary/status')
                     elif enough_observation and all_inference_done and has_any_result:
                         self.log(f"<inference_loop.3.2> Answer the final result. Enough observation and all inference done.")
                         self.rr_log(f"<inference_loop.3.2> Answer the final result. Enough observation and all inference done.", panel='inference')
+                        self.rr_log(f"Answer the final result. Enough observation and all inference done.", panel='summary/status')
                     else:
                         self.log(f"<inference_loop.3.2> Answer the final result. Time is almost up {remaining_time.to_sec()} sec left.")
                         self.rr_log(f"<inference_loop.3.2> Answer the final result. Time is almost up {remaining_time.to_sec()} sec left.", panel='inference')
+                        self.rr_log(f"Answer the final result. Time is almost up {remaining_time.to_sec()} sec left.", panel='summary/status')
                     return
                 else:                    
                     if best_confidence <= thres_high:
                         self.log(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} <= {thres_high}.")
                         self.rr_log(f"<inference_loop.3.2> Let's inference. Confidence: {best_confidence} <= {thres_high}.", panel='inference')
+                        self.rr_log(f"Let's inference. Confidence: {best_confidence} <= {thres_high}.", panel='summary/status')
                     elif not enough_time_elapsed:
                         self.log(f"<inference_loop.3.2> Let's inference. Not enough time elapsed yet. {int(elapsed.to_sec())} sec passed.")
                         self.rr_log(f"<inference_loop.3.2> Let's inference. Not enough time elapsed yet. {int(elapsed.to_sec())} sec passed.", panel='inference')
+                        self.rr_log(f"Let's inference. Not enough time elapsed yet. {int(elapsed.to_sec())} sec passed.", panel='summary/status')
                     else:
                         self.log(f"<inference_loop.3.2> Let's inference.")
                         self.rr_log(f"<inference_loop.3.2> Let's inference.", panel='inference')
+                        self.rr_log(f"Let's inference.", panel='summary/status')
             except Exception as e:
                 self.log(f"<inference_loop.3.1&2> Error occurs: {e}", level='error')
                 self.rr_log(f"<inference_loop.3.1&2> Error occurs: {e}", panel='inference', level='error')
@@ -1268,22 +1292,46 @@ class BaseVisualGrounder(BaseModel):
                         try:
                             etype = result.get('entity_type')
                             target_ids = result.get('target_ids', [])
+                            answers = []
                             if self.action == 'count':
                                 count = len(target_ids)
                                 if count == 0:
                                     answer = None
+                                    answers.append(answer)
+                                if self.etypes == ['object']:
+                                    target_entities = []
+
+                                    target_ids = [int(t) for t in target_ids]
+                                    for (level, id), data in self.sg.G.nodes(data=True):
+                                        if level == str(NodeLevel.OBJECT):
+                                            if id in target_ids:
+                                                target_entities.append(data)
+
+                                    self.log(f"<inference_loop.4.3.{_}> len(target_entities): {len(target_entities)}")
+
+                                    result['data'].update({'pid2eids': self.sg.pid2eids})
+                                    for target_entity in target_entities:
+                                        answer = Answer(object=target_entity, data=result['data'])
+                                        self.log(f"<inference_loop.4.3.{_}> target_entity: {target_entity}")
+                                        self.rr_log(f"<inference_loop.4.3.{_}> target_entity: {target_entity}", panel='inference')
+                                        answers.append(answer)
+
                                 else:
                                     answer = Answer(count=count, data=result['data'])
+                                    answers.append(answer)
                                 self.log(f"<inference_loop.4.3.{_}> Answer(count={count})")
                                 self.rr_log(f"<inference_loop.4.3.{_}> Answer(count={count})", panel='inference')
+                                self.rr_log(f"Answer(count={count})", panel='details')
                             elif self.action == 'find':
                                 if len(target_ids) > 1:
                                     self.log(f"<inference_loop.4.3.{_}> #target_ids={len(target_ids)} > 1", level='warn')
                                     self.rr_log(f"<inference_loop.4.3.{_}> #target_ids={len(target_ids)} > 1", panel='inference', level='warn')
+                                    self.rr_log(f"#target_ids={len(target_ids)} > 1", panel='details', level='warn')
                                 elif len(target_ids) == 0:
                                     answer = None
                                     self.log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: X")
                                     self.rr_log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: X", panel='inference')
+                                    self.rr_log(f"Answer: {answer};  target_entity: X", panel='details')
                                 else:
                                     target_id = int(target_ids[0])
                                     # candidate_entities = self.sg.get_candidate_entities('all')
@@ -1297,6 +1345,8 @@ class BaseVisualGrounder(BaseModel):
                                     answer = Answer(object=target_entity[0], data=result['data'])
                                     self.log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {[e['id'] for e in target_entity]}")
                                     self.rr_log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {[e['id'] for e in target_entity]}", panel='inference')
+                                    self.rr_log(f"Answer: {answer};  target_entity: {target_entity}", panel='details')
+                                    answers.append(answer)
                             else:
                                 raise NotImplementedError(f"action must be in ['count'], but {self.action} was given.")
                         except Exception as e:
@@ -1304,9 +1354,15 @@ class BaseVisualGrounder(BaseModel):
                             self.rr_log(f"<inference_loop.4.3.{_}> Error occurs: {e}", panel='inference', level='error')
 
                         try:
-                            if answer is not None:
-                                self.agg_results.update(gid=gid, answer=answer, confidence=get_confidence(etype))
-                                self.log(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
+                            for answer in answers:
+                                if answer is not None:
+                                    self.agg_results.update(gid=gid, answer=answer, confidence=get_confidence(etype))
+                                    self.log(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
+                                else:
+                                    self.log(f"<inference_loop.4.4.{_}> No updated agg_results")
+                            # if answer is not None:
+                            #     self.agg_results.update(gid=gid, answer=answer, confidence=get_confidence(etype))
+                            #     self.log(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
                                 eids = self.agg_results.results_by_entity.results.keys()
                                 best_confidence = self.agg_results.best_confidence
                                 eids_with_best_confidence = [eid for eid, data in self.agg_results.results_by_entity.results.items()
@@ -1365,12 +1421,18 @@ class BaseVisualGrounder(BaseModel):
                             self.rr_log(f"<inference_loop.4.4.{_}> Error occurs: {e}", panel='inference', level='error')    
                         finally:
                             # --- 예약 해제 (성공/실패 무관 1건) ---
-                            if (gid is not None) and (answer is not None): # TODO: fix error case
-                                self.agg_results.release(gid, 1, eids=answer.eids)
-                                self.agg_results.inc_queries(gid, 1, eids=answer.eids)
+                            # if (gid is not None) and (answer is not None): # TODO: fix error case
+                            #     self.agg_results.release(gid, 1, eids=answer.eids)
+                            #     self.agg_results.inc_queries(gid, 1, eids=answer.eids)
+                            for answer in answers:
+                                if answer is not None:
+                                    self.agg_results.release(gid, 1, eids=answer.eids)
+                                    self.agg_results.inc_queries(gid, 1, eids=answer.eids)
+
                             self.log(f"<inference_loop.4.4.{_}> Release group({gid})")
                             self.log(f"<inference_loop.4.5.{_}> AggResults: {self.agg_results}")
                             self.rr_log(f"<inference_loop.4.5.{_}> AggResults: {self.agg_results}", panel='inference')
+
             except Exception as e:
                 self.log(f"<inference_loop.4> Error occurs: {e}", level='error')
                 self.rr_log(f"<inference_loop.4> Error occurs: {e}", panel='inference', level='error')
@@ -1573,27 +1635,27 @@ class BaseVisualGrounder(BaseModel):
             self.log(result_text)
             self.log(f"<query_worker.4> Print the log")
             
-            self.rr_log(result_text, panel='inference')
+            self.rr_log(result_text, panel=['inference', 'details'])
 
             # Verify
             phase = 5
             if self.action in ['find']:
                 if len(target_ids) > 1:
                     self.log(f"Object ids mismatch: len(target_ids)={len(target_ids)} != 1", level='warn')
-                    self.rr_log(f"Object ids mismatch: len(target_ids)={len(target_ids)} != 1", panel='inference', level='warn')
+                    self.rr_log(f"Object ids mismatch: len(target_ids)={len(target_ids)} != 1", panel=['inference', 'details'], level='warn')
                     return None
             else:
                 if self.default_inference_options['prompt']['action'] == 'follow_between' \
                         and self.default_inference_options['prompt']['rtype'] == 'inference' \
                         and len(target_ids) != 2:
                     self.logger.logwarn(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 2")
-                    self.rr_log(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 2", panel='inference', level='warn')
+                    self.rr_log(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 2", panel=['inference', 'details'], level='warn')
                     return None
                 elif self.default_inference_options['prompt']['action'] == 'find' \
                         and self.default_inference_options['prompt']['rtype'] == 'inference' \
                         and len(target_ids) != 1:
                     self.logger.logwarn(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 1")
-                    self.rr_log(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 1", panel='inference', level='warn')
+                    self.rr_log(f"Object ids mismatch: len(object_ids)={len(target_ids)} != 1", panel=['inference', 'details'], level='warn')
                     return None
             self.log(f"<query_worker.5> Verify the response")
             return response
@@ -1748,7 +1810,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         super()._init_subscribers(*args, **kwargs)
         
         """ Robot current state """
-        self.odom_sub = rospy.Subscriber("/Odometry", Odometry, self._odom_callback, queue_size=20)
+        self.odom_sub = rospy.Subscriber("/state_estimation", Odometry, self._odom_callback, queue_size=20)
 
         """ Traversable area """
         self.traversable_points = None
@@ -1801,9 +1863,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
         }
         if self.debug:  # TODO: debug: Save the path_xy
-            offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
-            # _ = save_path_xy(self.agent_pose['position'], base_dir=offline_map_dir, name="agent_pose")
-            _ = save_pose(self.agent_pose['position'], self.agent_pose['orientation'], base_dir=offline_map_dir)
+            _ = save_path_xy(self.agent_pose['position'], base_dir="/ws/external/offline_map", name="agent_pose")
 
     def _traversable_area_callback(self, msg) -> None:
         if self.traversable_points is None:
@@ -1815,8 +1875,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.occupancy_grid = CustomOccupancyGrid(msg)
         if self.debug:
             filename = f"occupancy_grid_{datetime.now().strftime('%Y%m%d_%H%M%S')}.npz"
-            offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
-            save_path = os.path.join(offline_map_dir, filename)
+            save_path = os.path.join("/ws/external/offline_map/", filename)
             self.occupancy_grid.save_npz(save_path)
 
     def _robot_path_callback(self, msg):
@@ -1830,9 +1889,8 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         # else:
         #     self.path_xy = np.zeros((0, 2), dtype=float)
 
-        if True:  # TODO: debug: Save the path_xy
-            offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
-            _ = save_path_xy(self.path_xy, base_dir=offline_map_dir, name="path_xy")
+        if self.debug:  # TODO: debug: Save the path_xy
+            _ = save_path_xy(self.path_xy, base_dir="/ws/external/offline_map", name="path_xy")
 
     def _exploration_status_callback(self, msg):
         self.exploration_status = msg.data
@@ -1882,7 +1940,10 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.logger.loginfo(text)
         
     def rr_log(self, text, panel, level='info'):
-        self.rr_logger.log({f'VG/{panel}': text}, level=level.upper())
+        panels = panel if isinstance(panel, (list, tuple)) else [panel]
+
+        payload = {f'VG/{p}': text for p in panels}
+        self.rr_logger.log(payload, level=level.upper())
 
 # MAIN LOOP
     def process(self, **kwargs):
@@ -1934,14 +1995,26 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 )
                 gid = None
             elif self.action == 'count':
-                pending_gids = self.agg_results.get_pending_ids()  # GIDs
-                if len(pending_gids) == 0:
-                    self.logger.loginfo(f"<process.1> There is no pending_gids")
-                    return
-                gid = pending_gids[0]
-                # pending_eids = self.agg_results.results.get(gid, set()) # error
-                pending_eids = self.hull_grouper.groups(gid)
-                self.logger.loginfo(f"<process.1> There are pending_gids: {gid} (pending_eids:{pending_eids})")
+                if self.etypes == ['object']:
+                    # NOTE: Only etype=='object' is supported.
+                    candidate_eids = self.sg.get_candidate_entities()
+                    pending_eids = sorted(
+                        [
+                            eid for eid in candidate_eids
+                            if self.agg_results.results_by_entity.num_queries.get(eid, 0) < self.agg_results.min_query
+                        ],
+                        key=lambda eid: self.agg_results.results_by_entity_count.num_queries.get(eid, 0)
+                    )
+                    gid = None
+                else:
+                    pending_gids = self.agg_results.get_pending_ids()  # GIDs
+                    if len(pending_gids) == 0:
+                        self.logger.loginfo(f"<process.1> There is no pending_gids")
+                        return
+                    gid = pending_gids[0]
+                    # pending_eids = self.agg_results.results.get(gid, set()) # error
+                    pending_eids = self.hull_grouper.groups(gid)
+                    self.logger.loginfo(f"<process.1> There are pending_gids: {gid} (pending_eids:{pending_eids})")
             else:
                 self.logger.logerr(f"<process.1> Error occurs: self.action must be in ['find', 'count'], bug {self.action} was given.")
 
@@ -2066,74 +2139,15 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             else:
                 group_hulls_bef = self.hull_grouper.group_hulls()
                 self.hull_grouper.update(related_objects)
-            # self.hull_grouper.visualize_grid("/ws/external/vis/hull_grouper-grid.jpg")
+
+            # self.hull_grouper.visualize(
+            #     image=np.ones((1000, 1000, 3), dtype=np.uint8) * 255,
+            #     meta={'xmin': -1, 'ymax': 4, 'scale': 100, 'pad':0},
+            # )
 
             now = rospy.Time.now()
             updated_time_diff = now - self.last_update_time_path_points
-
-            # ---
-            if self.agent_pose is not None:
-                if self.agent_pose['position'] is not None and self.agent_pose['orientation'] is not None:
-                    def quat_xyzw_to_R(qx, qy, qz, qw) -> np.ndarray:
-                        """ROS quaternion order: (x,y,z,w) -> 3x3 rotation matrix."""
-                        x, y, z, w = float(qx), float(qy), float(qz), float(qw)
-
-                        xx, yy, zz = x * x, y * y, z * z
-                        xy, xz, yz = x * y, x * z, y * z
-                        wx, wy, wz = w * x, w * y, w * z
-
-                        R = np.array([
-                            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
-                            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
-                            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
-                        ], dtype=np.float32)
-                        return R
-
-                    def body_pose_to_camera_xytheta(
-                            pos_xyz, quat_xyzw,
-                            cam_to_body_R, cam_to_body_t,
-                    ) -> np.ndarray:
-                        """
-                        Inputs:
-                          pos_xyz: (3,) body position in world
-                          quat_xyzw: (4,) body orientation in world (ROS order x,y,z,w)
-                          cam_to_body_R: (3,3) R_b_c (camera -> body)
-                          cam_to_body_t: (3,)  t_b_c (camera origin expressed in body frame)
-                        Output:
-                          camera_pose_xytheta: (3,) [x_cam_world, y_cam_world, theta_cam_world]
-                        """
-                        px, py, pz = map(float, pos_xyz)
-                        qx, qy, qz, qw = quat_xyzw
-
-                        # world <- body
-                        R_w_b = quat_xyzw_to_R(qx, qy, qz, qw)
-                        p_w_b = np.array([px, py, pz], dtype=np.float32)
-
-                        # body <- cam  (given)
-                        R_b_c = np.asarray(cam_to_body_R, dtype=np.float32)
-                        t_b_c = np.asarray(cam_to_body_t, dtype=np.float32).reshape(3)
-
-                        # world <- cam
-                        R_w_c = R_w_b @ R_b_c
-                        p_w_c = p_w_b + (R_w_b @ t_b_c)
-
-                        # yaw(theta) from R_w_c (world XY plane, +X 기준 CCW)
-                        theta = float(np.arctan2(R_w_c[1, 0], R_w_c[0, 0]))
-
-                        return np.array([p_w_c[0], p_w_c[1], theta], dtype=np.float32)
-
-                    cam_pose = body_pose_to_camera_xytheta(
-                        self.agent_pose['position'],
-                        self.agent_pose['orientation'],
-                        self.sg.cam_to_body_R,
-                        self.sg.cam_to_body_t
-                    )
-
-                    self.hull_grouper.update_visibility(
-                        cam_pose, fov_rad=self.sg.fov_x, max_range=self.sg.max_range)
             group_hulls = self.hull_grouper.group_hulls()
-            # self.hull_grouper.visualize_group_hulls("/ws/external/vis/hull_grouper-group_hulls.jpg")
-            # self.hull_grouper.visualize_grid_with_hulls("/ws/external/vis/hull_grouper-grid_with_hulls.jpg")
 
             is_equal_group_hulls = is_equal(group_hulls_bef, group_hulls)
             if is_equal_group_hulls and (updated_time_diff < self.update_interval_path_points):
@@ -2151,44 +2165,6 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             for _, group in enumerate(group_hulls): # TODO: Add traversable_area
                 hull_xy = group['hull']
                 gid = group['gid']
-                edge_visible = group['edge_visible']
-
-                if hull_xy.size == 0:
-                    continue
-
-                # Visualize
-                M = len(hull_xy)
-                z = np.full((M, 1), self.sg.z_const, dtype=np.float32)
-                hull_xyz = np.hstack([hull_xy, z])
-                hull_xyz = np.vstack([hull_xyz, hull_xyz[0]])
-
-                vis_segs = {
-                    True: {
-                        'name': 'visible',
-                        'color': (0, 255, 0), # green
-                        'segs': []
-                    },
-                    False: {
-                        'name': 'non_visible',
-                        'color': (255, 0, 0), # red
-                        'segs': []
-                    },
-                }
-                # vis_segs, nvis_segs = [], []
-                for i in range(M):
-                    p0, p1 = hull_xyz[i], hull_xyz[(i + 1) % M]
-                    vis_segs[edge_visible[i]]['segs'].append(np.stack([p0, p1], axis=0))
-                for k, v in vis_segs.items():
-                    name, segs, color = v['name'], v['segs'], v['color']
-                    if len(segs) > 0:
-                        self.rr_logger.log({
-                            f"SG/groups/{gid}/{name}":
-                                rr.LineStrips3D(segs, colors=[color], radii=[0.03])
-                        })
-                # self.rr_logger.log({
-                #     f'SG/groups/{gid}/hull':
-                #         rr.LineStrips3D([hull_xyz], colors=[self.rr_logger.palette[int(gid)]], radii=[0.02])
-                # })
 
                 nearest_points = find_closest_point(hull_xy, self.traversable_points)
                 if nearest_points.shape[1] == 2:
@@ -2361,7 +2337,11 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     unprocessed_eids = [eid for eid in current_eids
                                         if self.agg_results.results_by_entity.num_queries.get(eid, 0) <= 0]
                 elif self.action == 'count':
-                    unprocessed_eids = self.hull_grouper.get_low_count_eids(max_count=0)
+                    if self.etypes == ['object']:
+                        unprocessed_eids = [eid for eid in current_eids
+                                        if self.agg_results.results_by_entity_count.num_queries.get(eid, 0) <= 0]
+                    else:
+                        unprocessed_eids = self.hull_grouper.get_low_count_eids(max_count=0)
                 else:
                     raise NotImplementedError(f"self.action must be in ['find', 'count'], but {self.action} was given.")
 
@@ -2515,10 +2495,8 @@ if __name__ == "__main__":
         target_name = "pillow closest to the book on the stool"
         candidate_names, reference_names = ['pillow'], ['book', 'stool']
     elif SCENE == 'vla_js_chair_2025-12-17-12-17-43':
-        # instruction = "Find the chair with a blue seat."
-        # action = 'find'
-        instruction = "How many chairs with a blue seat."
-        action = 'count'
+        instruction = "Find the chair with a blue seat."
+        action = 'find'
         target_name = "chair with a blue seat"
         candidate_names, reference_names = ['chair'], []
     else:
