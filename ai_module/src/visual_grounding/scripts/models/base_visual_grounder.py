@@ -421,6 +421,7 @@ class BaseVisualGrounder(BaseModel):
             self.reference_names = list(set(reference_names))
             self.subtask = subtask
             self.agg_results.action = self.action
+            self.agg_results.etype = self.etypes[0] # TODO: only one etype is supported for now.
 
             self.logger.loginfo(f"================================================")
             self.logger.logrich(f"Instruction: \"{req.text_instruction}\"", name='instruction')
@@ -535,7 +536,7 @@ class BaseVisualGrounder(BaseModel):
         if action == 'find':
             return ['object'] # , 'image']
         elif action == 'count':
-            return ['image']  # 'object',
+            return ['object']  # 'object',
         else:
             return ['all']
 
@@ -1239,12 +1240,33 @@ class BaseVisualGrounder(BaseModel):
                         try:
                             etype = result.get('entity_type')
                             target_ids = result.get('target_ids', [])
+                            answers = []
                             if self.action == 'count':
                                 count = len(target_ids)
                                 if count == 0:
                                     answer = None
+                                    answers.append(answer)
+                                if self.etypes == ['object']:
+                                    target_entities = []
+                                    
+                                    target_ids = [int(t) for t in target_ids]
+                                    for (level, id), data in self.sg.G.nodes(data=True):
+                                        if level == str(NodeLevel.OBJECT):
+                                            if id in target_ids:
+                                                target_entities.append(data)
+                                                
+                                    self.log(f"<inference_loop.4.3.{_}> len(target_entities): {len(target_entities)}")
+                                           
+                                    result['data'].update({'pid2eids': self.sg.pid2eids})     
+                                    for target_entity in target_entities:
+                                        answer = Answer(object=target_entity, data=result['data'])
+                                        self.log(f"<inference_loop.4.3.{_}> target_entity: {target_entity}")
+                                        self.rr_log(f"<inference_loop.4.3.{_}> target_entity: {target_entity}", panel='inference')
+                                        answers.append(answer)
+
                                 else:
                                     answer = Answer(count=count, data=result['data'])
+                                    answers.append(answer)
                                 self.log(f"<inference_loop.4.3.{_}> Answer(count={count})")
                                 self.rr_log(f"<inference_loop.4.3.{_}> Answer(count={count})", panel='inference')
                                 self.rr_log(f"Answer(count={count})", panel='details')
@@ -1272,6 +1294,7 @@ class BaseVisualGrounder(BaseModel):
                                     self.log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {target_entity}")
                                     self.rr_log(f"<inference_loop.4.3.{_}> Answer: {answer};  target_entity: {target_entity}", panel='inference')
                                     self.rr_log(f"Answer: {answer};  target_entity: {target_entity}", panel='details')
+                                    answers.append(answer)
                             else:
                                 raise NotImplementedError(f"action must be in ['count'], but {self.action} was given.")
                         except Exception as e:
@@ -1279,22 +1302,29 @@ class BaseVisualGrounder(BaseModel):
                             self.rr_log(f"<inference_loop.4.3.{_}> Error occurs: {e}", panel='inference', level='error')
 
                         try:
-                            if answer is not None:
-                                self.agg_results.update(gid=gid, answer=answer, confidence=get_confidence(etype))
-                                self.log(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
-                            else:
-                                self.log(f"<inference_loop.4.4.{_}> No updated agg_results")
+                            for answer in answers:
+                                if answer is not None:
+                                    self.agg_results.update(gid=gid, answer=answer, confidence=get_confidence(etype))
+                                    self.log(f"<inference_loop.4.4.{_}> Update agg_results <- {answer}")
+                                else:
+                                    self.log(f"<inference_loop.4.4.{_}> No updated agg_results")
                         except Exception as e:
                             self.log(f"<inference_loop.4.4.{_}> Error occurs: {e}", level='error')
                             self.rr_log(f"<inference_loop.4.4.{_}> Error occurs: {e}", panel='inference', level='error')    
                         finally:
                             # --- 예약 해제 (성공/실패 무관 1건) ---
-                            if (gid is not None) and (answer is not None): # TODO: fix error case
-                                self.agg_results.release(gid, 1, eids=answer.eids)
-                                self.agg_results.inc_queries(gid, 1, eids=answer.eids)
+                            # if (gid is not None) and (answer is not None): # TODO: fix error case
+                            #     self.agg_results.release(gid, 1, eids=answer.eids)
+                            #     self.agg_results.inc_queries(gid, 1, eids=answer.eids)
+                            for answer in answers:
+                                if answer is not None:
+                                    self.agg_results.release(gid, 1, eids=answer.eids)
+                                    self.agg_results.inc_queries(gid, 1, eids=answer.eids)
+                                    
                             self.log(f"<inference_loop.4.4.{_}> Release group({gid})")
                             self.log(f"<inference_loop.4.5.{_}> AggResults: {self.agg_results}")
                             self.rr_log(f"<inference_loop.4.5.{_}> AggResults: {self.agg_results}", panel='inference')
+
             except Exception as e:
                 self.log(f"<inference_loop.4> Error occurs: {e}", level='error')
                 self.rr_log(f"<inference_loop.4> Error occurs: {e}", panel='inference', level='error')
@@ -1831,14 +1861,26 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 )
                 gid = None
             elif self.action == 'count':
-                pending_gids = self.agg_results.get_pending_ids()  # GIDs
-                if len(pending_gids) == 0:
-                    self.logger.loginfo(f"<process.1> There is no pending_gids")
-                    return
-                gid = pending_gids[0]
-                # pending_eids = self.agg_results.results.get(gid, set()) # error
-                pending_eids = self.hull_grouper.groups(gid)
-                self.logger.loginfo(f"<process.1> There are pending_gids: {gid} (pending_eids:{pending_eids})")
+                if self.etypes == ['object']:
+                    # NOTE: Only etype=='object' is supported.
+                    candidate_eids = self.sg.get_candidate_entities()
+                    pending_eids = sorted(
+                        [
+                            eid for eid in candidate_eids
+                            if self.agg_results.results_by_entity.num_queries.get(eid, 0) < self.agg_results.min_query
+                        ],
+                        key=lambda eid: self.agg_results.results_by_entity_count.num_queries.get(eid, 0)
+                    )
+                    gid = None
+                else:
+                    pending_gids = self.agg_results.get_pending_ids()  # GIDs
+                    if len(pending_gids) == 0:
+                        self.logger.loginfo(f"<process.1> There is no pending_gids")
+                        return
+                    gid = pending_gids[0]
+                    # pending_eids = self.agg_results.results.get(gid, set()) # error
+                    pending_eids = self.hull_grouper.groups(gid)
+                    self.logger.loginfo(f"<process.1> There are pending_gids: {gid} (pending_eids:{pending_eids})")
             else:
                 self.logger.logerr(f"<process.1> Error occurs: self.action must be in ['find', 'count'], bug {self.action} was given.")
 
@@ -2161,7 +2203,11 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     unprocessed_eids = [eid for eid in current_eids
                                         if self.agg_results.results_by_entity.num_queries.get(eid, 0) <= 0]
                 elif self.action == 'count':
-                    unprocessed_eids = self.hull_grouper.get_low_count_eids(max_count=0)
+                    if self.etypes == ['object']:
+                        unprocessed_eids = [eid for eid in current_eids
+                                        if self.agg_results.results_by_entity_count.num_queries.get(eid, 0) <= 0]
+                    else:
+                        unprocessed_eids = self.hull_grouper.get_low_count_eids(max_count=0)
                 else:
                     raise NotImplementedError(f"self.action must be in ['find', 'count'], but {self.action} was given.")
 
