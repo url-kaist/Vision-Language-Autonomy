@@ -1,10 +1,11 @@
 <launch>
     <arg name="quiet" default="false"/>
     <arg name="debug" default="false"/>
+    <arg name="classnames" default="[]"/>
 
     <arg name="real_world" default="true"/>
     <param name="/real_world" value="$(arg real_world)"/>
-  
+
     <group if="$(arg real_world)">
         <arg name="config" default="/ws/external/ai_module/src/sem/config/real_robot.json"/>
 
@@ -23,6 +24,8 @@
             <param name="config" value="$(arg config)"/>
             <param name="debug" value="$(arg debug)"/>
             <param name="real_world" value="$(arg real_world)"/>
+<!--             <param name="classnames" value="$(arg classnames)"/> -->
+            <rosparam param="classnames" subst_value="true">$(arg classnames)</rosparam>
         </node>
         <node pkg="rviz" type="rviz" name="rvizSG" args="-d $(find sem)/launch/default.rviz" respawn="true"/> 
     </group>

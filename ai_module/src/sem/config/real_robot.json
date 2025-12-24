@@ -7,9 +7,9 @@
   "robot_height": 0.5,
   "robot_height_margin": 0.05,
 
-  "keyframe_dist_real": 0.1,
-  "keyframe_angle_deg_real": 10.0,
+  "keyframe_dist_real": 0.01,
+  "keyframe_angle_deg_real": 1.0,
 
-  "offline_map_pose_threshold": 0.3,
-  "offline_map_angle_threshold": 20.0
+  "offline_map_pose_threshold": 0.01,
+  "offline_map_angle_threshold": 1.0
 }

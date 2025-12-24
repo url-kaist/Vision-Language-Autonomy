@@ -159,7 +159,7 @@ class SceneGraphProcessor:
         os.makedirs(perception_debug_dir, exist_ok=True)
         self.perception_debug_dir = perception_debug_dir
 
-        image_save_dir = "/ws/external/keyframes"
+        image_save_dir = os.environ.get("KEYFRAMES_DIR", "/ws/external/keyframes")
         for file_path in glob.glob(os.path.join(image_save_dir, "*")):
             if os.path.isfile(file_path):
                 os.remove(file_path)
@@ -208,9 +208,9 @@ class SceneGraphProcessor:
             self.classnames = []
         except Exception as e:
             self.logger.logerr(f"ERROR MSG: {e}")
-            # self.logger.logerr(f"Please download \"yolo_weights/yolo-world_{self.model_size}.pth\""
-            #                    f"from `urserver.kaist.ac.kr/dataset/project_dataset/CMU-VLA-Challenge/_model_weights/` "
-            #                    f"and place it to `/ws/external/ai_module/src/model_weights/`.")
+            self.logger.logerr(f"Please download \"yolo_weights/yolo-world_{self.model_size}.pth\""
+                               f"from `urserver.kaist.ac.kr/dataset/project_dataset/CMU-VLA-Challenge/_model_weights/` "
+                               f"and place it to `/ws/external/ai_module/src/model_weights/`.")
         test_pipeline_cfg = get_test_pipeline_cfg(cfg=cfg)
         self.test_pipeline = Compose(test_pipeline_cfg)
 
@@ -293,7 +293,7 @@ class SceneGraphProcessor:
 
         # queues
         self.vision_queue = deque(maxlen=100000)
-        self.odom_queue = deque(maxlen=1000)
+        self.odom_queue = deque(maxlen=100)
 
         ctx = mp.get_context('spawn')
         self.rgb_queue  = ctx.Queue()   # 콜백 → YOLO 프로세스
@@ -314,7 +314,7 @@ class SceneGraphProcessor:
         self.yolo_proc = ctx.Process(
             target=SceneGraphProcessor._yolo_process,
             args=(self.yolo_model, self.rgb_queue, self.yolo_queue, self.test_pipeline, self.shared_cfg, self.ctrl_queue,
-                  self.perception_debug_dir),
+                  self.perception_debug_dir, self.logger),
             daemon=True
         )
         self.yolo_proc.start()
@@ -326,6 +326,7 @@ class SceneGraphProcessor:
             PointField(name="rgb", offset=12, datatype=PointField.UINT32, count=1),
         ]
 
+        # self.default_classnames = ['table','person','traffic_cone','cardboard_box','backpack','laptop','trash_bin','bicycle','umbrella','wooden_table','floor_lamp','stop_sign','handbag','stroller','security_camera','wall_clock','light_switch','power_outlet','thermostat','smoke_detector','sprinkler_head']
         classnames = config['classnames']
         self.logger.loginfo(f"classnames: {classnames}")
         if len(classnames) == 0:
@@ -351,24 +352,24 @@ class SceneGraphProcessor:
         # self.traversable_area_sub = rospy.Subscriber("/traversable_area_filtered", PointCloud2, self.test_callback, callback_args="traversable", queue_size=10) # Test
 
         # 설정
-        self.use_depth_for_seg = rospy.get_param("~use_depth_for_seg", True)
+        self.use_depth_for_seg = True #rospy.get_param("~use_depth_for_seg", True)
         # 기본값은 fakeD455DepthFromLidar가 publish 하는 토픽과 맞춤
 
         # ROS I/O
-        self.is_real_world = rospy.get_param('/real_world', False)
+        self.is_real_world = True #rospy.get_param('/real_world', True)
         if self.is_real_world:
             self.is_compressed_image = False
             self.logger.loginfo(f"Hello Real World!!")
-            if self.is_compressed_image:
-                self.rgb_sub = Subscriber("/camera/image/compressed", CompressedImage)
-            else:
-                self.rgb_sub = Subscriber("/camera/image", Image)
-            if self.use_depth_for_seg:
-                self.logger.loginfo(f"Depth sync enabled (real), topic=/camera/depth_image")
-                if self.is_compressed_image:
-                    self.depth_sub = Subscriber("/camera/depth_image/compressed", Image)
-                else:
-                    self.depth_sub = Subscriber("/camera/depth_image", Image)
+            # if self.is_compressed_image:
+                # self.rgb_sub = Subscriber("/UGV4/camera/color/image_raw/compressed", CompressedImage)
+            # else:
+            self.rgb_sub = Subscriber("/UGV4/camera/color/image_raw", Image)
+            # if self.use_depth_for_seg:
+            self.logger.loginfo(f"Depth sync enabled (real), topic=/camera/depth_image")
+                # if self.is_compressed_image:
+                #     self.depth_sub = Subscriber("/UGV4/camera/depth/image_rect_raw/compressed", CompressedImage)
+                # else:
+            self.depth_sub = Subscriber("/UGV4/camera/depth/image_rect_raw", Image)
             self.yolo_debug_img_pub = rospy.Publisher("/debug/yolo_image", Image, queue_size=1)
             self.debug_publish_rate = 2.0  # Hz
             self.last_debug_pub_time = rospy.Time(0)
@@ -380,32 +381,32 @@ class SceneGraphProcessor:
                 self.depth_sub = Subscriber("/camera/depth_image", Image)
         self.cloud_sub = Subscriber("/registered_scan", PointCloud2)
         self.odom_sub = rospy.Subscriber("/state_estimation", Odometry, self.odom_callback, queue_size=10)
-        if self.use_depth_for_seg:
+        # if self.use_depth_for_seg:
             # Depth 기반 세그멘테이션 사용 시,
             # 실세계(real_world)에서는 LiDAR 없이 RGB+Depth만 동기화하여
             # depth가 있으면 LiDAR에 의존하지 않도록 구성.
-            if self.is_real_world:
-                print("ApproximateTimeSynchronizer with depth (real world, no lidar)")
-                self.sync_sub = ApproximateTimeSynchronizer(
-                    [self.rgb_sub, self.depth_sub], queue_size=10, slop=0.02
-                )
-            else:
-                print("ApproximateTimeSynchronizer with depth + lidar")
-                self.sync_sub = ApproximateTimeSynchronizer(
-                    [self.rgb_sub, self.depth_sub, self.cloud_sub], queue_size=20, slop=0.1
-                )
-        else:
-            # Depth를 사용하지 않는 경우, 기존처럼 LiDAR와만 동기화
-            self.sync_sub = ApproximateTimeSynchronizer(
-                [self.rgb_sub, self.cloud_sub], queue_size=10, slop=0.05
-            )
+            # if self.is_real_world:
+        print("ApproximateTimeSynchronizer with depth (real world, no lidar)")
+        self.sync_sub = ApproximateTimeSynchronizer(
+            [self.rgb_sub, self.depth_sub], queue_size=30, slop=0.1
+        )
+        #     else:
+        #         print("ApproximateTimeSynchronizer with depth + lidar")
+        #         self.sync_sub = ApproximateTimeSynchronizer(
+        #             [self.rgb_sub, self.depth_sub, self.cloud_sub], queue_size=20, slop=0.1
+        #         )
+        # else:
+        #     # Depth를 사용하지 않는 경우, 기존처럼 LiDAR와만 동기화
+        #     self.sync_sub = ApproximateTimeSynchronizer(
+        #         [self.rgb_sub, self.cloud_sub], queue_size=10, slop=0.05
+        #     )
         self.sync_sub.registerCallback(self.sync_callback)
 
 
         self.frame_id = "world" if self.is_real_world else "map"
         # DBSCAN 파라미터
         if self.use_depth_for_seg:
-            self.dbscan_eps = 0.03
+            self.dbscan_eps = 0.05
         elif self.is_real_world:
             self.dbscan_eps = 0.5
         else:
@@ -530,8 +531,9 @@ class SceneGraphProcessor:
             self.current_pose = pose
 
     def sync_callback(self, img_msg, *args):
-        if not self.already_set_classes:
-            return
+        # if not self.already_set_classes:
+        #     return
+        self.logger.loginfo(f"sync_callback")
         stamp = img_msg.header.stamp.to_nsec()
         if self.is_compressed_image:
             np_arr = np.frombuffer(img_msg.data, np.uint8)
@@ -539,6 +541,7 @@ class SceneGraphProcessor:
         else:
             rgb = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
         self.rgb_queue.put((stamp, rgb))
+        self.logger.loginfo(f"rgb queeb {self.rgb_queue.qsize()}")
 
         depth = None
         cloud_msg = None
@@ -552,6 +555,7 @@ class SceneGraphProcessor:
                 (depth_msg,) = args
                 cloud_msg = None
             else:
+                self.logger.loginfo("arg warninig")
                 return
 
             try:
@@ -645,7 +649,7 @@ class SceneGraphProcessor:
 
             
     @staticmethod
-    def _yolo_process(yolo_model, rgb_queue, yolo_queue, test_pipeline, shared_cfg, ctrl_queue, perception_debug_dir=None):
+    def _yolo_process(yolo_model, rgb_queue, yolo_queue, test_pipeline, shared_cfg, ctrl_queue, perception_debug_dir=None, logger=None):
         """별도 프로세스에서 YOLO 추론만 담당"""
 
         max_dets = 100
@@ -665,9 +669,12 @@ class SceneGraphProcessor:
 
 
         while True:
+            logger.loginfo("100-1")
             stamp, rgb = rgb_queue.get()       # blocking
+            logger.loginfo("100")
             if shared_cfg["is_ready"] == False:
                 continue
+            logger.loginfo("201")
             # torch.cuda.synchronize()
             t0 = time.time()
 
@@ -724,6 +731,7 @@ class SceneGraphProcessor:
                                     mask=masks)
             
             tracks = tracker.update_with_detections(detections)
+            logger.loginfo("400")
 
             if False: # detections is not None:
                 labels = [
@@ -750,6 +758,7 @@ class SceneGraphProcessor:
 
             # 4) 원본 boxes, masks, 소요시간을 메인 프로세스로 전달
             yolo_queue.put((stamp, detections))
+            logger.loginfo("500")
 
 
     def gen_hash_key_3d(self, points, voxel_size=0.1):
@@ -870,7 +879,9 @@ class SceneGraphProcessor:
             if not merged and id_i not in used_ids and id_i not in updated_detections:
                 updated_detections[id_i] = det_i
 
+        self.logger.loginfo(f"updated_detections: {len(updated_detections)}")
         self.objects = updated_detections
+        self.logger.loginfo(f"self.objects: {len(self.objects)}")
    
     def override_points(self, points, new_id, yolo_conf, size_conf, voxel_size=0.05): #, new_conf, voxel_size=0.05):
         keys = self.gen_hash_key_3d(points[:, :3], voxel_size=voxel_size)
@@ -1222,28 +1233,40 @@ class SceneGraphProcessor:
             
                 
     def get_latest_blocking(self, q):
-        item = q.get()  # blocking
+        # item = q.get()  # blocking
+        self.logger.loginfo(f"queue size: {q.qsize()}")
         while True:
             try:
-                item = q.get_nowait()
+                item = q.get(timeout=0.5)
+                return item
+                # item = q.get_nowait()
             except pyqueue.Empty:   # ← 모듈명까지 붙여서 예외 지정
+                self.logger.logwarn("yolo get timeout")
                 break
-        return item
+        return None
 
     def run(self):
         iter = 0
         while self.running and not rospy.is_shutdown():
             if not self.already_set_classes:
-                # self.logger.log(f"Wait for classes...")
+                self.logger.log(f"Wait for classes...")
                 rospy.sleep(0.01)
                 continue
+            self.logger.loginfo(f"rgb SSSqueue size: {self.rgb_queue.qsize()}")
 
             self.logger.log(f"--- Iteration {iter} ---")
+            self.logger.log("1")
             self.merge_detections_every_n_iter(iter, 5)
+            self.logger.log("1.1")
             iter += 1
             t0 = time.time()
-            stamp, boxes = self.get_latest_blocking(self.yolo_queue)
+            result = self.get_latest_blocking(self.yolo_queue)
+            if result is None:
+                continue
+            stamp, boxes = result
+            self.logger.log("1.2")
             yolo_time = time.time() - t0
+            self.logger.log("2")
             with self.lock:
                 synced_data = self.sync_queue.pop(stamp, None)
             if synced_data is None:
@@ -1253,6 +1276,7 @@ class SceneGraphProcessor:
 
             # Check new_detection_signal
             ids = boxes.tracker_id.astype(int) if getattr(boxes, 'tracker_id') is not None else []
+            self.logger.log("3")
             # if len(ids) > 0:
             #     current_max_id = ids.max()
 
@@ -1265,6 +1289,7 @@ class SceneGraphProcessor:
             for k in list(self.sync_queue.keys()):
                 if k < stamp:
                     del self.sync_queue[k]
+            self.logger.log("4")
 
             # LiDAR가 없는 경우(real world에서 depth만 사용하는 경우 등)를
             # 고려하여 cloud_msg가 None일 수 있음.
@@ -1282,6 +1307,7 @@ class SceneGraphProcessor:
             t_b2w = pose["position"]
             cloud = cloud_body @ R_b2w.T + t_b2w if cloud_body.size > 0 else np.empty((0, 3), dtype=np.float32)
 
+            self.logger.log("5")
             #4x4 pose
             cur_pose = np.eye(4)
             cur_pose[:3, :3] = pose["rotation"]
@@ -1296,6 +1322,7 @@ class SceneGraphProcessor:
             ):
                 # self.logger.log("No detections")
                 continue
+            self.logger.log("6")
 
             tracking_ids = boxes.tracker_id.astype(int).tolist()
             confs = boxes.confidence.tolist()
@@ -1308,6 +1335,7 @@ class SceneGraphProcessor:
             if not run_sam_this_frame:
                 # YOLO 트래킹만 업데이트하고, 무거운 SAM/3D 파이프라인은 건너뜀
                 continue
+            self.logger.log("7")
 
             # 트래킹된 객체( id >= 0 )만 SAM 대상
             tracked_indices = [i for i, tid in enumerate(tracking_ids) if tid >= 0]
@@ -1320,7 +1348,30 @@ class SceneGraphProcessor:
             class_ids = [class_ids[i] for i in tracked_indices]
             bounding_boxes = bounding_boxes[tracked_indices]
             labels = np.array(class_ids)
+            self.logger.log("8")
 
+            # self.logger.loginfo(f">>>> class_ids: {class_ids}")
+            # valid_indices = []
+            # for i, cid in enumerate(class_ids):
+            #     cname = self.classnames[cid]
+            #     self.logger.loginfo(f">>>> cid, cname: {cid}, {cname}")
+            #     if not cname in self.default_classnames:
+            #         valid_indices.append(i)
+            # self.logger.loginfo(f">>>> valid_indices: {valid_indices}")
+            #
+            # if not valid_indices:
+            #     continue
+            #
+            # # 필터링 적용
+            # tracking_ids = [tracking_ids[i] for i in valid_indices]
+            # confs = [confs[i] for i in valid_indices]
+            # class_ids = [class_ids[i] for i in valid_indices]
+            # bounding_boxes = bounding_boxes[valid_indices]
+            # labels = np.array(class_ids)
+            # self.logger.loginfo(f">>>> bounding_boxes: {bounding_boxes.shape}")
+            # self.logger.loginfo(f">>>> class_ids: {class_ids}")
+
+            self.logger.log("9")
             if self.is_real_world and (self.yolo_debug_img_pub is not None):
                 vis_now = rospy.Time.now()
                 if (vis_now - self.last_debug_pub_time).to_sec() > 1.0 / self.debug_publish_rate:
@@ -1330,6 +1381,8 @@ class SceneGraphProcessor:
                         cls_id = class_ids[i]
                         conf = confs[i]
                         label = self.obj_classes[cls_id] if 0 <= cls_id < len(self.obj_classes) else str(cls_id)
+                        # if label in self.default_classnames:
+                        #     continue
                         cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
                         txt = f"{label} {conf:.2f}"
                         cv2.putText(
@@ -1351,6 +1404,7 @@ class SceneGraphProcessor:
                 image.copy(), bboxes=bounding_boxes, verbose=False,
             )
             masks = sam_results[0].masks.data
+            self.logger.log("10")
 
             # SAM 마스크 침식:
             # - bbox가 어느 정도 이상 클 때만 적용해서
@@ -1378,6 +1432,7 @@ class SceneGraphProcessor:
             masks_np = np.array(masks_np)
 
             sam_boxes = []
+            self.logger.log("11")
 
             def mask_to_bbox(mask: torch.Tensor):
                 if isinstance(mask, np.ndarray):
@@ -1398,6 +1453,7 @@ class SceneGraphProcessor:
 
             t3 = time.time()
             projected_image = image.copy()
+            self.logger.log("12")
 
             # Kinect(depth) 기반 포인트 클라우드 사용 (가능하면)
             if self.use_depth_for_seg and (depth_image is not None):
@@ -1438,6 +1494,7 @@ class SceneGraphProcessor:
                         label_ids=self.classnames
                         # index=iter
                     )
+            self.logger.log("13")
 
             # Depth 기반 포인트클라우드(obj_clouds_world)를
             # RGB 이미지에 다시 투영해서 시각화 (디버그용)
@@ -1553,11 +1610,13 @@ class SceneGraphProcessor:
                     self.yolo_debug_img_pub.publish(msg)
                     self.last_debug_pub_time = vis_now
                     # self.logger.loginfo("publish depth_seg_reproj_debug")
+            self.logger.log("14")
             
             for i, tracking_id in enumerate(tracking_ids):
                 if tracking_id == -1:
                     tracking_ids[i] = self.untracked_id 
                     self.untracked_id -= 1
+            self.logger.log("15")
 
             # self.xyzrgbl_pub.publish(pointcloud2_msg)
             # self.publish_pointcloud(obj_clouds_world, colors_list, semantic_labels, image_stamp)
@@ -1587,6 +1646,7 @@ class SceneGraphProcessor:
             merged_num = 0
             new_detected_num = 0
             track_fail_num = 0
+            self.logger.log("16")
 
 
             # print(f"bounding_boxes {bounding_boxes}")
@@ -1615,6 +1675,8 @@ class SceneGraphProcessor:
                 # print(f"self.dbscan_eps {self.dbscan_eps}")
                 # DBSCAN으로 가장 큰 클러스터만 남기고,
                 # 포인트 수가 충분히 많지 않으면 노이즈로 간주
+                self.logger.log(f"DBSCAN: #pcd={obj_cloud.shape},  eps={self.dbscan_eps}")
+                # obj_cloud = cluster_dbscan(obj_cloud[::4], self.dbscan_eps, 5)
                 obj_cloud = cluster_dbscan(obj_cloud, self.dbscan_eps, 5)
                 
                 # 포인트 개수가 충분히 많지 않으면 object로 사용하지 않음
@@ -1722,6 +1784,7 @@ class SceneGraphProcessor:
                         # "bboxes": bounding_box, # DSHONG
                     })
                     continue
+                self.logger.log("17")
 
                 merged_to_id = None
                 reason = None
@@ -1824,7 +1887,8 @@ class SceneGraphProcessor:
                         # "bboxes": bounding_box, # DSHONG
                     })
                     # print(f"{tracking_id} bounding_box {bounding_box}")
-
+            self.logger.log("18")
+            self.logger.log(f"!!!!!!!!!!!object len: {len(self.objects)}")
             self.logger.log(f"\033[94m✅ -1: {track_fail_num}, all: {all_num}, filtered: {filtered1_num}, {filtered2_num}, {filtered3_num}, {filtered4_num}, tracked: {tracked_num}, diff_cls: {diff_cls_num}, merged: {merged_num}, new: {new_detected_num}\033[0m")
             
 
@@ -1844,9 +1908,9 @@ class SceneGraphProcessor:
             #     continue
             
             # Check if the pose has changed enough to add a keyframe=
-            if self.keyframe_counter == 0 \
-                    or (self.pose_changed_enough(cur_pose, self.last_keyframe_pose)):
-                
+            # if self.keyframe_counter == 0 \
+            #         or (self.pose_changed_enough(cur_pose, self.last_keyframe_pose)):
+            if True:
                 self.logger.log("======= Pose Change Enough =======")
                 self.prev_objects = len(self.objects)
                 # self.new_detection_signal = False
@@ -2404,6 +2468,7 @@ class SceneGraphProcessor:
                     instance_id = node_u.get("instance_id", None)
                     if instance_id is not None and instance_id in self.objects and "center" in self.objects[instance_id]:
                         pu = self.objects[instance_id]["center"]
+                        self.logger.loginfo(f"<<< objects: {instance_id} ({len(self.objects)}")
                     else:
                         continue
                 else:
@@ -2583,6 +2648,7 @@ class SceneGraphProcessor:
 
         # base_dir = '/ws/external/vla_ws/CMU-VLA-Challenge/ai_module/offline_map' #'/ws/external/offline_map'
         base_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
+        self.logger.loginfo(f"base_dir: {base_dir}")
         save_dir = None
         if save_to_disk:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2613,6 +2679,7 @@ class SceneGraphProcessor:
                     oid = int(pt[3])
                     hash_keys_per_id.setdefault(oid, []).append(int(key))
 
+            self.logger.loginfo(f"self.objects: {self.objects.keys()}")
             for oid, info in self.objects.items():
                 try:
                     serializable_objects[int(oid)] = {
@@ -2644,7 +2711,10 @@ class SceneGraphProcessor:
                     # 'bbox_by_kf':   info['bbox_by_kf'],
                 }
             # Convert numpy types and save the objects JSON
+            self.logger.loginfo(f"serializable_objects: {len(serializable_objects)}")
+            self.logger.loginfo(f"obj_path: {obj_path}")
             json_objects = convert_numpy_types(serializable_objects)
+            self.logger.loginfo(f"json_objects: {len(json_objects)}")
             if obj_path is not None:
                 with open(obj_path, 'w') as f:
                     json.dump(json_objects, f, indent=2)
@@ -2830,6 +2900,8 @@ class SceneGraphProcessor:
                         edge_entry[k] = v
                 serialized_edges.append(edge_entry)
 
+            self.logger.loginfo(f"serialized_nodes: {len(serialized_nodes)}")
+            self.logger.loginfo(f"serialized_edges: {len(serialized_edges)}")
             graph_data = {
                 "nodes": serialized_nodes,
                 "edges": serialized_edges,
