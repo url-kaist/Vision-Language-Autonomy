@@ -775,3 +775,79 @@ else:
 # from visual_grounding.srv import SetSubplans, SetSubplansResponse
 # from std_srvs.srv import Trigger, TriggerResponse
 # ------------------------------------------------------------
+    # --------------------------------------------------------
+    # cv_bridge (ADD THIS)
+    # --------------------------------------------------------
+    cv_bridge = _mk_mod("cv_bridge")
+
+    class CvBridgeError(Exception):
+        pass
+
+    cv_bridge.CvBridgeError = CvBridgeError
+
+    # ---- internal helpers ----
+    def _dtype_from_encoding(enc):
+        import numpy as np
+        enc = (enc or "").lower()
+        if enc in ("bgr8", "rgb8", "mono8", "bgra8", "rgba8"):
+            return np.uint8
+        if enc in ("16uc1",):
+            return np.uint16
+        if enc in ("32fc1",):
+            return np.float32
+        return np.uint8
+
+    def _channels_from_encoding(enc):
+        enc = (enc or "").lower()
+        if enc in ("mono8", "16uc1", "32fc1"):
+            return 1
+        if enc in ("bgr8", "rgb8"):
+            return 3
+        if enc in ("bgra8", "rgba8"):
+            return 4
+        return 3
+
+    def _bytes_per_channel(enc):
+        import numpy as np
+        return np.dtype(_dtype_from_encoding(enc)).itemsize
+
+    # ---- CvBridge stub ----
+    class CvBridge:
+        __slots__ = ()
+
+        def imgmsg_to_cv2(self, img_msg, desired_encoding="passthrough"):
+            try:
+                import numpy as np
+                h, w = int(img_msg.height), int(img_msg.width)
+                enc = img_msg.encoding or "bgr8"
+                ch = _channels_from_encoding(enc)
+                dt = _dtype_from_encoding(enc)
+
+                buf = np.frombuffer(img_msg.data, dtype=dt)
+                if ch == 1:
+                    arr = buf.reshape((h, w))
+                else:
+                    arr = buf.reshape((h, w, ch))
+                return arr
+            except Exception as e:
+                raise CvBridgeError(f"imgmsg_to_cv2 failed: {e}")
+
+        def cv2_to_imgmsg(self, cv_img, encoding="bgr8"):
+            try:
+                import numpy as np
+                from sensor_msgs.msg import Image
+                msg = Image()
+                msg.height, msg.width = int(cv_img.shape[0]), int(cv_img.shape[1])
+                msg.encoding = encoding
+                msg.is_bigendian = 0
+                ch = 1 if cv_img.ndim == 2 else cv_img.shape[2]
+                msg.step = msg.width * (_bytes_per_channel(encoding) * ch)
+                msg.data = memoryview(np.ascontiguousarray(cv_img)).tobytes()
+                return msg
+            except Exception as e:
+                raise CvBridgeError(f"cv2_to_imgmsg failed: {e}")
+
+    cv_bridge.CvBridge = CvBridge
+
+    # ★ 이 줄이 핵심 ★
+    _install_stub("cv_bridge", cv_bridge)
