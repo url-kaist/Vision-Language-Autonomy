@@ -5,11 +5,11 @@ TOPIC="/challenge_question"
 MSG_TYPE="std_msgs/String"
 
 SCENARIOS=(
-  "Find a blue chair between red chairs"
+  "Find a red chair between blue chairs"
   "Find a red chair below the halloween poster"
   "Find a blue fire extinguisher next to the TV monitor"
   "How many books are on the bookshelf?"
-  "How many blur chairs are below the halloween poster?"
+  "How many chairs does the doll sit on?"
   "How many silver fire extinguishers are there next to the TV monitor?"
   # 여기에 시나리오를 계속 추가하세요.
 )
