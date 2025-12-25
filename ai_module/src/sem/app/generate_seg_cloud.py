@@ -384,7 +384,7 @@ def _generate_seg_comp_cloud_from_depth(
         # depth 이미지에서 대응되는 depth 샘플링
         d = depth[v_d_rounded, u_d_rounded] * depth_scale
         # 유효한 depth만 사용 (0 초과이면서 finite)
-        valid_depth = (d > 0) & np.isfinite(d)
+        valid_depth = np.isfinite(d) & (d > 0) & (d < 5.0)
         if not np.any(valid_depth):
             continue
 
