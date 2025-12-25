@@ -67,6 +67,17 @@ def make_palette(K, n_candidates: int = 2000, seed: int = 0):
     palette_rgb = (rgb[selected] * 255).astype(np.uint8)
     return palette_rgb
 
+import time
+import socket
+def _wait_port(host: str, port: int, timeout_s: float = 3.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.2):
+                return True
+        except OSError:
+            time.sleep(0.05)
+    return False
 
 class RRLogger:
     timeline = "ros_time"
@@ -81,101 +92,144 @@ class RRLogger:
         if save:
             rr.init(name)
             rr.save(full_output_path)
-        else:
-            subprocess.Popen([
-                "rerun",
-                "--serve",
-                "--bind", "0.0.0.0",
-                "--web-viewer-port", "9090",
-                "--port", "9876"],
+            self.rr = rr
+            return
+
+        host = "127.0.0.1"
+        tcp_port = 9876
+        ws_port = 9877  # web viewer connects here
+        web_port = 9090
+
+        if not (_wait_port(host, tcp_port, timeout_s=0.2) and _wait_port(host, web_port, 0.2) \
+                and _wait_port(host, ws_port, 0.2)):
+            # 2) 실패 로그를 버리지 말고 파일로 남김
+            log_path = osp.join(output_path, "rerun_server.stderr.log")
+            err_f = open(log_path, "a", buffering=1)
+
+            subprocess.Popen(
+                ["rerun", "--serve", "--bind", "0.0.0.0",
+                 "--web-viewer-port", str(web_port),
+                 "--port", str(tcp_port)],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stderr=err_f,
             )
-            rr.init(name, spawn=False)
 
-            prefix_sg = "SG"
-            log_root = "VG/"
-            blueprint = rrb.Blueprint(
-                rrb.Vertical(
-                    rrb.Horizontal(
-                        # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
-                        rrb.Spatial3DView(
-                            name="SceneGraph 3D",
-                            origin="/",
-                            contents=[f"SG/**"],
-                        ),
+            # 3) 서버 준비 대기
+            if not _wait_port(host, tcp_port, timeout_s=3.0):
+                raise RuntimeError(
+                    f"Rerun server did not open {host}:{tcp_port}. "
+                    f"Check: {log_path}"
+                )
+            if not _wait_port(host, ws_port, timeout_s=3.0):
+                raise RuntimeError(
+                    f"Rerun server did not open {host}:{ws_port}. "
+                    f"Check: {log_path}"
+                )
+            if not _wait_port(host, web_port, timeout_s=3.0):
+                raise RuntimeError(
+                    f"Rerun server did not open {host}:{web_port}. "
+                    f"Check: {log_path}"
+                )
 
-                        # (2) 우측 패널: 2D 이미지 + 선택 패널
-                        rrb.Vertical(
-                            rrb.Spatial2DView(
-                                name="Observation",
-                                origin="/",
-                                contents=[f"obs/**"],
-                            ),
-                            rrb.Spatial2DView(
-                                name="Keyframe Image",
-                                origin=f"{prefix_sg}",
-                                contents=[f"{prefix_sg}/nodes/NodeLevel.KEYFRAME/**"],
-                            ),
-                            rrb.SelectionPanel(),
-                        ),
+        rr.init(name, spawn=False)
+
+        # 4) connect 재시도 (간단 backoff)
+        last_err = None
+        for _ in range(10):
+            try:
+                rr.connect(f"{host}:{tcp_port}")
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(0.1)
+
+        if last_err is not None:
+            raise RuntimeError(f"rr.connect failed: {last_err}")
+        rr.log("debug/hello", rr.TextLog("connected"))
+
+        prefix_sg = "SG"
+        log_root = "VG/"
+        blueprint = rrb.Blueprint(
+            rrb.Vertical(
+                rrb.Horizontal(
+                    # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
+                    rrb.Spatial3DView(
+                        name="SceneGraph 3D",
+                        origin="/",
+                        contents=[f"SG/**"],
                     ),
-                    rrb.Horizontal(
-                        rrb.Vertical(
-                            rrb.TextLogView(
-                                name="VG/summary/task",
-                                origin="/",
-                                contents=[f"{log_root}/summary/task/**"],
-                            ),
-                            rrb.TextLogView(
-                                name="VG/summary/status",
-                                origin="/",
-                                contents=[f"{log_root}/summary/status/**"],
-                            ),
-                            row_shares=[1, 1],
-                        ),
-                        rrb.TextLogView(
-                            name="VG/details",
+
+                    # (2) 우측 패널: 2D 이미지 + 선택 패널
+                    rrb.Vertical(
+                        rrb.Spatial2DView(
+                            name="Observation",
                             origin="/",
-                            contents=[f"{log_root}/details/**"],
+                            contents=[f"obs/**"],
                         ),
-                        column_shares=[1, 1],
+                        # rrb.Spatial2DView(
+                        #     name="Keyframe Image",
+                        #     origin=f"/",
+                        #     contents=[f"SG/**"],
+                        # ),
+                        rrb.SelectionPanel(),
                     ),
                 ),
-                # row_shares=[1, 1],
-
-                rrb.Vertical(
-                    rrb.Horizontal(
+                rrb.Horizontal(
+                    rrb.Vertical(
                         rrb.TextLogView(
-                            name="VG/default",
+                            name="VG/summary/task",
                             origin="/",
-                            contents=[f"{log_root}/default/**"],
+                            contents=[f"{log_root}/summary/task/**"],
                         ),
                         rrb.TextLogView(
-                            name="VG/main",
+                            name="VG/summary/status",
                             origin="/",
-                            contents=[f"{log_root}/main/**"],
+                            contents=[f"{log_root}/summary/status/**"],
                         ),
-                        column_shares=[1, 1],
+                        row_shares=[1, 1],
                     ),
-                    rrb.Horizontal(
-                        rrb.TextLogView(
-                            name="VG/inference",
-                            origin="/",
-                            contents=[f"{log_root}/inference/**"],
-                        ),
-                        rrb.TextLogView(
-                            name="VG/nav",
-                            origin="/",
-                            contents=[f"{log_root}/nav/**"],
-                        ),
-                        column_shares=[1, 1],
+                    rrb.TextLogView(
+                        name="VG/details",
+                        origin="/",
+                        contents=[f"{log_root}/details/**"],
                     ),
-                    row_shares=[1, 1],
+                    column_shares=[1, 1],
                 ),
-            )
-            rr.send_blueprint(blueprint, make_active=True)
-            rr.connect("127.0.0.1:9876")
+            ),
+            # row_shares=[1, 1],
+
+            rrb.Vertical(
+                rrb.Horizontal(
+                    rrb.TextLogView(
+                        name="VG/default",
+                        origin="/",
+                        contents=[f"{log_root}/default/**"],
+                    ),
+                    rrb.TextLogView(
+                        name="VG/main",
+                        origin="/",
+                        contents=[f"{log_root}/main/**"],
+                    ),
+                    column_shares=[1, 1],
+                ),
+                rrb.Horizontal(
+                    rrb.TextLogView(
+                        name="VG/inference",
+                        origin="/",
+                        contents=[f"{log_root}/inference/**"],
+                    ),
+                    rrb.TextLogView(
+                        name="VG/nav",
+                        origin="/",
+                        contents=[f"{log_root}/nav/**"],
+                    ),
+                    column_shares=[1, 1],
+                ),
+                row_shares=[1, 1],
+            ),
+        )
+        rr.send_blueprint(blueprint, make_active=True)
 
         self.rr = rr
 
