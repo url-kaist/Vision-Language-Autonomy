@@ -117,8 +117,13 @@ class KeyframeNode(Node):
         if not 'image_path' in attrs:
             raise ValueError(f"KeyframeNode must have image_path")
         image_path = attrs['image_path']
-        attrs['image'] = cv2.imread(image_path)
         attrs['fname'] = image_path.split("/")[-1]
+        attrs['image'] = cv2.imread(image_path)
+        if attrs['image'] is None:
+            keyframe_dir = os.environ.get('KEYFRAMES_DIR2', '/ws/external/test_data/vla_js_chair_2025-12-17-12-17-43/keyframes')
+            image_path = os.path.join(keyframe_dir, attrs['fname'])
+            attrs['image'] = cv2.imread(image_path)
+            attrs['image_path'] = image_path
 
 _NODE_LEVEL_TO_CLS = {
     NodeLevel.BUILDING: BuildingNode,
@@ -177,8 +182,9 @@ class SceneGraph:
         self.cam_to_body_t = np.zeros(3, dtype=np.float32)
 
         self.image_height, self.image_width = 480, 640
-        self.z_const = -0.40
+        self.z_const = -0.8
         self.max_range = 8.0
+        self.ground_offset = np.array([0.0, 0.0, 0.8])
 
     @property
     def fov_x(self):
@@ -224,7 +230,7 @@ class SceneGraph:
                     self.image_height, self.image_width = image.shape[:-1]
 
                 self.G.add_node(node.id, **node.__dict__)
-                print(f"Add node: {node}")
+                # print(f"Add node: {node}")
 
             for data in scene_graph.get('edges', []):
                 source = (data['source']['level'], data['source']['id'])
@@ -244,7 +250,7 @@ class SceneGraph:
 
                 self.G.add_edge(source, target)
                 self.G.add_edge(target, target)
-                print(f"Add edge: {source} <-> {target}")
+                # print(f"Add edge: {source} <-> {target}")
         print(f"=> Graph: {self.G}")
 
 
@@ -354,7 +360,8 @@ class SceneGraph:
 
         image_height, image_width, _ = kf_attrs['image'].shape
         xs, ys = self.project_pts(pts_world, pose, image_size=(image_height, image_width))
-
+        if (xs is None) or (len(xs) == 0):
+            return (0, 0, 0, 0)
         u_min, v_min, u_max, v_max = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
         return (u_min, v_min, u_max, v_max)
 

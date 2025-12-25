@@ -44,6 +44,8 @@ from ai_module.src.visual_grounding.scripts.structures.answer import Answer
 from ai_module.src.visual_grounding.scripts.structures.scene_graph import NodeLevel
 from ai_module.src.visual_grounding.scripts.structures.bbox import BBoxes
 from ai_module.src.utils.visualizer import Visualizer
+from ai_module.src.utils.utils_traversability import filter_disconnected_traversable, load_pcd_ascii_with_fields
+from ai_module.src.utils.utils_pose import theta_from_agent_pose
 
 import rerun as rr
 
@@ -66,13 +68,6 @@ from std_srvs.srv import Trigger, TriggerResponse
 from ai_module.src.utils.rr_logger import RRLogger, rotmat_to_quat_xyzw
 from cv_bridge import CvBridge
 
-
-def theta_from_agent_pose(orientation):
-    qx, qy, qz, qw = orientation
-    siny_cosp = 2.0 * (qw * qz + qx * qy)
-    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
-    theta = np.arctan2(siny_cosp, cosy_cosp)
-    return theta
 
 ANSWER_TYPE = {'find': Marker, 'count': Int32}
 ANSWER_TOPIC_NAME = {'find': 'selected_object_marker', 'count': '/numerical_response'}
@@ -528,12 +523,12 @@ class BaseVisualGrounder(BaseModel):
 
     def _img_callback(self, msg):
         try:
-            self.log(f"IMAGE CALLBACK) COMPRESSED?")
+            # self.log(f"IMAGE CALLBACK) COMPRESSED?")
             np_arr = np.frombuffer(msg.data, np.uint8)
             bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         except:
-            self.log(f"IMAGE CALLBACK) RAW?")
+            # self.log(f"IMAGE CALLBACK) RAW?")
             bgr = CvBridge().imgmsg_to_cv2(msg, desired_encoding="bgr8")
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         self.rr_logger.log({'obs/rgb': rr.Image(image=rgb)})
@@ -669,6 +664,16 @@ class BaseVisualGrounder(BaseModel):
         self.system_instruction_renderer = SystemInstructionRenderer()
 
         self.ready = True
+        if self.vis_traversable_points:
+            self.traversable_points += self.sg.ground_offset
+            self.risky_points += self.sg.ground_offset
+            self.rr_logger.log({
+                'SG/traversable_points': rr.Points3D(self.traversable_points, colors=[0, 255, 0, 200], radii=0.05)
+            }) # non-traversable: red (transparent)
+            self.rr_logger.log({
+                'SG/non_traversable_points': rr.Points3D(self.risky_points, colors=[255, 0, 0, 80], radii=0.02)
+            }) # traversable: green
+            self.vis_traversable_points = False
 
     def log_sg(self, G):
         prefix = "SG/nodes"
@@ -689,21 +694,18 @@ class BaseVisualGrounder(BaseModel):
                 })
             elif level == str(NodeLevel.KEYFRAME):
                 pose = np.array(attrs['pose'], dtype=np.float32)
-                R, t = pose[:3, :3], pose[:3, 3]
+                R_b2w, t_b2w = pose[:3, :3], pose[:3, 3]
+                R_c2w = R_b2w @ self.sg.cam_to_body_R
+                t_c2w = R_b2w @ self.sg.cam_to_body_t + t_b2w
                 self.rr_logger.log({
                     entity_path: rr.Transform3D(
-                        translation=t, quaternion=rotmat_to_quat_xyzw(R)
+                        translation=t_c2w, quaternion=rotmat_to_quat_xyzw(R_c2w)
                     )
                 })
                 height, width, _ = attrs['image'].shape
-                fx_rgb = 606.040283203125
-                fy_rgb = 606.2955932617188
-                cx_rgb = 328.3797912597656
-                cy_rgb = 245.35792541503906
-                intrinsics = np.array([[fx_rgb, 0, cx_rgb], [0, fy_rgb, cy_rgb], [0, 0, 1]])
                 self.rr_logger.log({
                     entity_path: rr.Pinhole(
-                        resolution=[width, height], image_from_camera=intrinsics, camera_xyz=rr.ViewCoordinates.RDF,
+                        resolution=[width, height], image_from_camera=self.sg.rgb_K, camera_xyz=rr.ViewCoordinates.RDF,
                     )
                 })
                 self.rr_logger.log({
@@ -802,6 +804,7 @@ class BaseVisualGrounder(BaseModel):
                             raise NotImplementedError("No implementation for other etypes")
                         save_path = self.sg.save_path(etype, fname)
                         success = cv2.imwrite(save_path, image)
+                        self.rr_logger.log({f"SG/nodes/NodeLevel.KEYFRAME/{id}": rr.Image(image)})
                         if success:
                             success_path.append(save_path)
                         else:
@@ -1109,39 +1112,39 @@ class BaseVisualGrounder(BaseModel):
                     color = (0.0, 0.0, 1.0, 1.0)
                     eid = int(answer)
                     self.logger.loginfo(f"<answer_the_question.5.2> Get single EID={eid}...")
-                    answer_entity = self.sg.entities.get_single(eid)
-                    self.logger.loginfo(f"<answer_the_question.5.2> answer_entity: {answer_entity}")
+                    # answer_entity = self.sg.entities.get_single(eid)
+                    # self.logger.loginfo(f"<answer_the_question.5.2> answer_entity: {answer_entity}")
+                    #
+                    # # Refinement
+                    # self.logger.loginfo(f"<answer_the_question.5.3> Refinement...")
+                    # eid2pids = self.sg.keyframes.entity_id2place_ids
+                    # pids_answer = eid2pids[answer_entity.id]
+                    # kfs_answer = self.sg.keyframes.get(pids_answer)
+                    # initial_bbox_3d = answer_entity.corners_3d
+                    #
+                    # self.logger.loginfo(f"<answer_the_question.5.4> Let's minimize")
+                    # refined_result = minimize(
+                    #     refine_bbox,
+                    #     initial_bbox_3d,
+                    #     args=(answer_entity, kfs_answer,),
+                    #     method='Nelder-Mead',
+                    #     options={'disp': True}
+                    # )
+                    # refined_point_3d = refined_result.x.reshape(-1, 3)
+                    #
+                    # self.logger.loginfo(f"<answer_the_question.5.5> point_3d_to_marker:\n"
+                    #                     f"  > initial_bbox_3d: {initial_bbox_3d}\n"
+                    #                     f"  > refined_point_3d: {refined_point_3d}\n")
+                    # marker_orig = point_3d_to_marker(initial_bbox_3d, eid, color=color, style='box')
+                    # marker = point_3d_to_marker(refined_point_3d, eid, color=color, style='box')
+                    # answer_msg = point_3d_to_marker(refined_point_3d, eid, color=color, style='cube')
 
-                    # Refinement
-                    self.logger.loginfo(f"<answer_the_question.5.3> Refinement...")
-                    eid2pids = self.sg.keyframes.entity_id2place_ids
-                    pids_answer = eid2pids[answer_entity.id]
-                    kfs_answer = self.sg.keyframes.get(pids_answer)
-                    initial_bbox_3d = answer_entity.corners_3d
-
-                    self.logger.loginfo(f"<answer_the_question.5.4> Let's minimize")
-                    refined_result = minimize(
-                        refine_bbox,
-                        initial_bbox_3d,
-                        args=(answer_entity, kfs_answer,),
-                        method='Nelder-Mead',
-                        options={'disp': True}
-                    )
-                    refined_point_3d = refined_result.x.reshape(-1, 3)
-
-                    self.logger.loginfo(f"<answer_the_question.5.5> point_3d_to_marker:\n"
-                                        f"  > initial_bbox_3d: {initial_bbox_3d}\n"
-                                        f"  > refined_point_3d: {refined_point_3d}\n")
-                    marker_orig = point_3d_to_marker(initial_bbox_3d, eid, color=color, style='box')
-                    marker = point_3d_to_marker(refined_point_3d, eid, color=color, style='box')
-                    answer_msg = point_3d_to_marker(refined_point_3d, eid, color=color, style='cube')
-
-                    self.logger.loginfo(f"<answer_the_question.5.6> Publish Answer...")
-                    self.answer_pub.publish(answer_msg)
-                    self.logger.loginfo(f"<answer_the_question.5.6> Publish...")
-                    self.marker_pub.publish(marker)
-                    self.marker_pub_orig.publish(marker_orig)
-                    self.logger.loginfo(f"<answer_the_question.5.6> Publish... Done")
+                    # self.logger.loginfo(f"<answer_the_question.5.6> Publish Answer...")
+                    # self.answer_pub.publish(answer_msg)
+                    # self.logger.loginfo(f"<answer_the_question.5.6> Publish...")
+                    # self.marker_pub.publish(marker)
+                    # self.marker_pub_orig.publish(marker_orig)
+                    # self.logger.loginfo(f"<answer_the_question.5.6> Publish... Done")
                 elif self.action in ['count']:
                     count = int(answer)
                     answer_msg = Int32(count)
@@ -1156,6 +1159,9 @@ class BaseVisualGrounder(BaseModel):
 
         self.logger.loginfo(f"self.answer: {self.answer}")
         self.logger.logrich(f"Answer: {answer}", name='answer')
+        # self.rr_logger.rr.flush()
+        # time.sleep(0.5)
+        # sys.exit(0)
 
     def answer_the_question(self, answer, block=False):
         return self._dispatcher.submit_high(self._answer_impl, answer, block=block)
@@ -1810,10 +1816,27 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         super()._init_subscribers(*args, **kwargs)
         
         """ Robot current state """
+        self.log("Odom Sub")
         self.odom_sub = rospy.Subscriber("/state_estimation", Odometry, self._odom_callback, queue_size=20)
+        self.odom_sub2 = rospy.Subscriber("/Odometry", Odometry, self._odom_callback2, queue_size=20)
 
         """ Traversable area """
+        traversable_path = os.environ.get("TRAVERSABLE_PATH", None)
         self.traversable_points = None
+        self.vis_traversable_points = False
+        if traversable_path is not None:
+            cols, arr = load_pcd_ascii_with_fields(traversable_path)
+            filtered_arr, mask = filter_disconnected_traversable(
+                cols, arr, res=0.11, collision_thr=0.1, use_8n=False
+            )
+            col2idx = {c: i for i, c in enumerate(cols)}
+            collision_risk = arr[:, col2idx["collision_risk"]]
+            xyz = arr[:, [col2idx["x"], col2idx["y"], col2idx["z"]]]
+            print("collision_risk:", float(np.nanmin(collision_risk)), float(np.nanmax(collision_risk)))
+
+            self.traversable_points = np.asarray(xyz[mask]) # self.traversable_points = np.asarray(xyz[~mask])
+            self.risky_points = np.asarray(xyz[~mask]) # self.risky_points = np.asarray(xyz_risky)
+            self.vis_traversable_points = True
         self._traversable_lock = threading.RLock()
         self.traversable_area_sub = rospy.Subscriber(
             "/traversable_area_filtered", PointCloud2, self._traversable_area_callback, queue_size=10)
@@ -1858,18 +1881,45 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
 # CALLBACKS
     def _odom_callback(self, msg):
-        self.agent_pose = {
+        self.log("_odom_callback")
+        self.agent_pose = agent_pose = {
             "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
             "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
         }
-        if self.debug:  # TODO: debug: Save the path_xy
-            _ = save_path_xy(self.agent_pose['position'], base_dir="/ws/external/offline_map", name="agent_pose")
+        theta = theta_from_agent_pose(agent_pose['orientation'])
+        self.rr_logger.log(
+            {'SG/agent': rr.Arrows3D(
+                origins=agent_pose['position'],
+                vectors=np.array([[np.cos(theta), np.sin(theta), 0.0]], dtype=np.float32) * 0.5,
+                radii=0.1)})
+        offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
+        if True: # self.debug:  # TODO: debug: Save the path_xy
+            _ = save_path_xy(agent_pose['position'], base_dir=offline_map_dir, name="position")
+            _ = save_path_xy(agent_pose['orientation'], base_dir=offline_map_dir, name="orientation")
+
+    def _odom_callback2(self, msg):
+        self.log("_odom_callback2")
+        self.agent_pose = agent_pose = {
+            "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
+            "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
+        }
+        theta = theta_from_agent_pose(agent_pose['orientation'])
+        self.rr_logger.log(
+            {'SG/agent': rr.Arrows3D(
+                origins=agent_pose['position'],
+                vectors=np.array([[np.cos(theta), np.sin(theta), 0.0]], dtype=np.float32) * 0.5,
+                radii=0.1)})
+        offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
+        if True: # self.debug:  # TODO: debug: Save the path_xy
+            _ = save_path_xy(agent_pose['position'], base_dir=offline_map_dir, name="position")
+            _ = save_path_xy(agent_pose['orientation'], base_dir=offline_map_dir, name="orientation")
 
     def _traversable_area_callback(self, msg) -> None:
         if self.traversable_points is None:
             traversable_pts, _ = pointcloud2_to_xy_array(msg)
             with self._traversable_lock:
                 self.traversable_points = traversable_pts
+                self.vis_traversable_points = True
 
     def _occupancy_grid_callback(self, msg):
         self.occupancy_grid = CustomOccupancyGrid(msg)
@@ -1954,7 +2004,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 pose_files = [
                     os.path.join(dir_path, f)
                     for f in os.listdir(dir_path)
-                    if f.startswith(name) and f.endswith(".npy")
+                    if f.startswith(name)
                 ]
                 if not pose_files:
                     return None, None
@@ -1969,11 +2019,18 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             # self.agent_pose, _ = load_latest_agent_pose(kwargs['dir'])
             position, _ = load_latest_data(kwargs['dir'], name='position')
             orientation, _ = load_latest_data(kwargs['dir'], name='orientation')
-            self.agent_pose = {'position': position, 'orientation': orientation}
-            print(f"self.agent_pose: {self.agent_pose}")
+            self.agent_pose = agent_pose = {'position': position, 'orientation': orientation}
+            self.log(f"self.agent_pose: {agent_pose}")
+            theta = theta_from_agent_pose(agent_pose['orientation'])
+            self.rr_logger.log({
+                'SG/agent': rr.Arrows3D(
+                    origins=agent_pose['position'], colors=[0, 0, 255], radii=0.05,
+                    vectors=np.array([[np.cos(theta), np.sin(theta), 0.0]], dtype=np.float32) * 0.5)
+            })
 
             rgb, _ = load_latest_data(kwargs['dir'], name='rgb')
-            self.rr_logger.log({'obs/rgb': rr.Image(rgb)})
+            if rgb is not None:
+                self.rr_logger.log({'obs/rgb': rr.Image(rgb)})
             self.log(f"<process.0> Read agent_pose from {_}")
 
         # Select Group ID
@@ -2140,10 +2197,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 group_hulls_bef = self.hull_grouper.group_hulls()
                 self.hull_grouper.update(related_objects)
 
-            # self.hull_grouper.visualize(
-            #     image=np.ones((1000, 1000, 3), dtype=np.uint8) * 255,
-            #     meta={'xmin': -1, 'ymax': 4, 'scale': 100, 'pad':0},
-            # )
+            self.hull_grouper.update_visibility(self.agent_pose, fov_rad=self.sg.fov_x, max_range=8.0)
 
             now = rospy.Time.now()
             updated_time_diff = now - self.last_update_time_path_points
@@ -2164,12 +2218,29 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             path_points, log_data = {}, {}
             for _, group in enumerate(group_hulls): # TODO: Add traversable_area
                 hull_xy = group['hull']
+                self.logger.log(f"hull_xy: {hull_xy.shape}")
+                # hull_xyz = np.hstack([hull_xy, np.ones((6, 1)) * self.sg.z_const]).shape
                 gid = group['gid']
+
+                # Visualize
+                edge_sigs, edge_visible = group['edge_sigs'], group['edge_visible']
+                visible_strips, invisible_strips = [], []
+                for (p0, p1), visible in zip(edge_sigs, edge_visible):
+                    strip = np.array([[p0[0], p0[1], 0.0], [p1[0], p1[1], 0.0]], dtype=np.float32)
+                    (visible_strips if visible else invisible_strips).append(strip)
+                if visible_strips:
+                    self.rr_logger.log({
+                        f'SG/group/{gid}/visible_hull':
+                            rr.LineStrips3D(visible_strips, colors=[[0, 255, 0]], radii=0.02)})
+                if invisible_strips:
+                    self.rr_logger.log({
+                        f'SG/group/{gid}/invisible_hull':
+                            rr.LineStrips3D(invisible_strips, colors=[[255, 0, 0]], radii=0.02)})
 
                 nearest_points = find_closest_point(hull_xy, self.traversable_points)
                 if nearest_points.shape[1] == 2:
                     nearest_points = np.hstack([nearest_points, np.zeros((len(nearest_points), 1))])
-
+                self.rr_logger.log({'SG/active_waypoints': rr.Points3D(nearest_points, colors=[255, 0, 255, 200], radii=0.1)}) # pink
                 # new_filtered_path_points = filter_close_points(nearest_points, self.min_point_spacing)
                 new_filtered_path_points = nearest_points  # Now, we don't need to sampling the points.
                 kept_mask, wps_keep = filter_waypoints_by_path(new_filtered_path_points, self.path_xy, self.radius)
@@ -2192,6 +2263,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.path_points = path_points
             self.is_path_points_updated = True
             self.last_update_time_path_points = now
+            # self.log(f"<update_path_points.3> log_data:")
             self.log(f"<update_path_points.3> path_points (#valid/#total): {{{', '.join([f'{gid}: ({valid}/{total})' for gid, (valid, total) in log_data.items()])}}}")
             self.rr_log(f"<update_path_points.3> path_points (#valid/#total): {{{', '.join([f'{gid}: ({valid}/{total})' for gid, (valid, total) in log_data.items()])}}}", panel='nav')
         except Exception as e:
@@ -2488,12 +2560,21 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 if __name__ == "__main__":
     logger = Logger()
 
-    SCENE = "vla_js_chair_2025-12-17-12-17-43"
+    SCENE = 'vla_test_2025-12-23-16-23-57'
     if SCENE == "arabic_room":
         instruction = "Find the pillow closest to the book on the stool."
         action = 'find'
         target_name = "pillow closest to the book on the stool"
         candidate_names, reference_names = ['pillow'], ['book', 'stool']
+    elif SCENE == 'vla_test_2025-12-23-16-23-57':
+        # instruction = "Find a blue chair between red chairs"
+        # action = 'find'
+        # target_name = "blue chair between red chairs"
+        # candidate_names, reference_names = ['chair'], []
+        instruction = "Find a red chair between blue chairs"
+        action = 'find'
+        target_name = "red chair between blue chairs"
+        candidate_names, reference_names = ['chair'], []
     elif SCENE == 'vla_js_chair_2025-12-17-12-17-43':
         instruction = "Find the chair with a blue seat."
         action = 'find'

@@ -12,6 +12,8 @@ import matplotlib.cm as cm
 import matplotlib.patches as patches
 from dataclasses import dataclass
 from ai_module.src.visual_grounding.scripts.utils.utils_active_perception import visible_edges_from_pose, visualize_visibility
+from ai_module.src.utils.utils_pose import theta_from_agent_pose
+
 
 def _visible_arcs_from_mask(mask: np.ndarray):
     """
@@ -323,6 +325,12 @@ class GridGrouper:
     def update_visibility(self, agent_pose, fov_rad=None, max_range=None):
         hulls = self.group_hulls()
         # self._visible_edges_cache.clear()
+
+        if len(hulls) > 0 and isinstance(agent_pose, dict):
+            position = agent_pose['position']
+            orientation = agent_pose['orientation']
+            theta = theta_from_agent_pose(orientation)
+            agent_pose = np.array([position[0], position[1], theta], dtype=np.float32)
 
         for item in hulls:
             gid = item['gid']
