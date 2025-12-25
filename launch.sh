@@ -1,5 +1,10 @@
 #!/bin/bash
+export OFFLINE_MAP_DIR=/ws/data/VLA/offline_map
+export KEYFRAMES_DIR=/ws/data/VLA/keyframes
+#export KEYFRAMES_DIR2=/ws/external/test_data/vla_js_chair_2025-12-17-12-17-43/keyframes
+export TRAVERSABLE_PATH=/ws/data/VLA/E3_3225_TRIP.pcd
 sudo chmod 777 -R /ws/external/
+sudo chmod 777 -R /ws/data/
 export PATH="$HOME/.local/bin:$PATH"
 
 MODE="$1"
@@ -10,9 +15,9 @@ if [ "$MODE" == "sg" ]; then
   catkin_make && cd /ws/external
   source /ws/external/ai_module/devel/setup.bash
 
-  cd /ws/external/system/unity/ && catkin_make &&
-  ./system_bring_up.sh &
-  sleep 5
+  # cd /ws/external/system/unity/ && catkin_make &&
+  # ./system_bring_up.sh &
+  # sleep 5
   cd /ws/external/ai_module
   roslaunch sem sg.launch "$@"
 fi
