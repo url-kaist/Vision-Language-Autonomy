@@ -599,8 +599,15 @@ class SceneGraphProcessor:
                 if dist > 0.05 or angle > 1.0:
                     reset_queues = True
                     self.last_image_reset_pose = pose
-                    self.vision_queue.clear()
-                    self.sync_queue.clear()
+                    if len(self.vision_queue) > 0:
+                        last_item = self.vision_queue[-1]
+                        self.vision_queue.clear()
+                        self.vision_queue.append(last_item)
+                    if len(self.sync_queue) > 0:
+                        latest_stamp = max(self.sync_queue.keys())
+                        latest_entry = self.sync_queue[latest_stamp]
+                        self.sync_queue.clear()
+                        self.sync_queue[latest_stamp] = latest_entry
 
         if reset_queues:
             # RGB / YOLO multiprocessing 큐에 쌓인 이전 프레임도 제거
@@ -807,7 +814,7 @@ class SceneGraphProcessor:
 
             # RGB 프레임 대기 (최대 0.05초)
             try:
-                stamp, rgb = rgb_queue.get(timeout=0.05)
+                stamp, rgb = rgb_queue.get(timeout=0.1)
             except queue.Empty:
                 # 0.05초 동안 아무 프레임도 안 들어온 경우: 이번 iteration은 스킵
                 continue
@@ -1416,9 +1423,9 @@ class SceneGraphProcessor:
         """YOLO 결과 큐에서 '가장 최신' 항목 하나를 blocking으로 가져온다."""
         try:
             # 최초 결과를 timeout을 두고 대기
-            item = q.get(timeout=0.05)
+            item = q.get(timeout=0.3)
         except pyqueue.Empty:
-            self.logger.logwarn("yolo get timeout (no result within 0.05s)")
+            self.logger.logwarn("yolo get timeout (no result within 0.3s)")
             return None
         # 큐에 backlog가 있으면 모두 비우고 마지막 것만 사용
         while True:
