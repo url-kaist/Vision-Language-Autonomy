@@ -28,12 +28,12 @@ class PathRecorder:
         self.path_points = []  # [[x1, y1], [x2, y2], ...]
         self.dist_thresh = 0.05  # Record only when the minimum movement distance (m) is exceeded
 
+        self.path_pub = rospy.Publisher("/path_recorder/path", Path, queue_size=1)
         self.odom_sub = rospy.Subscriber("/state_estimation", Odometry, self._odom_callback, queue_size=1)
         self.running = False
         self.is_paused = False
         self.trigger_srv = rospy.Service("/path_recorder/trigger", Trigger, self._trigger_callback)
         self.pause_srv = rospy.Service("/path_recorder/pause", SetBool, self._pause_callback)
-        self.path_pub = rospy.Publisher("/path_recorder/path", Path, queue_size=1)
 
     def _trigger_callback(self, req):
         self.running = not self.running
