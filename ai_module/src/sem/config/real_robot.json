@@ -6,6 +6,7 @@
   "odom_topic": "/Odometry",
   "robot_height": 0.5,
   "robot_height_margin": 0.1,
+  "real_world": true,
 
   "offline_map_pose_threshold": 0.1,
   "offline_map_angle_threshold": 5.0
