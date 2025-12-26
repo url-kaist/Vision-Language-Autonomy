@@ -432,8 +432,8 @@ class SceneGraphProcessor:
         if self.is_compressed_image:
             if not self.image_topic.endswith("/compressed"):
                 self.image_topic += "/compressed"
-            if not self.depth_topic.endswith("/compressedDepth"):
-                self.depth_topic += "/compressedDepth"
+            # if not self.depth_topic.endswith("/compressedDepth"):
+            #     self.depth_topic += "/compressedDepth"
 
         self.logger.logwarn(
             f"subscribed topics: rgb: {self.image_topic}, depth: {self.depth_topic}, lidar: {self.lidar_topic}, odom: {self.odom_topic}"
@@ -448,10 +448,10 @@ class SceneGraphProcessor:
 
         # Depth subscriber (real/sim 공통, config 기반)
         if self.use_depth_for_seg:
-            if self.is_compressed_image:
-                self.depth_sub = Subscriber(self.depth_topic, CompressedImage)
-            else:
-                self.depth_sub = Subscriber(self.depth_topic, Image)
+            # if self.is_compressed_image:
+            #     self.depth_sub = Subscriber(self.depth_topic, CompressedImage)
+            # else:
+            self.depth_sub = Subscriber(self.depth_topic, Image)
         else:
             self.depth_sub = None
 
@@ -489,7 +489,7 @@ class SceneGraphProcessor:
         self.frame_id = "world" if self.is_real_world else "map"
         # DBSCAN 파라미터
         if self.use_depth_for_seg:
-            self.dbscan_eps = 0.03
+            self.dbscan_eps = 0.05
         elif self.is_real_world:
             self.dbscan_eps = 0.5
         else:
@@ -663,7 +663,7 @@ class SceneGraphProcessor:
     def sync_callback(self, img_msg, *args):
         if not self.already_set_classes:
             return
-        # self.logger.loginfo(f"sync_callback")
+        self.logger.loginfo(f"sync_callback")
         stamp = img_msg.header.stamp.to_nsec()
         try:
             if self.is_compressed_image:
@@ -706,27 +706,27 @@ class SceneGraphProcessor:
                 return
 
             try:
-                if self.is_compressed_image:
-                    # CompressedImage → depth (passthrough: 16UC1 / 32FC1 그대로 유지)
-                    depth = self.bridge.compressed_imgmsg_to_cv2(
-                        depth_msg, desired_encoding="passthrough"
-                    )
-                else:
-                    depth = self.bridge.imgmsg_to_cv2(
-                        depth_msg, desired_encoding="passthrough"
-                    )
+                # if self.is_compressed_image:
+                #     # CompressedImage → depth (passthrough: 16UC1 / 32FC1 그대로 유지)
+                #     depth = self.bridge.compressed_imgmsg_to_cv2(
+                #         depth_msg, desired_encoding="passthrough"
+                #     )
+                # else:
+                depth = self.bridge.imgmsg_to_cv2(
+                    depth_msg, desired_encoding="passthrough"
+                )
             except Exception as e:
                 self.logger.logerr(f"[sync_callback] Failed to decode depth image: {e}")
                 depth = None
-            else:
-                # 압축 해제 후 depth 해상도 로그 (한 번만)
-                if depth is not None and not hasattr(self, "_logged_depth_shape"):
-                    self._logged_depth_shape = True
-                    h_d, w_d = depth.shape[:2]
-                    self.logger.loginfo(
-                        f"[sync_callback] Depth decoded "
-                        f"(compressed={self.is_compressed_image}, size={w_d}x{h_d}, dtype={depth.dtype})"
-                    )
+            # else:
+            #     # 압축 해제 후 depth 해상도 로그 (한 번만)
+            #     if depth is not None and not hasattr(self, "_logged_depth_shape"):
+            #         self._logged_depth_shape = True
+            #         h_d, w_d = depth.shape[:2]
+            #         self.logger.loginfo(
+            #             f"[sync_callback] Depth decoded "
+            #             f"(compressed={self.is_compressed_image}, size={w_d}x{h_d}, dtype={depth.dtype})"
+            #         )
         else:
             # depth를 사용하지 않는 경우: args는 (cloud_msg,) 이어야 함
             if len(args) != 1:
@@ -851,7 +851,7 @@ class SceneGraphProcessor:
 
             # RGB 프레임 대기 (최대 0.05초)
             try:
-                stamp, rgb = rgb_queue.get(timeout=0.1)
+                stamp, rgb = rgb_queue.get(timeout=1.0)
             except queue.Empty:
                 # 0.05초 동안 아무 프레임도 안 들어온 경우: 이번 iteration은 스킵
                 continue
@@ -1460,7 +1460,7 @@ class SceneGraphProcessor:
         """YOLO 결과 큐에서 '가장 최신' 항목 하나를 blocking으로 가져온다."""
         try:
             # 최초 결과를 timeout을 두고 대기
-            item = q.get(timeout=0.3)
+            item = q.get(timeout=1.0)
         except pyqueue.Empty:
             self.logger.logwarn("yolo get timeout (no result within 0.3s)")
             return None
@@ -1564,7 +1564,7 @@ class SceneGraphProcessor:
             # cloud_body = voxel_downsample(cloud_body, 0.02)
 
             iter += 1
-            # self.merge_detections_every_n_iter(iter, 30)
+            self.merge_detections_every_n_iter(iter, 30)
             # cloud_body = cloud_body[cloud_body[:, 2] > 0.05]
             R_b2w = pose["rotation"]
             t_b2w = pose["position"]
@@ -1788,10 +1788,10 @@ class SceneGraphProcessor:
 
                     # RGB 카메라 intrinsic (480x640 기준, CameraInfo)
                     if H_rgb == 480 and W_rgb == 640:
-                        fx_rgb = 606.040283203125
-                        fy_rgb = 606.2955932617188
-                        cx_rgb = 328.3797912597656
-                        cy_rgb = 245.35792541503906
+                        fx_rgb = 379.15924072265625
+                        fy_rgb = 378.71624755859375
+                        cx_rgb = 320.7159423828125
+                        cy_rgb = 237.7329559326172
                     else:
                         # 해상도가 다른 경우에는 대략적인 intrinsic 사용
                         fx_rgb = W_rgb / 2.0
@@ -1922,7 +1922,7 @@ class SceneGraphProcessor:
                     continue
 
                 cloud_tmp = obj_cloud.copy()
-                obj_cloud_clustered = cluster_dbscan(cloud_tmp[::4], self.dbscan_eps, 5)
+                obj_cloud_clustered = cluster_dbscan(cloud_tmp[::4], self.dbscan_eps, 10)
                 # obj_cloud_clustered = cluster_dbscan(cloud_tmp, self.dbscan_eps, 5)
                 # If clustering fails (no valid cluster), fall back to the original points
                 if obj_cloud_clustered.size > 0:
@@ -1999,6 +1999,7 @@ class SceneGraphProcessor:
                             #    "bbox": bounding_box,
                             #    "points": obj_cloud,
                             #    })
+                            self.logger.log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!11")
                             continue
 
                         if overlap > 0.1:
@@ -2014,6 +2015,7 @@ class SceneGraphProcessor:
                             #    "bbox": bounding_box,
                             #    "points": obj_cloud,
                             #})
+                            self.logger.log("2222222222222222222222222222")
                             continue
 
                     det["yolo_conf"] = max(det["yolo_conf"], yolo_conf)
@@ -2204,8 +2206,8 @@ class SceneGraphProcessor:
                     cur_pose[:3, 3], None, cloud_center,
                     image=image, pose=cur_pose, detections=self.detections)
                 
-                if keyframe_id>=2:
-                    self.add_object_nodes_for_place_node(keyframe_id, self.detections, self.missing_detections)
+                # if keyframe_id>=2:
+                self.add_object_nodes_for_place_node(keyframe_id, self.detections, self.missing_detections)
 
                 self.last_keyframe_id = keyframe_id
                 self.keyframe_counter += 1 #REVISED_0910

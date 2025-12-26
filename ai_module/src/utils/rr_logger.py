@@ -97,11 +97,11 @@ class RRLogger:
 
         host = "127.0.0.1"
         tcp_port = 9876
-        ws_port = 9877  # web viewer connects here
+        # ws_port = 9877  # web viewer connects here
+        use_terminal = True
         web_port = 9090
 
-        if not (_wait_port(host, tcp_port, timeout_s=0.2) and _wait_port(host, web_port, 0.2) \
-                and _wait_port(host, ws_port, 0.2)):
+        if (not (_wait_port(host, tcp_port, timeout_s=0.2) and _wait_port(host, web_port, 0.2))) or (not use_terminal):
             # 2) 실패 로그를 버리지 말고 파일로 남김
             log_path = osp.join(output_path, "rerun_server.stderr.log")
             err_f = open(log_path, "a", buffering=1)
@@ -120,11 +120,11 @@ class RRLogger:
                     f"Rerun server did not open {host}:{tcp_port}. "
                     f"Check: {log_path}"
                 )
-            if not _wait_port(host, ws_port, timeout_s=3.0):
-                raise RuntimeError(
-                    f"Rerun server did not open {host}:{ws_port}. "
-                    f"Check: {log_path}"
-                )
+            # if not _wait_port(host, ws_port, timeout_s=3.0):
+            #     raise RuntimeError(
+            #         f"Rerun server did not open {host}:{ws_port}. "
+            #         f"Check: {log_path}"
+            #     )
             if not _wait_port(host, web_port, timeout_s=3.0):
                 raise RuntimeError(
                     f"Rerun server did not open {host}:{web_port}. "
@@ -167,11 +167,11 @@ class RRLogger:
                             origin="/",
                             contents=[f"obs/**"],
                         ),
-                        # rrb.Spatial2DView(
-                        #     name="Keyframe Image",
-                        #     origin=f"/",
-                        #     contents=[f"SG/**"],
-                        # ),
+                        rrb.Spatial2DView(
+                            name="Detection",
+                            origin=f"/",
+                            contents=[f"det/**"],
+                        ),
                         rrb.SelectionPanel(),
                     ),
                 ),
