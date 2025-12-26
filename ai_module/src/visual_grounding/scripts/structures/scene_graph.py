@@ -251,8 +251,79 @@ class SceneGraph:
                 self.G.add_edge(source, target)
                 self.G.add_edge(target, target)
                 # print(f"Add edge: {source} <-> {target}")
+
+            self.update_projection_links(
+                min_point_ratio=0.05,
+                min_bbox_area_ratio=0.002,
+            )
         print(f"=> Graph: {self.G}")
 
+    def _projection_stats(self, pts_world: np.ndarray, pose: np.ndarray, image_size):
+        """
+        pts_world: (N,3)
+        pose: (4,4) body->world (현재 코드의 convention 그대로 사용)
+        return:
+          proj_ratio: 투영 성공한 point 비율
+          bbox_area_ratio: bbox 면적 / 이미지 면적
+          bbox: (u_min,v_min,u_max,v_max) (없으면 (0,0,0,0))
+        """
+        H, W = image_size
+        xs, ys = self.project_pts(pts_world, pose, image_size=(H, W))
+
+        n_total = int(pts_world.shape[0])
+        n_proj = int(len(xs)) if xs is not None else 0
+        proj_ratio = (n_proj / max(n_total, 1))
+
+        if xs is None or len(xs) == 0:
+            return proj_ratio, 0.0, (0, 0, 0, 0)
+
+        u_min, v_min, u_max, v_max = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+        bw = max(0, u_max - u_min)
+        bh = max(0, v_max - v_min)
+        bbox_area = float(bw * bh)
+        bbox_area_ratio = bbox_area / float(max(H * W, 1))
+
+        return proj_ratio, bbox_area_ratio, (u_min, v_min, u_max, v_max)
+
+    def update_projection_links(self, min_point_ratio: float = 0.05, min_bbox_area_ratio: float = 0.002):
+        """
+        각 OBJECT(eid)가 KEYFRAME(pid)들에 충분히 투영되면 OBJECT<->KEYFRAME edge를 추가한다.
+        - min_point_ratio: object point 중 이미지 안으로 투영되는 점 비율 최소값
+        - min_bbox_area_ratio: bbox 면적/이미지 면적 최소값 (너무 작으면 멀리 있거나 거의 안보임)
+        """
+        # 노드 목록 수집
+        object_nodes = []
+        keyframe_nodes = []
+        for (level, nid), data in self.G.nodes(data=True):
+            if level == str(NodeLevel.OBJECT):
+                object_nodes.append(((level, nid), data))
+            elif level == str(NodeLevel.KEYFRAME):
+                keyframe_nodes.append(((level, nid), data))
+
+        for (obj_key, obj_data) in object_nodes:
+            e_attrs = obj_data.get("_attrs", {})
+            pts = np.asarray(e_attrs.get("points", []), dtype=np.float32)
+            if pts.size == 0:
+                continue
+
+            good_pids = []
+            for (kf_key, kf_data) in keyframe_nodes:
+                kf_attrs = kf_data.get("_attrs", {})
+                pose = np.asarray(kf_attrs.get("pose", None), dtype=np.float32)
+                img = kf_attrs.get("image", None)
+                if pose is None or img is None:
+                    continue
+
+                H, W = img.shape[:2]
+                proj_ratio, area_ratio, bbox = self._projection_stats(pts, pose, (H, W))
+
+                ok = (proj_ratio >= min_point_ratio) and (area_ratio >= min_bbox_area_ratio)
+                if ok:
+                    good_pids.append(kf_key)
+
+            for kf_key in good_pids:
+                self.G.add_edge(obj_key, kf_key)
+                self.G.add_edge(kf_key, obj_key)
 
     def get_entity_names(self, names, *args, **kwargs) -> Entities:
         output_entities = []
@@ -367,7 +438,7 @@ class SceneGraph:
 
 
 if __name__ == "__main__":
-    DATA_DIR = "/ws/external/test_data/offline_map"
+    DATA_DIR = "/ws/external/bags/20251224/6count_2025-12-24-21-01-39/offline_map"
     dirs = [os.path.join(DATA_DIR, d) for d in os.listdir(DATA_DIR)
             if os.path.isdir(os.path.join(DATA_DIR, d))]
     dir_sorted = sorted(dirs, key=os.path.getmtime)
@@ -376,7 +447,7 @@ if __name__ == "__main__":
         'candidate': {'show': True, 'color': 'blue'},
     }
 
-    sg = SceneGraph(candidate_names='pillow', reference_names=['sofa'])
+    sg = SceneGraph(candidate_names=['fire extinguisher'], reference_names=['TV monitor'])
     for dir in dir_sorted:
         with open(os.path.join(dir, 'scene_graph.json'), 'r', encoding='utf-8') as f:
             scene_graph = json.load(f)
@@ -384,8 +455,22 @@ if __name__ == "__main__":
             objects = json.load(f)
         sg.update(scene_graph, objects)
 
-        for kf_id, kf in sg.keyframes.items():
-            kf.annotate(styles, node_name='test', suffix='_annotated_global')
+        print('--------------')
+        pid2eids = sg.pid2eids
+
+        # eid -> object name 캐시
+        eid2name = {}
+        for (level, nid), data in sg.G.nodes(data=True):
+            if level == str(NodeLevel.OBJECT):
+                eid2name[nid] = data.get("_attrs", {}).get("name", "unknown")
+
+        # pid별로 (eid, name) 형태로 출력
+        for pid, eids in sorted(pid2eids.items(), key=lambda x: x[0]):
+            pairs = [(eid, eid2name.get(eid, "unknown")) for eid in sorted(eids)]
+            print(f"pid={pid}: {pairs}")
+
+        # for kf_id, kf in sg.keyframes.items():
+        #     kf.annotate(styles, node_name='test', suffix='_annotated_global')
 
         time.sleep(0.1)
 
