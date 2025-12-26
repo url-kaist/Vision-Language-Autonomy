@@ -44,8 +44,9 @@ from ai_module.src.visual_grounding.scripts.structures.answer import Answer
 from ai_module.src.visual_grounding.scripts.structures.scene_graph import NodeLevel
 from ai_module.src.visual_grounding.scripts.structures.bbox import BBoxes
 from ai_module.src.utils.visualizer import Visualizer
-from ai_module.src.utils.utils_traversability import filter_disconnected_traversable, load_pcd_ascii_with_fields
+from ai_module.src.utils.utils_traversability import filter_disconnected_traversable, load_pcd_ascii_with_fields, save_pcd_ascii_with_header
 from ai_module.src.utils.utils_pose import theta_from_agent_pose
+from ai_module.src.utils.utils_visualize import _polyline_xy_to_ribbon_mesh3d, build_ribbon_mesh
 
 import rerun as rr
 
@@ -258,12 +259,28 @@ class BaseVisualGrounder(BaseModel):
     def __init__(self, node_name=None, is_real_world=False, logger=None, *args, **kwargs):
         self.rr_logger = RRLogger()
         super().__init__(logger=logger, *args, **kwargs)
+        # Load Configuration
+        self.config = None
+        config_path = rospy.get_param('~config', "/ws/external/ai_module/src/visual_grounding/config/rover_3225.json")
+        with open(config_path, "r") as f:
+            self.config = config = json.load(f)
+        self.logger.loginfo(f"=== configuration ===")
+        for k, v in config.items():
+            self.logger.loginfo(f"  {k} : {v}")
+        self.logger.loginfo(f"=====================")
+
+        self.debug = self.config.get("debug", self.debug)
+        self.offline_map_dir = self.config.get(
+            "offline_map_dir", os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map"))
+        self.frame_id = self.config.get("frame_id", "world" if is_real_world else "map")
+        self.wo_query = self.config.get(
+            "wo_query", rospy.get_param('~wo_query', False) or
+                        (os.environ.get("WO_QUERY", False).lower() == 'true'))
 
         """ Core """
         self.node_name = node_name if node_name else rospy.get_name()
-        self.time_limit = rospy.Duration(600)  # seconds
+        self.time_limit = rospy.Duration(self.config.get("time_limit", 600))  # seconds
         self.is_real_world = is_real_world
-        self.frame_id = "world" if self.is_real_world else "map"
         
         """ Scheduling """
         self._dispatcher = PriorityDispatcher(name=node_name, normal_workers=0)
@@ -318,6 +335,10 @@ class BaseVisualGrounder(BaseModel):
         """ Initialization """
         self._init_all(*args, **kwargs)
 
+        self.current_agent_message = ""
+        self.agent_arrow_len = 0.5
+
+        self.objects_prev = self.objects_curr = []
 
     def _init_all(self, *args, **kwargs):
         self._init_vars(*args, **kwargs)
@@ -533,8 +554,7 @@ class BaseVisualGrounder(BaseModel):
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         self.rr_logger.log({'obs/rgb': rr.Image(image=rgb)})
         if self.debug:
-            offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
-            subdirs = [d for d in glob.glob(os.path.join(offline_map_dir, "*")) if os.path.isdir(d)]
+            subdirs = [d for d in glob.glob(os.path.join(self.offline_map_dir, "*")) if os.path.isdir(d)]
             if not subdirs:
                 return
             latest_dir = max(subdirs, key=os.path.getmtime)
@@ -634,7 +654,7 @@ class BaseVisualGrounder(BaseModel):
         if self.status == Status.STANDBY:
             self.log_status()
             self.standby()
-
+            self.current_agent_message = f"Let's {self.action} {self.target_name}"
         if self.status == Status.PROCESSING:
             self.log_status()
             # self.logger.logrich(f"Status: {self.status} | #inference_queue={len(self.inference_queue.queue)}", name='status')
@@ -689,7 +709,7 @@ class BaseVisualGrounder(BaseModel):
                 self.rr_logger.log({
                     entity_path: rr.Boxes3D(
                         centers=centers, half_sizes=half_sizes, quaternions=quaternions,
-                        colors=colors, labels=attrs['name']
+                        colors=colors, labels=f"{attrs['name']}({id})"
                     ),
                 })
             elif level == str(NodeLevel.KEYFRAME):
@@ -715,8 +735,15 @@ class BaseVisualGrounder(BaseModel):
 
 
     def update_resource(self, **kwargs):
+        self.objects_prev = self.objects_curr
+
         self.scene_graph_clients.update_scene_graph(**kwargs)
         self.log_sg(self.sg.G)
+
+        self.objects_curr = [id for (level, id), e in self.sg.G.nodes(data=True) if level == str(NodeLevel.OBJECT)]
+        new_objects = list(set(self.objects_curr) - set(self.objects_prev))
+        if len(new_objects) > 0:
+            self.current_agent_message = f"New object({', '.join([str(_id) for _id in new_objects])})!"
 
         styles = {
             # 'reference': {'show': True, 'color': 'blue'},
@@ -804,7 +831,7 @@ class BaseVisualGrounder(BaseModel):
                             raise NotImplementedError("No implementation for other etypes")
                         save_path = self.sg.save_path(etype, fname)
                         success = cv2.imwrite(save_path, image)
-                        self.rr_logger.log({f"SG/nodes/NodeLevel.KEYFRAME/{id}": rr.Image(image)})
+                        self.rr_logger.log({f"SG/nodes/NodeLevel.KEYFRAME/{id}": rr.Image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))})
                         if success:
                             success_path.append(save_path)
                         else:
@@ -1097,7 +1124,7 @@ class BaseVisualGrounder(BaseModel):
 
     def _answer_impl(self, answer, block=False):
         if answer is None:
-            self.logger.logwarb(f"<answer_the_question> answer is None")
+            self.logger.logwarn(f"<answer_the_question> answer is None")
             return
 
         if isinstance(answer, Answer):
@@ -1258,19 +1285,22 @@ class BaseVisualGrounder(BaseModel):
                     self.answer_result = self.agg_results.best_answer  # TODO
                     self.answer_the_question(self.answer_result)
                     self.rr_log(f"Answer: {self.answer_result}", panel=['default', 'summary/task'])
-                    
+
                     if best_confidence > thres_high:
                         self.log(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} > {thres_high}.")
                         self.rr_log(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} > {thres_high}.", panel='inference')
                         self.rr_log(f"Answer the final result. Confidence: {best_confidence} > {thres_high}.", panel='summary/status')
+                        self.current_agent_message = f"Answer {self.answer_result}, with high confidence."
                     elif enough_observation and all_inference_done and has_any_result:
                         self.log(f"<inference_loop.3.2> Answer the final result. Enough observation and all inference done.")
                         self.rr_log(f"<inference_loop.3.2> Answer the final result. Enough observation and all inference done.", panel='inference')
                         self.rr_log(f"Answer the final result. Enough observation and all inference done.", panel='summary/status')
+                        self.current_agent_message = f"Answer {self.answer_result}, with sufficient observations."
                     else:
                         self.log(f"<inference_loop.3.2> Answer the final result. Time is almost up {remaining_time.to_sec()} sec left.")
                         self.rr_log(f"<inference_loop.3.2> Answer the final result. Time is almost up {remaining_time.to_sec()} sec left.", panel='inference')
                         self.rr_log(f"Answer the final result. Time is almost up {remaining_time.to_sec()} sec left.", panel='summary/status')
+                        self.current_agent_message = f"No time. The answer is {self.answer_result}."
                     return
                 else:                    
                     if best_confidence <= thres_high:
@@ -1295,6 +1325,8 @@ class BaseVisualGrounder(BaseModel):
                     inference_queue_size = self.inference_queue.qsize()
                 for _ in range(inference_queue_size):
                     try:
+                        if self.wo_query:
+                            break
                         with self.inference_queue_lock:
                             jobs = self.inference_queue.get_nowait()
                     except queue.Empty:
@@ -1800,8 +1832,9 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         super().__init__(*args, **kwargs)
 
         """ Navigation """
-        self.min_point_spacing = 0.5
-        self.radius = 0.55 # (m)
+        # self.min_point_spacing = 0.5
+        self.radius = self.config.get('path_radius', 0.55) # (m)
+        self.group_threshold = self.config.get('group_threshold', 0.5) # (m)
         self._empty_path_since = {}  # {gid: rospy.Time}
         self._empty_path_cooldown = rospy.Duration(3.0)  # 3초
 
@@ -1837,13 +1870,28 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.vis_traversable_points = False
         if traversable_path is not None:
             cols, arr = load_pcd_ascii_with_fields(traversable_path)
-            filtered_arr, mask = filter_disconnected_traversable(
-                cols, arr, res=0.11, collision_thr=0.1, use_8n=False
-            )
             col2idx = {c: i for i, c in enumerate(cols)}
-            collision_risk = arr[:, col2idx["collision_risk"]]
             xyz = arr[:, [col2idx["x"], col2idx["y"], col2idx["z"]]]
-            print("collision_risk:", float(np.nanmin(collision_risk)), float(np.nanmax(collision_risk)))
+
+            collision_risk = arr[:, col2idx["collision_risk"]]
+            mask = np.ones(arr.shape[0], dtype=bool)
+            mask = mask & (collision_risk < 0.1)
+            if not 'postprocessed' in traversable_path:
+                # filtered_arr, mask = filter_disconnected_traversable(cols, arr, res=0.11, collision_thr=0.1, use_8n=False)
+                print("collision_risk:", float(np.nanmin(collision_risk)), float(np.nanmax(collision_risk)))
+                def mask_area(aabb):
+                    xmin, ymin, xmax, ymax = aabb
+                    return ~((xyz[:, 0] >= xmin) & (xyz[:, 0] <= xmax) &
+                             (xyz[:, 1] >= ymin) & (xyz[:, 1] <= ymax))
+                mask = (mask
+                        & mask_area((-1.6, -2.3, 4.3, -0.9))    # workspace
+                        & mask_area((3.5, -0.8, 4.2, 3.9))      # TV monitor
+                        & mask_area((-2.0, 4.0, 4.0, 7.4))      # storage
+                        & mask_area((0.2, 2.2, 2.3, 3.3))       # table
+                        & mask_area((-1.8, -0.8, -1.3, 3.5)))   # chairs
+
+                arr[~mask, col2idx['collision_risk']] = np.inf
+                # save_pcd_ascii_with_header(traversable_path, '/ws/data/VLA/E3_3225_TRIP_postprocessed.pcd', arr)
 
             self.traversable_points = np.asarray(xyz[mask]) # self.traversable_points = np.asarray(xyz[~mask])
             self.risky_points = np.asarray(xyz[~mask]) # self.risky_points = np.asarray(xyz_risky)
@@ -1890,6 +1938,21 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.navigation_running = threading.Event()
         self.active_clients.end()
 
+    def log_agent(self, agent_pose):
+        theta = theta_from_agent_pose(agent_pose['orientation'])
+        pos = agent_pose['position']
+        dir_vec = np.array([[np.cos(theta), np.sin(theta), 0.0]], dtype=np.float32)
+        self.rr_logger.log({
+            "SG/agent": rr.Arrows3D(origins=pos, vectors=dir_vec * self.agent_arrow_len,
+                                    colors=[0, 0, 255], radii=0.1)
+        })
+        balloon_pos = pos + 0.3 * dir_vec * self.agent_arrow_len + np.array([[0.0, 0.0, 0.3]])
+        self.rr_logger.log({f'SG/message': rr.Points3D(
+            positions=balloon_pos, labels=[self.current_agent_message], radii=0.001, colors=[255, 255, 255])})
+        # arrow_tip = pos + 0.3 * dir_vec * self.agent_arrow_len + np.array([[0.0, 0.0, 0.1]])
+        # tail = np.concatenate([arrow_tip, balloon_pos], axis=0).astype(np.float32)  # (2,3)
+        # self.rr_logger.log({'SG/message_tail': rr.LineStrips3D(tail, colors=[49, 56, 59], radii=0.01)})
+
 # CALLBACKS
     def _odom_callback(self, msg):
         self.log("_odom_callback")
@@ -1897,16 +1960,11 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
             "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
         }
-        theta = theta_from_agent_pose(agent_pose['orientation'])
-        self.rr_logger.log(
-            {'SG/agent': rr.Arrows3D(
-                origins=agent_pose['position'],
-                vectors=np.array([[np.cos(theta), np.sin(theta), 0.0]], dtype=np.float32) * 0.5,
-                radii=0.1)})
-        offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
-        if True: # self.debug:  # TODO: debug: Save the path_xy
-            _ = save_path_xy(agent_pose['position'], base_dir=offline_map_dir, name="position")
-            _ = save_path_xy(agent_pose['orientation'], base_dir=offline_map_dir, name="orientation")
+        self.log_agent(agent_pose)
+
+        if self.debug:  # TODO: debug: Save the path_xy
+            _ = save_path_xy(agent_pose['position'], base_dir=self.offline_map_dir, name="position")
+            _ = save_path_xy(agent_pose['orientation'], base_dir=self.offline_map_dir, name="orientation")
 
     def _odom_callback2(self, msg):
         self.log("_odom_callback2")
@@ -1914,16 +1972,10 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
             "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
         }
-        theta = theta_from_agent_pose(agent_pose['orientation'])
-        self.rr_logger.log(
-            {'SG/agent': rr.Arrows3D(
-                origins=agent_pose['position'],
-                vectors=np.array([[np.cos(theta), np.sin(theta), 0.0]], dtype=np.float32) * 0.5,
-                radii=0.1)})
-        offline_map_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
-        if True: # self.debug:  # TODO: debug: Save the path_xy
-            _ = save_path_xy(agent_pose['position'], base_dir=offline_map_dir, name="position")
-            _ = save_path_xy(agent_pose['orientation'], base_dir=offline_map_dir, name="orientation")
+        self.log_agent(agent_pose)
+        if self.debug:  # TODO: debug: Save the path_xy
+            _ = save_path_xy(agent_pose['position'], base_dir=self.offline_map_dir, name="position")
+            _ = save_path_xy(agent_pose['orientation'], base_dir=self.offline_map_dir, name="orientation")
 
     def _traversable_area_callback(self, msg) -> None:
         if self.traversable_points is None:
@@ -2032,17 +2084,27 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             orientation, _ = load_latest_data(kwargs['dir'], name='orientation')
             self.agent_pose = agent_pose = {'position': position, 'orientation': orientation}
             self.log(f"self.agent_pose: {agent_pose}")
-            theta = theta_from_agent_pose(agent_pose['orientation'])
-            self.rr_logger.log({
-                'SG/agent': rr.Arrows3D(
-                    origins=agent_pose['position'], colors=[0, 0, 255], radii=0.05,
-                    vectors=np.array([[np.cos(theta), np.sin(theta), 0.0]], dtype=np.float32) * 0.5)
-            })
+            self.log_agent(agent_pose)
 
             rgb, _ = load_latest_data(kwargs['dir'], name='rgb')
             if rgb is not None:
                 self.rr_logger.log({'obs/rgb': rr.Image(rgb)})
             self.log(f"<process.0> Read agent_pose from {_}")
+
+            self.path_xy = path_xy = np.concatenate([self.path_xy, [position[:2]]], axis=0)
+            if len(path_xy) > 1:
+                # v0, t0 = _polyline_xy_to_ribbon_mesh3d(path_xy, z=self.sg.z_const-0.01, width=self.radius * 2, closed=False)
+                v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2, rgb_u8=[0, 255, 255])
+                if (v0 is not None) and (t0 is not None):
+                    self.rr_logger.log({'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
+                # v0, t0 = _polyline_xy_to_ribbon_mesh3d(path_xy, z=self.sg.z_const, width=0.04, closed=False)
+                v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
+                if (v1 is not None) and (t1 is not None):
+                    # self.rr_logger.log({'SG/agent/path_xy': rr.Mesh3D(
+                    #     vertex_positions=v0, triangle_indices=t0,
+                    #     vertex_colors=np.tile(np.array([[0, 0, 255]], dtype=np.uint8), (v0.shape[0], 1)))
+                    # })
+                    self.rr_logger.log({'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
 
         # Select Group ID
         num_queries_required = 1 # self.agg_results.min_query
@@ -2053,14 +2115,16 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         except queue.Empty:
             if self.action == 'find':
                 # NOTE: Only etype=='object' is supported.
-                candidate_eids = self.sg.get_candidate_entities()
-                pending_eids = sorted(
-                    [
-                        eid for eid in candidate_eids
-                        if self.agg_results.results_by_entity.num_queries.get(eid, 0) < self.agg_results.min_query
-                    ],
-                    key=lambda eid: self.agg_results.results_by_entity.num_queries.get(eid, 0)
-                )
+                # TODO: Need to check
+                # candidate_eids = self.sg.get_candidate_entities()
+                # pending_eids = sorted(
+                #     [
+                #         eid for eid in candidate_eids
+                #         if self.agg_results.results_by_entity.num_queries.get(eid, 0) < self.agg_results.min_query
+                #     ],
+                #     key=lambda eid: self.agg_results.results_by_entity.num_queries.get(eid, 0)
+                # )
+                pending_eids = []
                 gid = None
             elif self.action == 'count':
                 if self.etypes == ['object']:
@@ -2203,12 +2267,12 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         try:
             group_hulls_bef = None
             if self.hull_grouper is None:
-                self.hull_grouper = GridGrouper(threshold=0.5).fit(related_objects)
+                self.hull_grouper = GridGrouper(threshold=self.group_threshold).fit(related_objects) # threshold 높을수록 넓은 범위까지 group으로 인정
             else:
                 group_hulls_bef = self.hull_grouper.group_hulls()
                 self.hull_grouper.update(related_objects)
 
-            self.hull_grouper.update_visibility(self.agent_pose, fov_rad=self.sg.fov_x, max_range=8.0)
+            self.hull_grouper.update_visibility(self.agent_pose, sg=self.sg, max_range=8.0)
 
             now = rospy.Time.now()
             updated_time_diff = now - self.last_update_time_path_points
@@ -2233,7 +2297,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 # hull_xyz = np.hstack([hull_xy, np.ones((6, 1)) * self.sg.z_const]).shape
                 gid = group['gid']
 
-                # Visualize
+                # Visualize visibility
                 edge_sigs, edge_visible = group['edge_sigs'], group['edge_visible']
                 visible_strips, invisible_strips = [], []
                 for (p0, p1), visible in zip(edge_sigs, edge_visible):
@@ -2248,10 +2312,28 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                         f'SG/group/{gid}/invisible_hull':
                             rr.LineStrips3D(invisible_strips, colors=[[255, 0, 0]], radii=0.02)})
 
+                # Visualize edges (OBJECT <-> GROUP)
+                member_eids = group['members']
+                members = [self.sg.G.nodes[('NodeLevel.OBJECT', eid)] for eid in member_eids]
+                members_centroids = [np.array(mem.get("_attrs", {})['centroid']) for mem in members]
+                members_centroids = np.stack(members_centroids, axis=0)
+                group_xyz = np.mean(members_centroids, axis=0)
+                group_xyz[2] = 3.0
+                self.rr_logger.log({f"SG/nodes/NodeLevel.GROUP/{gid}": rr.Points3D(group_xyz, colors=[155, 155, 130], radii=0.15, labels=gid)})
+
+                for eid in group['members']:
+                    mem = self.sg.G.nodes[('NodeLevel.OBJECT', eid)]
+                    mem_xyz = np.array(mem.get("_attrs", {})['centroid'])
+                    seg = np.stack([mem_xyz, group_xyz], axis=0)  # shape (2,3)
+                    self.rr_logger.log({
+                        f"SG/edges/GROUP{gid}/OBJECT{eid}": rr.LineStrips3D(seg, colors=[[155, 155, 130]], radii=0.02)
+                    })
+
+                # Compute active_waypoints
                 nearest_points = find_closest_point(hull_xy, self.traversable_points)
                 if nearest_points.shape[1] == 2:
                     nearest_points = np.hstack([nearest_points, np.zeros((len(nearest_points), 1))])
-                self.rr_logger.log({'SG/active_waypoints': rr.Points3D(nearest_points, colors=[255, 0, 255, 200], radii=0.1)}) # pink
+                self.rr_logger.log({f'SG/active_waypoints/{gid}': rr.Points3D(nearest_points, colors=[255, 0, 255, 200], radii=0.1)}) # pink
                 # new_filtered_path_points = filter_close_points(nearest_points, self.min_point_spacing)
                 new_filtered_path_points = nearest_points  # Now, we don't need to sampling the points.
                 kept_mask, wps_keep = filter_waypoints_by_path(new_filtered_path_points, self.path_xy, self.radius)
@@ -2288,29 +2370,37 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
             if (path_points_all is None) or (len(path_points_all) == 0):
                 self.logger.loginfo(f"<navigate.1> path_points_all is None. Skip this turn.")
+                self.rr_log(f"<navigate.1> path_points_all is None. Skip this turn.", panel='nav')
                 return
             self.logger.loginfo(f"<navigate.1> self.path_points: #GIDs={len(path_points_all)}")
+            self.rr_log(f"<navigate.1> self.path_points: #GIDs={len(path_points_all)}", panel='nav')
         except Exception as e:
             self.logger.logerr(f"<navigate.1> Error occurs: {e}")
+            self.rr_log(f"<navigate.1> Error occurs: {e}", penel='nav', level='error')
 
         try:
             if not self.is_path_points_updated:
                 if self.previous_path_points:
                     self.path_points_vis_pub.publish(self.previous_path_points)
                 self.logger.loginfo(f"<navigate.2> Publish previous path_points for visualization")
+                self.rr_log(f"<navigate.2> Publish previous path_points for visualization", panel='nav')
                 return
             self.logger.loginfo(f"<navigate.2> ...")
+            self.rr_log(f"<navigate.2> ...", panel='nav')
         except Exception as e:
             self.logger.logerr(f"<navigate.2> Error occurs: {e}")
+            self.rr_log(f"<navigate.2> Error occurs: {e}", panel='nav')
 
         try:
             colors = _color_palette(len(path_points_all), alpha=0.5)
             current_gid = self.current_gid
             self.logger.logrich(f"<navigate.3> Current group ID: {current_gid}", name="gid")
-            
+            self.rr_log(f"<navigate.3> Current group ID: {current_gid}", panel='nav')
+
             # Fail to find current_gid
             if current_gid is None:
                 self.logger.loginfo(f"<navigate.3> Current GID is None.")
+                self.rr_log(f"<navigate.3> Current GID is None.", panel='nav')
                 if self.agent_pose:
                     agent_xy = np.array(self.agent_pose['position'][:2], dtype=float)
                     min_dist = float("inf")
@@ -2324,6 +2414,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                             min_gid = gid
                     self.current_gid = min_gid
                     self.logger.loginfo(f"<navigate.3> Changed GID: {current_gid} -> {self.current_gid}")
+                    self.rr_log(f"<navigate.3> Changed GID: {current_gid} -> {self.current_gid}", panel='nav')
                     
                 # current_gid = self.current_gid
                 # current_path_points = path_points_all.get(current_gid, [])
@@ -2404,14 +2495,18 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             current_path_points = path_points_all.get(current_gid)
             if current_path_points is None:
                 self.logger.loginfo(f"<navigate.3> Current path_points for GID({current_gid}) is None.")
+                self.rr_log(f"<navigate.3> Current path_points for GID({current_gid}) is None.", panel='nav')
                 exp_strategy = "geometric_frontier"
                 self.exploration_strategy_pub.publish(String(exp_strategy))
                 return
             exp_strategy = "geometric_frontier"
             self.exploration_strategy_pub.publish(String(exp_strategy))
             self.logger.loginfo(f"<navigate.3> current_path_points: {current_path_points.shape}")
+            self.rr_log(f"<navigate.3> current_path_points: {current_path_points.shape}", panel='nav')
+            self.current_agent_message = f"Let's observe Group({current_gid})!"
         except Exception as e:
             self.logger.logerr(f"<navigate.3> Error occurs: {e}")
+            self.rr_log(f"<navigate.3> Error occurs: {e}", panel='nav', level='error')
 
         try:
             if len(current_path_points) == 0:
@@ -2429,12 +2524,13 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     raise NotImplementedError(f"self.action must be in ['find', 'count'], but {self.action} was given.")
 
                 if len(unprocessed_eids) > 0:
+                    self.current_agent_message = f"Group({current_gid}) sufficiently observed. Let's query them."
                     self.inference_signal_queue.put((current_gid, unprocessed_eids))
-                    self.logger.loginfo(
-                        f"<navigate.4.1> Need inference of EIDs: {unprocessed_eids}. Put group({current_gid}) to inference_signal_queue.")
+                    self.logger.loginfo(f"<navigate.4.1> Need inference of EIDs: {unprocessed_eids}. Put group({current_gid}) to inference_signal_queue.")
+                    self.rr_log(f"<navigate.4.1> Need inference of EIDs: {unprocessed_eids}. Put group({current_gid}) to inference_signal_queue.", panel='nav')
                 else:
-                    self.logger.loginfo(
-                        f"<navigate.4.1> No valide EIDs. Entities in group({current_gid}) was already processed.")
+                    self.logger.loginfo(f"<navigate.4.1> No valide EIDs. Entities in group({current_gid}) was already processed.")
+                    self.rr_log(f"<navigate.4.1> No valide EIDs. Entities in group({current_gid}) was already processed.", panel='nav')
 
                 if self.agent_pose:
                     agent_xy = np.array(self.agent_pose['position'][:2], dtype=float)
@@ -2449,10 +2545,15 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                             min_gid = gid
                     self.current_gid = min_gid
                     self.logger.loginfo(f"<navigate.4.2> Changed GID: {current_gid} -> {self.current_gid}")
+                    self.rr_log(f"<navigate.4.2> Changed GID: {current_gid} -> {self.current_gid}", panel='nav')
+                    if self.current_gid is not None:
+                        self.current_agent_message = f"Now observe Group({current_gid})!"
                 else:
                     self.logger.logwarn(f"<navigate.4.2> self.agent_pose is not available.")
+                    self.rr_log(f"<navigate.4.2> self.agent_pose is not available.", panel='nav', level='warn')
         except Exception as e:
             self.logger.logerr(f"<navigate.4> Error occurs: {e}")
+            self.rr_log(f"<navigate.4> Error occurs: {e}", panel='nav', level='error')
 
         # Visualize
         try:
@@ -2460,8 +2561,10 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 current_path_points, ns=f"path_points_{current_gid}", color=colors[current_gid], frame_id=self.frame_id)
             self.path_points_pub.publish(path_points_marker)
             self.logger.loginfo(f"<navigate.4.3> Publish /active_waypoints (path_points)")
+            self.rr_log(f"<navigate.4.3> Publish /active_waypoints (path_points)", panel='nav')
         except Exception as e:
             self.logger.logerr(f"<navigate.4.3> Error occurs: {e}")
+            self.rr_log(f"<navigate.4.3> Error occurs: {e}", panel='nav', level='error')
 
         try:
             marker_array_all = []
@@ -2477,8 +2580,10 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 self.path_points_vis_pub.publish(self.previous_path_points)
                 self.is_path_points_updated = False
             self.logger.loginfo(f"<navigate.4.4> Save previous path_points for efficient visualization")
+            self.rr_log(f"<navigate.4.4> Save previous path_points for efficient visualization", panel='nav')
         except Exception as e:
             self.logger.logerr(f"<navigate.4.4> Error occurs: {e}")
+            self.rr_log(f"<navigate.4.4> Error occurs: {e}", panel='nav', level='error')
 
         # Set exploration strategy
         try:
@@ -2493,6 +2598,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     exp_strategy = "geometric_frontier"
                 self.exploration_strategy_pub.publish(String(exp_strategy))
                 self.logger.logrich(f"<navigate.4.5> Exp Strategy: {exp_strategy}", name='navigation')
+                self.rr_log(f"<navigate.4.5> Exp Strategy: {exp_strategy}", panel='nav')
             else:
                 if self.active_clients.is_running:
                     if len(marker_array_all) == 0:
@@ -2502,12 +2608,15 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                         exp_strategy = "geometric_frontier"
                         self.exploration_strategy_pub.publish(String(exp_strategy))
                         self.logger.logrich(f"<navigate.4.5> Exp Strategy: Ended ({exp_strategy})", name='navigation')
+                        self.rr_log(f"<navigate.4.5> Exp Strategy: Ended ({exp_strategy})", panel='nav')
                         return
                 exp_strategy = "geometric_frontier"
                 self.exploration_strategy_pub.publish(String(exp_strategy))
                 self.logger.logrich(f"<navigate.4.5> Is Not Active ({exp_strategy})", name='navigation')
+                self.rr_log(f"<navigate.4.5> Is Not Active ({exp_strategy})", panel='nav')
         except Exception as e:
             self.logger.logerr(f"<navigate.4.5> Error occurs: {e}")
+            self.rr_log(f"<navigate.4.5> Error occurs: {e}", panel='nav', level='error')
 
     def start_coverage_planning(self):
         """
@@ -2571,12 +2680,22 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 if __name__ == "__main__":
     logger = Logger()
 
-    SCENE = 'vla_test_2025-12-23-16-23-57'
+    SCENE = '2find'
     if SCENE == "arabic_room":
         instruction = "Find the pillow closest to the book on the stool."
         action = 'find'
         target_name = "pillow closest to the book on the stool"
         candidate_names, reference_names = ['pillow'], ['book', 'stool']
+    elif SCENE == '2find':
+        instruction = "Find a red chair below the halloween poster"
+        action = 'find'
+        target_name = "red chair below the halloween poster"
+        candidate_names, reference_names = ['chair'], ['doll']
+    elif SCENE == '5count':
+        instruction = "How many chairs does the doll sit on?"
+        action = 'count'
+        target_name = "chairs the doll sit on"
+        candidate_names, reference_names = ['chair'], ['doll']
     elif SCENE == 'vla_test_2025-12-23-16-23-57':
         # instruction = "Find a blue chair between red chairs"
         # action = 'find'
@@ -2594,7 +2713,8 @@ if __name__ == "__main__":
     else:
         raise TypeError(f"SCENE must be in ['office_1', 'hotel_room_1', 'chinese_room'], but {SCENE} was given.")
 
-    DATA_DIR = f"/ws/external/test_data/{SCENE}"
+    # DATA_DIR = f"/ws/external/test_data/{SCENE}"
+    DATA_DIR = f"/ws/data/VLA/demo_20251224/{SCENE}"
     MAP_DIR = os.path.join(DATA_DIR, "offline_map")
     KEYFRAMES_DIR = os.path.join(DATA_DIR, "keyframes")
 
@@ -2630,6 +2750,7 @@ if __name__ == "__main__":
         task, target_name=target_name,
         candidate_names=candidate_names, reference_names=reference_names
     )
+    tester.node_active_signal = True
 
     map_dirs = [os.path.join(MAP_DIR, d) for d in os.listdir(MAP_DIR)
             if os.path.isdir(os.path.join(MAP_DIR, d))]

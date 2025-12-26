@@ -13,6 +13,7 @@ import matplotlib.patches as patches
 from dataclasses import dataclass
 from ai_module.src.visual_grounding.scripts.utils.utils_active_perception import visible_edges_from_pose, visualize_visibility
 from ai_module.src.utils.utils_pose import theta_from_agent_pose
+from ai_module.src.visual_grounding.scripts.structures.scene_graph import NodeLevel
 
 
 def _visible_arcs_from_mask(mask: np.ndarray):
@@ -322,15 +323,28 @@ class GridGrouper:
                     break
         return b
 
-    def update_visibility(self, agent_pose, fov_rad=None, max_range=None):
+    def update_visibility(self, agent_pose, sg=None, max_range=None):
         hulls = self.group_hulls()
         # self._visible_edges_cache.clear()
+        fov_rad = sg.fov_x
 
         if len(hulls) > 0 and isinstance(agent_pose, dict):
             position = agent_pose['position']
             orientation = agent_pose['orientation']
             theta = theta_from_agent_pose(orientation)
             agent_pose = np.array([position[0], position[1], theta], dtype=np.float32)
+
+        if sg is not None and len(hulls) > 0:
+            agent_poses = []
+            for (elevel, eid), entity in sg.G.nodes(data=True):
+                if elevel == str(NodeLevel.KEYFRAME):
+                    print(f"{eid}")
+                    attrs = entity.get("_attrs", {})
+                    T = np.asarray(attrs["pose"], dtype=np.float32)
+                    x, y = T[0, 3], T[1, 3]
+                    theta = np.arctan2(T[1, 0], T[0, 0])
+                    agent_poses.append(np.array([x, y, theta], dtype=np.float32))
+            agent_poses.append(agent_pose)
 
         for item in hulls:
             gid = item['gid']
@@ -353,13 +367,19 @@ class GridGrouper:
             old_sig_to_idx = {s: i for i, s in enumerate(old_sigs)}
 
             # --- 현재 프레임 visibility 계산 (전체 hull에 대해 한 번만) ---
-            vis, segs, _ = visible_edges_from_pose(
-                hull,
-                agent_pose,
-                fov_rad=fov_rad,
-                max_range=max_range,
-            )
-            # visualize_visibility(hull, agent_pose, segs, fov_rad, max_range, save_path='/ws/external/vis/visibility_debug3.jpg')
+            vis_all = np.zeros(M, dtype=bool)
+            segs_all = []  # 디버깅/시각화용 (원하면)
+            for eid, pose in enumerate(agent_poses):
+                vis, segs, _ = visible_edges_from_pose(
+                    hull,
+                    pose,
+                    fov_rad=fov_rad,
+                    max_range=max_range,
+                )
+                vis_all |= vis
+                if segs is not None:
+                    segs_all.append(segs)
+                # visualize_visibility(hull, pose, segs, fov_rad, max_range, save_path=f'/ws/external/vis/visibility_debug{eid}.jpg')
 
             # --- 새 edge_visible ---
             new_edge_visible = np.zeros(M, dtype=bool)
@@ -367,7 +387,7 @@ class GridGrouper:
 
             # ---- 1) 변하지 않은 edge는 그대로 복사 ----
             for i, sig in enumerate(new_sigs):
-                cur_vis = vis[i]
+                cur_vis = vis_all[i]
 
                 if sig in old_sig_to_idx:
                     j = old_sig_to_idx[sig]
