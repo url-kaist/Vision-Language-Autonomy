@@ -136,7 +136,6 @@ class SceneGraphProcessor:
             shutil.rmtree(base_dir)
         os.makedirs(base_dir, exist_ok=True)
 
-        self.debug = rospy.get_param('~debug', False)
         # Load Configuration
         config_path = rospy.get_param('~config', "/ws/external/ai_module/src/sem/config/simulation.json")
         with open(config_path, "r") as f:
@@ -145,6 +144,7 @@ class SceneGraphProcessor:
         for k, v in config.items():
             self.logger.loginfo(f"  {k} : {v}")
         self.logger.loginfo(f"=====================")
+        self.debug = bool(config.get("debug", rospy.get_param('~debug', False)))
 
         # robot height (body frame z 기준) 설정
         # - body z ≈ -robot_height 근처 포인트는 로봇 바로 아래/바닥으로 간주해서 제거
@@ -373,15 +373,14 @@ class SceneGraphProcessor:
 
         # 설정
         # - real_world: launch 파일(real_world arg → /real_world param)에서만 제어
-        cfg_real_world = bool(config.get("real_world", True))
-        self.is_real_world = rospy.get_param("/real_world", cfg_real_world)
+        self.is_real_world = bool(config.get("real_world", rospy.get_param("/real_world", True)))
 
         # - use_depth_for_seg / compressed_image: config.json / real_robot.json 에서만 제어
         self.use_depth_for_seg = bool(config.get("use_depth_for_seg", True))
         self.is_compressed_image = bool(config.get("compressed_image", False))
 
         self.logger.logwarn(
-            f"real_world={self.is_real_world}, use_depth_for_seg={self.use_depth_for_seg}, compressed_image={self.is_compressed_image}"
+            f"real_world={self.is_real_world}, use_depth_for_seg={self.use_depth_for_seg}, compressed_image={self.is_compressed_image}, debug={self.debug}"
         )
         if self.is_real_world and self.use_depth_for_seg and self.is_compressed_image:
             self.logger.logwarn("YEEEEEEEEEEAHHHHHHHHHHHHHHHHHHHH")

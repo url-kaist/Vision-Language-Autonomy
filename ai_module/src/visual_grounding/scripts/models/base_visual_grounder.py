@@ -338,6 +338,8 @@ class BaseVisualGrounder(BaseModel):
 
         self.objects_prev = self.objects_curr = []
 
+        self.yolo_sub = rospy.Subscriber("/debug/yolo_image", RosImage, self._yolo_callback, queue_size=1)
+
     def _init_all(self, *args, **kwargs):
         self._init_vars(*args, **kwargs)
         self._init_services(*args, **kwargs)
@@ -539,6 +541,10 @@ class BaseVisualGrounder(BaseModel):
         self.system_start_ros = msg.clock
         self.system_start_received = True
 
+    def _yolo_callback(self, msg):
+        bgr = CvBridge().imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        self.rr_logger.log({'det/rgb': rr.Image(image=rgb)})
 
     def _img_callback(self, msg):
         try:
@@ -1894,7 +1900,13 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                         & mask_area((-1.8, -0.8, -1.3, 3.5)))   # chairs
 
                 arr[~mask, col2idx['collision_risk']] = np.inf
-                # save_pcd_ascii_with_header(traversable_path, '/ws/data/VLA/E3_3225_TRIP_postprocessed.pcd', arr)
+                # arr[:, col2idx['z']] += 0.8
+                arr_new = np.zeros((0,21), dtype=np.float32)
+                for _arr in arr:
+                    if _arr[col2idx['collision_risk']] < 0.1:
+                        arr_new = np.concatenate([arr_new, _arr[None, :]], axis=0)
+
+                save_pcd_ascii_with_header(traversable_path, '/ws/data/VLA/E3_3225_TRIP_postprocessed_p08.pcd', arr)
 
             self.traversable_points = np.asarray(xyz[mask]) # self.traversable_points = np.asarray(xyz[~mask])
             self.risky_points = np.asarray(xyz[~mask]) # self.risky_points = np.asarray(xyz_risky)
