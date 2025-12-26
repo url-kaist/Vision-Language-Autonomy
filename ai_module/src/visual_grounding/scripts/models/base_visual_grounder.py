@@ -275,7 +275,7 @@ class BaseVisualGrounder(BaseModel):
         self.frame_id = self.config.get("frame_id", "world" if is_real_world else "map")
         self.wo_query = self.config.get(
             "wo_query", rospy.get_param('~wo_query', False) or
-                        (os.environ.get("WO_QUERY", False).lower() == 'true'))
+                        (os.environ.get("WO_QUERY", "false").lower() == 'true'))
 
         """ Core """
         self.node_name = node_name if node_name else rospy.get_name()
@@ -848,7 +848,7 @@ class BaseVisualGrounder(BaseModel):
         self.updated_resource = True
 
     def select_keyframes(
-            self, entity_type='object', w_cov=1.0, w_area=1.0, alpha=0.5, target_eids=None,
+            self, entity_type='object', w_cov=1.0, w_area=0.2, w_rel=0.8, alpha=0.5, target_eids=None,
             min_kfs=None, max_kfs=10, iter_margin=5, *args, **kwargs
     ):
         with self.sg_lock:
@@ -856,6 +856,7 @@ class BaseVisualGrounder(BaseModel):
         etype = 'all' if entity_type == 'image' else entity_type
 
         # --- candidate ids 준비 ---
+        related_eids = set([entity['id'][1] for entity in sg.get_related_entities(etype)])
         try:
             if target_eids is None:
                 target_eids = set(sg.get_related_entities(etype).ids) # TODO: Need to check
@@ -953,6 +954,7 @@ class BaseVisualGrounder(BaseModel):
 
                 num_uncovered_tgts = len(uncovered_target_eids)
                 max_area = 0.0
+                max_rel = 0
                 tmp_stats = {}  # {pid: (c, a, covered_eids_now), ...}
                 for pid, kf in kfs_with_targets.items():
                     covered_eids_now = pid2target_eids.get(pid, ()) & uncovered_target_eids
@@ -964,15 +966,24 @@ class BaseVisualGrounder(BaseModel):
                         a += _entity_area(kf, pid, eid, sg=self.sg)
                     if a > max_area:
                         max_area = a
-                    tmp_stats[pid] = (c, a, covered_eids_now)
+                        
+                    eids_here = pid2eids.get(pid, [])
+                    related_eids_here = set(eids_here) & set(related_eids)
+                    rel_cnt = len(related_eids_here)
+                    max_rel = max(max_rel, rel_cnt)
+                    tmp_stats[pid] = (c, a, rel_cnt, covered_eids_now)
 
                 if not tmp_stats:
                     self.log(f"<select_keyframes.4> tmp_stats is None", level='warn')
                     break
 
                 best_pid, best_score = None, float("-inf")
-                for pid, (c, a, _) in tmp_stats.items():
-                    base = w_cov * c + (w_area * (a / max_area) if max_area > 0 else 0.0)
+                for pid, (c, a, rel_cnt, _) in tmp_stats.items():
+                    base = (
+                        w_cov * c
+                        + (w_area * (a / max_area) if max_area > 0 else 0.0)
+                        + (w_rel * (rel_cnt / max_rel) if max_rel > 0 else 0)
+                    )
                     cnt = self.kf_counts.get(pid, 0)  # TODO
                     seen = 1.0 / (1.0 + alpha * cnt)
                     score = base * seen
@@ -984,7 +995,7 @@ class BaseVisualGrounder(BaseModel):
                         break
 
                 selected_pids.append(best_pid)
-                _, _, covered_eids_best = tmp_stats[best_pid]
+                _, _, _, covered_eids_best = tmp_stats[best_pid]
                 uncovered_target_eids.difference_update(covered_eids_best)
                 self.kf_counts[best_pid] = self.kf_counts.get(best_pid, 0) + 1
                 kfs_with_targets.pop(best_pid, None)
