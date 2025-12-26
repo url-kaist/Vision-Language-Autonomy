@@ -182,7 +182,7 @@ class SceneGraph:
         self.cam_to_body_t = np.zeros(3, dtype=np.float32)
 
         self.image_height, self.image_width = 480, 640
-        self.z_const = -0.8
+        self.z_const = -0.5
         self.max_range = 8.0
         self.ground_offset = np.array([0.0, 0.0, 0.8])
 

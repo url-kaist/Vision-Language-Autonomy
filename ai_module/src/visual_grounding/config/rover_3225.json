@@ -1,0 +1,16 @@
+{
+  "debug": true,
+  "wo_query": true,
+  "_comment": "=== Save ===",
+  "offline_map_dir": "/ws/data/VLA/offline_map",
+
+  "_comment": "=== Setting ===",
+  "time_limit": 600,
+
+  "_comment": "=== Robot Platform ===",
+  "frame_id": "world",
+
+  "_comment": "=== Navigation ===",
+  "path_radius": 1.5,
+  "group_threshold": 2.0
+}
