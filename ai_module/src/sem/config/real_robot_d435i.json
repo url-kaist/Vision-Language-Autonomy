@@ -1,6 +1,6 @@
 {
   "use_depth_for_seg": true,
-  "compressed_image": true,
+  "compressed_image": false,
 
   "classnames": [],
   "image_topic": "/UGV4/camera/color/image_raw",
@@ -12,16 +12,16 @@
   "robot_height_margin": 0.1,
 
   "depth_intrinsics": {
-    "fx": 383.73699951171875,
-    "fy": 383.73699951171875,
-    "cx": 324.5614929199219,
-    "cy": 238.5606689453125
+    "fx": 389.8971252441406,
+    "fy": 389.8971252441406,
+    "cx": 325.1298828125,
+    "cy": 236.91766357421875
   },
   "rgb_intrinsics": {
-    "fx": 379.15924072265625,
-    "fy": 378.71624755859375,
-    "cx": 320.7159423828125,
-    "cy": 237.7329559326172
+    "fx": 606.040283203125,
+    "fy": 606.2955932617188,
+    "cx": 328.3797912597656,
+    "cy": 245.35792541503906
   },
 
   "offline_map_pose_threshold": 0.1,

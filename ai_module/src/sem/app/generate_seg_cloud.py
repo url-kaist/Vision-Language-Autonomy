@@ -264,6 +264,7 @@ def _generate_seg_comp_cloud_from_depth(
     t_b2w,
     image_src=None,
     depth_K: Optional[np.ndarray] = None,
+    rgb_K: Optional[np.ndarray] = None,
     cam_to_body_R: Optional[np.ndarray] = None,
     cam_to_body_t: Optional[np.ndarray] = None,
     depth_scale: float = 1.0,
@@ -279,6 +280,7 @@ def _generate_seg_comp_cloud_from_depth(
     R_b2w, t_b2w: body → world 변환
     image_src: (H, W, 3) RGB 이미지 (색상 평균용)
     depth_K: (3, 3) depth 카메라 intrinsic, 없으면 HFOV=90 기준으로 추정
+    rgb_K: (3, 3) RGB 카메라 intrinsic, 없으면 해상도/기본값 사용
     cam_to_body_R, cam_to_body_t: camera → body 변환, 없으면 단위/0 사용
     depth_scale: raw depth * depth_scale = [m]
     """
@@ -310,18 +312,19 @@ def _generate_seg_comp_cloud_from_depth(
     # 2) RGB 카메라 intrinsic (마스크/이미지 기준 좌표계)
     #    - 현재 pipeline에서 masks / image_src 는 RGB 카메라 프레임 기준이므로,
     #      RGB intrinsic을 사용해 3D ray를 정의하고, depth 쪽으로만 픽셀을 매핑.
-    if H == 480 and W == 640:
-        rgb_K = np.array(
-            [
-                [606.040283203125, 0.0, 328.3797912597656],
-                [0.0, 606.2955932617188, 245.35792541503906],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        )
-    else:
-        # 해상도가 다르면 일단 depth_K와 동일하다고 가정 (기존 동작 유지)
-        rgb_K = depth_K
+    if rgb_K is None:
+        if H == 480 and W == 640:
+            rgb_K = np.array(
+                [
+                    [606.040283203125, 0.0, 328.3797912597656],
+                    [0.0, 606.2955932617188, 245.35792541503906],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+        else:
+            # 해상도가 다르면 일단 depth_K와 동일하다고 가정 (기존 동작 유지)
+            rgb_K = depth_K
     rgb_K = np.asarray(rgb_K, dtype=np.float32)
     fx_rgb, fy_rgb = float(rgb_K[0, 0]), float(rgb_K[1, 1])
     cx_rgb, cy_rgb = float(rgb_K[0, 2]), float(rgb_K[1, 2])

@@ -151,6 +151,44 @@ class SceneGraphProcessor:
         self.robot_height = float(config.get("robot_height", 0.3))
         self.robot_height_margin = float(config.get("robot_height_margin", 0.05))
 
+        # RGB / Depth intrinsic (config에서 선택적으로 로드)
+        self.depth_K = None
+        self.rgb_K = None
+        try:
+            depth_intr = config.get("depth_intrinsics")
+            if depth_intr is not None:
+                if isinstance(depth_intr, dict):
+                    fx = float(depth_intr.get("fx"))
+                    fy = float(depth_intr.get("fy"))
+                    cx = float(depth_intr.get("cx"))
+                    cy = float(depth_intr.get("cy"))
+                    self.depth_K = np.array(
+                        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                        dtype=np.float32,
+                    )
+                else:
+                    depth_arr = np.asarray(depth_intr, dtype=np.float32)
+                    if depth_arr.shape == (3, 3):
+                        self.depth_K = depth_arr
+
+            rgb_intr = config.get("rgb_intrinsics")
+            if rgb_intr is not None:
+                if isinstance(rgb_intr, dict):
+                    fx = float(rgb_intr.get("fx"))
+                    fy = float(rgb_intr.get("fy"))
+                    cx = float(rgb_intr.get("cx"))
+                    cy = float(rgb_intr.get("cy"))
+                    self.rgb_K = np.array(
+                        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                        dtype=np.float32,
+                    )
+                else:
+                    rgb_arr = np.asarray(rgb_intr, dtype=np.float32)
+                    if rgb_arr.shape == (3, 3):
+                        self.rgb_K = rgb_arr
+        except Exception as e:
+            self.logger.logwarn(f"[SceneGraph] Failed to parse camera intrinsics from config: {e}")
+
         perception_debug_dir = "/ws/external/perception_debug"
         for file_path in glob.glob(os.path.join(perception_debug_dir, "*")):
             if os.path.isfile(file_path):
@@ -1527,7 +1565,7 @@ class SceneGraphProcessor:
             # cloud_body = voxel_downsample(cloud_body, 0.02)
 
             iter += 1
-            self.merge_detections_every_n_iter(iter, 30)
+            # self.merge_detections_every_n_iter(iter, 30)
             # cloud_body = cloud_body[cloud_body[:, 2] > 0.05]
             R_b2w = pose["rotation"]
             t_b2w = pose["position"]
@@ -1678,6 +1716,8 @@ class SceneGraphProcessor:
                     pose["rotation"],
                     pose["position"],
                     image_src=image.copy(),
+                    depth_K=self.depth_K,
+                    rgb_K=self.rgb_K,
                     cam_to_body_R=self.cam_to_body_R,
                     cam_to_body_t=self.cam_to_body_t,
                     depth_scale=0.001,  # RealSense 계열 depth: mm 단위 → m 로 변환
