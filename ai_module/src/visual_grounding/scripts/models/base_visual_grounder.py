@@ -846,7 +846,7 @@ class BaseVisualGrounder(BaseModel):
         self.updated_resource = True
 
     def select_keyframes(
-            self, entity_type='object', w_cov=1.0, w_area=0.2, w_rel=0.8, alpha=0.5, target_eids=None,
+            self, entity_type='object', w_cov=1.0, w_area=0.1, w_rel=0.5, alpha=0.7, target_eids=None,
             min_kfs=None, max_kfs=10, iter_margin=5, *args, **kwargs
     ):
         with self.sg_lock:

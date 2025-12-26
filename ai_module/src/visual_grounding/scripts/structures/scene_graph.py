@@ -248,12 +248,25 @@ class SceneGraph:
                 if target[0] == source[0]:
                     continue
 
+                # filter the obj and kf edges
+                s_is_obj = (source[0] == str(NodeLevel.OBJECT))
+                t_is_obj = (target[0] == str(NodeLevel.OBJECT))
+                s_is_kf = (source[0] == str(NodeLevel.KEYFRAME))
+                t_is_kf = (target[0] == str(NodeLevel.KEYFRAME))
+
+                if (s_is_obj and t_is_kf):
+                    if not self._ok_object_keyframe_edge(source, target, min_point_ratio=0.1, min_bbox_area_ratio=0.002):
+                        continue
+                elif (s_is_kf and t_is_obj):
+                    if not self._ok_object_keyframe_edge(target, source, min_point_ratio=0.1, min_bbox_area_ratio=0.002):
+                        continue
+
                 self.G.add_edge(source, target)
                 self.G.add_edge(target, target)
                 # print(f"Add edge: {source} <-> {target}")
 
             self.update_projection_links(
-                min_point_ratio=0.05,
+                min_point_ratio=0.1,
                 min_bbox_area_ratio=0.002,
             )
         print(f"=> Graph: {self.G}")
@@ -324,6 +337,47 @@ class SceneGraph:
             for kf_key in good_pids:
                 self.G.add_edge(obj_key, kf_key)
                 self.G.add_edge(kf_key, obj_key)
+
+    def _ok_object_keyframe_edge(
+            self,
+            obj_key,
+            kf_key,
+            min_point_ratio: float,
+            min_bbox_area_ratio: float,
+    ) -> bool:
+        """
+        obj_key: (str(NodeLevel.OBJECT), eid)
+        kf_key : (str(NodeLevel.KEYFRAME), pid)
+        """
+        if (obj_key not in self.G.nodes) or (kf_key not in self.G.nodes):
+            return False
+
+        obj_data = self.G.nodes[obj_key]
+        kf_data = self.G.nodes[kf_key]
+
+        e_attrs = obj_data.get("_attrs", {})
+        kf_attrs = kf_data.get("_attrs", {})
+
+        pts = np.asarray(e_attrs.get("points", []), dtype=np.float32)
+        if pts.size == 0:
+            return False
+
+        pose = np.asarray(kf_attrs.get("pose", None), dtype=np.float32)
+        img = kf_attrs.get("image", None)
+
+        # KeyframeNode에서 image를 읽어오지만, None일 수도 있어서 안전 처리 :contentReference[oaicite:2]{index=2}
+        if img is None:
+            image_path = kf_attrs.get("image_path", None)
+            if image_path:
+                img = cv2.imread(image_path)
+                kf_attrs["image"] = img
+
+        if pose is None or img is None:
+            return False
+
+        H, W = img.shape[:2]
+        proj_ratio, area_ratio, _ = self._projection_stats(pts, pose, (H, W))  # :contentReference[oaicite:3]{index=3}
+        return (proj_ratio >= min_point_ratio) and (area_ratio >= min_bbox_area_ratio)
 
     def get_entity_names(self, names, *args, **kwargs) -> Entities:
         output_entities = []
@@ -439,6 +493,7 @@ class SceneGraph:
 
 if __name__ == "__main__":
     DATA_DIR = "/ws/external/bags/20251224/6count_2025-12-24-21-01-39/offline_map"
+    DATA_DIR = "/ws/data/VLA/offline_map"
     dirs = [os.path.join(DATA_DIR, d) for d in os.listdir(DATA_DIR)
             if os.path.isdir(os.path.join(DATA_DIR, d))]
     dir_sorted = sorted(dirs, key=os.path.getmtime)
