@@ -275,7 +275,7 @@ class BaseVisualGrounder(BaseModel):
         self.frame_id = self.config.get("frame_id", "world" if is_real_world else "map")
         self.wo_query = self.config.get(
             "wo_query", rospy.get_param('~wo_query', False) or
-                        (os.environ.get("WO_QUERY", False).lower() == 'true'))
+                        (os.environ.get("WO_QUERY", "false").lower() == 'true'))
 
         """ Core """
         self.node_name = node_name if node_name else rospy.get_name()
