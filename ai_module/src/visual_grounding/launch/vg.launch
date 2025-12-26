@@ -1,9 +1,11 @@
 <launch>
     <arg name="quiet" default="false"/>
+    <arg name="config" default="/ws/external/ai_module/src/visual_grounding/config/rover_3225.json"/>
 
 <!-- Visual Grounding -->
     <include file="$(find visual_grounding)/launch/one_vg.launch">
         <arg name="quiet" value="$(arg quiet)"/>
+        <arg name="config" value="$(arg config)"/>
         <arg name="vg_index" value="0"/>
     </include>
 

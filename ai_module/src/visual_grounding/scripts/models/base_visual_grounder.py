@@ -257,17 +257,15 @@ class PriorityDispatcher:
 class BaseVisualGrounder(BaseModel):
 # INIT
     def __init__(self, node_name=None, is_real_world=False, logger=None, *args, **kwargs):
-        self.rr_logger = RRLogger()
-        super().__init__(logger=logger, *args, **kwargs)
         # Load Configuration
         self.config = None
         config_path = rospy.get_param('~config', "/ws/external/ai_module/src/visual_grounding/config/rover_3225.json")
         with open(config_path, "r") as f:
             self.config = config = json.load(f)
-        self.logger.loginfo(f"=== configuration ===")
-        for k, v in config.items():
-            self.logger.loginfo(f"  {k} : {v}")
-        self.logger.loginfo(f"=====================")
+
+        self.rr_logger = RRLogger(name=config['rr_name'])
+
+        super().__init__(logger=logger, *args, **kwargs)
 
         self.debug = self.config.get("debug", self.debug)
         self.offline_map_dir = os.environ.get(
@@ -1850,6 +1848,11 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.update_interval_path_points = rospy.Duration(5.0)  # (sec)
         self.current_gid = 0
 
+        self.logger.loginfo(f"=== configuration ===")
+        for k, v in self.config.items():
+            self.logger.loginfo(f"  {k} : {v}")
+        self.logger.loginfo(f"=====================")
+
     def _init_services(self, *args, **kwargs) -> None:
         super()._init_services(*args, **kwargs)
         
@@ -1962,6 +1965,19 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         }
         self.log_agent(agent_pose)
 
+        self.path_xy = path_xy = np.concatenate([self.path_xy, [agent_pose['position'][:2]]], axis=0)
+        if len(path_xy) > 1 and getattr(self, 'sg'):
+            if hasattr(self.sg, 'z_const'):
+                v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2,
+                                               rgb_u8=[0, 255, 255])
+                if (v0 is not None) and (t0 is not None):
+                    self.rr_logger.log(
+                        {'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
+                v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
+                if (v1 is not None) and (t1 is not None):
+                    self.rr_logger.log(
+                        {'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
+
         if self.debug:  # TODO: debug: Save the path_xy
             _ = save_path_xy(agent_pose['position'], base_dir=self.offline_map_dir, name="position")
             _ = save_path_xy(agent_pose['orientation'], base_dir=self.offline_map_dir, name="orientation")
@@ -1973,6 +1989,20 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
         }
         self.log_agent(agent_pose)
+
+        self.path_xy = path_xy = np.concatenate([self.path_xy, [agent_pose['position'][:2]]], axis=0)
+        if len(path_xy) > 1 and getattr(self, 'sg'):
+            if hasattr(self.sg, 'z_const'):
+                v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2,
+                                               rgb_u8=[0, 255, 255])
+                if (v0 is not None) and (t0 is not None):
+                    self.rr_logger.log(
+                        {'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
+                v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
+                if (v1 is not None) and (t1 is not None):
+                    self.rr_logger.log(
+                        {'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
+
         if self.debug:  # TODO: debug: Save the path_xy
             _ = save_path_xy(agent_pose['position'], base_dir=self.offline_map_dir, name="position")
             _ = save_path_xy(agent_pose['orientation'], base_dir=self.offline_map_dir, name="orientation")
@@ -2092,19 +2122,14 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.log(f"<process.0> Read agent_pose from {_}")
 
             self.path_xy = path_xy = np.concatenate([self.path_xy, [position[:2]]], axis=0)
-            if len(path_xy) > 1:
-                # v0, t0 = _polyline_xy_to_ribbon_mesh3d(path_xy, z=self.sg.z_const-0.01, width=self.radius * 2, closed=False)
-                v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2, rgb_u8=[0, 255, 255])
-                if (v0 is not None) and (t0 is not None):
-                    self.rr_logger.log({'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
-                # v0, t0 = _polyline_xy_to_ribbon_mesh3d(path_xy, z=self.sg.z_const, width=0.04, closed=False)
-                v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
-                if (v1 is not None) and (t1 is not None):
-                    # self.rr_logger.log({'SG/agent/path_xy': rr.Mesh3D(
-                    #     vertex_positions=v0, triangle_indices=t0,
-                    #     vertex_colors=np.tile(np.array([[0, 0, 255]], dtype=np.uint8), (v0.shape[0], 1)))
-                    # })
-                    self.rr_logger.log({'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
+            if len(path_xy) > 1 and getattr(self, 'sg'):
+                if hasattr(self.sg, 'z_const'):
+                    v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2, rgb_u8=[0, 255, 255])
+                    if (v0 is not None) and (t0 is not None):
+                        self.rr_logger.log({'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
+                    v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
+                    if (v1 is not None) and (t1 is not None):
+                        self.rr_logger.log({'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
 
         # Select Group ID
         num_queries_required = 1 # self.agg_results.min_query

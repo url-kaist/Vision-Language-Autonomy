@@ -3,10 +3,12 @@
     <arg name="real_world" default="false"/>
     <arg name="debug" default="false"/>
     <arg name="vg_index" default="0"/>
-    
+    <arg name="config" default="/ws/external/ai_module/src/visual_grounding/config/rover_3225.json"/>
+
     <node name="visual_grounding_$(arg vg_index)" pkg="visual_grounding" type="active_grounder.py" output="screen">
         <param name="quiet" value="$(arg quiet)"/>
         <param name="real_world" value="$(arg real_world)"/>
         <param name="debug" value="$(arg debug)"/>
+        <param name="config" value="$(arg config)"/>
     </node>
 </launch>
