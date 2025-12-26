@@ -270,8 +270,8 @@ class BaseVisualGrounder(BaseModel):
         self.logger.loginfo(f"=====================")
 
         self.debug = self.config.get("debug", self.debug)
-        self.offline_map_dir = self.config.get(
-            "offline_map_dir", os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map"))
+        self.offline_map_dir = os.environ.get(
+            "offline_map_dir", self.config.get("OFFLINE_MAP_DIR", "/ws/external/offline_map"))
         self.frame_id = self.config.get("frame_id", "world" if is_real_world else "map")
         self.wo_query = self.config.get(
             "wo_query", rospy.get_param('~wo_query', False) or
@@ -1854,9 +1854,9 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.odom_sub2 = rospy.Subscriber("/Odometry", Odometry, self._odom_callback2, queue_size=20)
 
         """ Traversable area """
-        traversable_path = os.environ.get("TRAVERSABLE_PATH", None)
         self.traversable_points = None
         self.vis_traversable_points = False
+        self.traversable_path = traversable_path = os.environ.get("TRAVERSABLE_PATH", self.config.get("traversable_path", None))
         if traversable_path is not None:
             cols, arr = load_pcd_ascii_with_fields(traversable_path)
             col2idx = {c: i for i, c in enumerate(cols)}
