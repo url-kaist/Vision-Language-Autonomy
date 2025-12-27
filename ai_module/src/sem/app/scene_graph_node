@@ -135,6 +135,7 @@ class SceneGraphProcessor:
         if os.path.exists(base_dir) and os.path.isdir(base_dir):
             shutil.rmtree(base_dir)
         os.makedirs(base_dir, exist_ok=True)
+        self.logger.loginfo(f">>> offline_map: {base_dir}")
 
         # Load Configuration
         config_path = rospy.get_param('~config', "/ws/external/ai_module/src/sem/config/simulation.json")
@@ -218,6 +219,7 @@ class SceneGraphProcessor:
         # data
         self.obj_classes = MATTERPORT_LABELS_160
         self.color_map = {i + 1: color for i, color in enumerate(MATTERPORT_COLOR_MAP_160.values())}
+        self.invalid_class_ids_logged = set()
         
         
         # perception
@@ -471,7 +473,7 @@ class SceneGraphProcessor:
             if self.is_real_world:
                 print("ApproximateTimeSynchronizer with depth (no lidar)")
                 self.sync_sub = ApproximateTimeSynchronizer(
-                    [self.rgb_sub, self.depth_sub], queue_size=1, slop=0.01
+                    [self.rgb_sub, self.depth_sub], queue_size=10, slop=0.1
                 )
             else:
                 print("ApproximateTimeSynchronizer with depth + lidar")
@@ -851,7 +853,7 @@ class SceneGraphProcessor:
 
             # RGB 프레임 대기 (최대 0.05초)
             try:
-                stamp, rgb = rgb_queue.get(timeout=1.0)
+                stamp, rgb = rgb_queue.get(timeout=0.1)
             except queue.Empty:
                 # 0.05초 동안 아무 프레임도 안 들어온 경우: 이번 iteration은 스킵
                 continue
@@ -1051,7 +1053,7 @@ class SceneGraphProcessor:
                 # Correct way to find the key with the maximum value
                 if merged_class_ids: # Check if the dictionary is not empty
                     max_id = max(merged_class_ids, key=merged_class_ids.get)
-                    class_name = self.obj_classes[max_id]
+                    class_name = self.get_class_name_safe(max_id)
                 else:
                     class_name = det_i["class_name"] # Or handle the empty case as needed
 
@@ -1460,7 +1462,7 @@ class SceneGraphProcessor:
         """YOLO 결과 큐에서 '가장 최신' 항목 하나를 blocking으로 가져온다."""
         try:
             # 최초 결과를 timeout을 두고 대기
-            item = q.get(timeout=1.0)
+            item = q.get(timeout=0.3)
         except pyqueue.Empty:
             self.logger.logwarn("yolo get timeout (no result within 0.3s)")
             return None
@@ -1903,8 +1905,12 @@ class SceneGraphProcessor:
             for i, obj_cloud in enumerate(obj_clouds_world):
                 tracking_id = tracking_ids[i]
                 class_id = class_ids[i]
-                if self.classnames[class_id][0] == "wall":
-                    continue
+                if 0 <= class_id < len(self.classnames):
+                    if self.classnames[class_id][0] == "wall":
+                        continue
+                else:
+                    # trigger warning/logging once per unseen id
+                    self.get_class_name_safe(class_id)
 
                 yolo_conf = confs[i]
                 bounding_box = bounding_boxes[i] # DSHONG
@@ -1914,7 +1920,7 @@ class SceneGraphProcessor:
                     self.missing_detections.append({
                         "id": tracking_id,
                         "class_id": class_id,
-                        "class_name": self.obj_classes[class_id],
+                        "class_name": self.get_class_name_safe(class_id),
                         "yolo_conf": yolo_conf,
                         "bbox": bounding_box,
                         "points": obj_cloud,
@@ -1936,7 +1942,7 @@ class SceneGraphProcessor:
                     self.missing_detections.append({
                         "id": tracking_id,
                         "class_id": class_id,
-                        "class_name": self.obj_classes[class_id],
+                        "class_name": self.get_class_name_safe(class_id),
                         "yolo_conf": yolo_conf,
                         "bbox": bounding_box,
                         "points": obj_cloud,
@@ -1954,7 +1960,7 @@ class SceneGraphProcessor:
                     self.missing_detections.append({
                         "id": tracking_id,
                         "class_id": class_id,
-                        "class_name": self.obj_classes[class_id],
+                        "class_name": self.get_class_name_safe(class_id),
                         "yolo_conf": yolo_conf,
                         "bbox": bounding_box,
                         "points": obj_cloud,
@@ -2030,7 +2036,7 @@ class SceneGraphProcessor:
                     self.detections.append({
                         "id": final_id,
                         "class_ids": det["class_ids"],
-                        "class_name": self.obj_classes[max_class_id], #det["class_name"],
+                        "class_name": self.get_class_name_safe(max_class_id), #det["class_name"],
                         "center": center,
                         "yolo_conf": yolo_conf,
                         "bbox": bounding_box,
@@ -2081,7 +2087,7 @@ class SceneGraphProcessor:
                         self.objects[tracking_id] = { # copy untracked to tracked
                                 "id": tracking_id,
                                 "class_ids": det['class_ids'],
-                                "class_name": self.obj_classes[class_id],
+                                "class_name": self.get_class_name_safe(class_id),
                                 "yolo_conf": det["yolo_conf"],
                                 "size_conf": det["size_conf"],
                                 "num_detections": det["num_detections"]+1,
@@ -2108,7 +2114,7 @@ class SceneGraphProcessor:
                     self.detections.append({
                         "id": final_id,
                         "class_ids": det["class_ids"],
-                        "class_name": self.obj_classes[max_class_id], #det["class_name"],
+                        "class_name": self.get_class_name_safe(max_class_id), #det["class_name"],
                         "center": center,
                         "yolo_conf": yolo_conf,
                         "bbox": bounding_box,
@@ -2121,7 +2127,7 @@ class SceneGraphProcessor:
                     self.objects[tracking_id] = {
                         "id": tracking_id,
                         "class_ids": class_dict,
-                        "class_name": self.obj_classes[class_id],
+                        "class_name": self.get_class_name_safe(class_id),
                         "yolo_conf": yolo_conf,
                         "size_conf": size_conf,
                         "num_detections": 1,
@@ -2132,7 +2138,7 @@ class SceneGraphProcessor:
                     self.detections.append({
                         "id": tracking_id,
                         "class_ids": class_dict,
-                        "class_name": self.obj_classes[class_id],
+                        "class_name": self.get_class_name_safe(class_id),
                         "center": center,
                         "yolo_conf": yolo_conf,
                         "bbox": bounding_box,
@@ -2346,6 +2352,31 @@ class SceneGraphProcessor:
 
         pc2_msg = pc2.create_cloud(header, self.fields, points)
         self.hash_map_pub.publish(pc2_msg)
+
+    def get_class_name_safe(self, class_id):
+        """Return class name with bounds check to avoid IndexError."""
+        try:
+            cid = int(class_id)
+        except Exception:
+            cid = class_id
+
+        if isinstance(cid, (int, np.integer)):
+            if 0 <= cid < len(self.obj_classes):
+                return self.obj_classes[cid]
+
+            if 0 <= cid < len(self.classnames):
+                cname = self.classnames[cid]
+                return cname[0] if isinstance(cname, (list, tuple)) and cname else cname
+        else:
+            cid = class_id
+
+        cid_key = cid if isinstance(cid, (int, np.integer, str)) else str(cid)
+        if cid_key not in self.invalid_class_ids_logged:
+            self.invalid_class_ids_logged.add(cid_key)
+            self.logger.logwarn(
+                f"[SceneGraph] class_id {cid} out of range for obj_classes (len={len(self.obj_classes)}); using raw id"
+            )
+        return str(cid)
 
     def get_color(self, class_id):
         if 0 <= class_id < len(self.obj_classes):
@@ -2960,7 +2991,7 @@ class SceneGraphProcessor:
         )
         
         base_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
-        self.logger.loginfo(f"base_dir: {base_dir}")
+        self.logger.loginfo(f">>> base_dir: {base_dir}")
         save_dir = None
         if save_to_disk:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
