@@ -1652,6 +1652,7 @@ class BaseVisualGrounder(BaseModel):
                     ]
                     self.log(f"<query_worker.0> 5")
                     candidate_eids_in_kfs += filtered_eids
+            candidate_eids_in_kfs = sorted(set(candidate_eids_in_kfs)) 
 
             options = input_data.get('options', self.default_options)
             previous_history = options['prompt']['previous_history']  # TODO
