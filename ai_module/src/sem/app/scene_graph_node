@@ -133,7 +133,11 @@ class SceneGraphProcessor:
             quiet=quiet, prefix='SceneGraph', log_path="/ws/external/log/scene_graph.log")
         base_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
         if os.path.exists(base_dir) and os.path.isdir(base_dir):
-            shutil.rmtree(base_dir)
+            try:
+                shutil1.rmtree(base_dir)
+            except Exception as e:
+                self.logger.logerr(f"ERROR MSG: {e}")
+                pass
         os.makedirs(base_dir, exist_ok=True)
         self.logger.loginfo(f">>> offline_map: {base_dir}")
 
@@ -568,16 +572,26 @@ class SceneGraphProcessor:
             self.classnames = list(set(classnames_old + classnames_new))
             self.obj_classes = self.classnames
             self.classnames = [[name] for name in self.classnames] + [[' ']]
+
+            # 타겟 클래스들의 인덱스 추출
+            target_ids = []
+            for name in classnames_new:
+                for i, c_list in enumerate(self.classnames):
+                    if name in c_list:
+                        target_ids.append(i)
+                        break
+
             self.shared_cfg["classnames"] = self.classnames
+            self.shared_cfg["target_ids"] = target_ids
             self.shared_cfg["is_add"] = True
             self.shared_cfg["is_ready"] = True
-            # self.yolo_model.set_classes(self.classnames) # It is not working
             
             self.color_map = {
                 idx: tuple(random.randint(0, 255) for _ in range(3))
                 for idx in range(len(self.classnames))
             }
             self.logger.log(f"Set classes: {self.classnames}")
+            self.logger.log(f"Target IDs: {target_ids}")
             self.logger.log(f"==============================")
             self.already_set_classes = True
 
@@ -904,6 +918,19 @@ class SceneGraphProcessor:
                         pred_instances.scores.float() > confidence
                     ]
 
+                # 타겟 클래스 필터링 (인덱싱 방식)
+                target_ids = shared_cfg.get("target_ids")
+                if target_ids is not None and len(pred_instances) > 0:
+                    indices = torch.tensor([
+                        i for i, label in enumerate(pred_instances.labels)
+                        if int(label) in target_ids
+                    ], device=pred_instances.labels.device)
+                    
+                    if len(indices) > 0:
+                        pred_instances = pred_instances[indices]
+                    else:
+                        pred_instances = pred_instances[:0]
+
                 if len(pred_instances.scores) > max_dets:
                     indices = pred_instances.scores.float().topk(max_dets)[1]
                     pred_instances = pred_instances[indices]
@@ -929,32 +956,43 @@ class SceneGraphProcessor:
 
                 tracks = tracker.update_with_detections(detections)
 
-                if False:  # detections is not None:
-                    labels = [
-                        f"{tracker_id} {classnames[class_id][0]} {confidence:0.2f}"
-                        for tracker_id, class_id, confidence in zip(
-                            detections.tracker_id,
-                            detections.class_id,
-                            detections.confidence,
+                if False:
+                    display_dets = tracks if tracks is not None and len(tracks) > 0 else detections
+
+                    if len(display_dets) > 0:
+                        # tracker_id가 None인 경우 -1로 채운 배열 생성
+                        if display_dets.tracker_id is None:
+                            tracker_ids = np.full(len(display_dets), -1)
+                        else:
+                            tracker_ids = display_dets.tracker_id
+
+                        labels = [
+                            f"{tid} {classnames[cid][0]} {conf:0.2f}"
+                            for tid, cid, conf in zip(
+                                tracker_ids,
+                                display_dets.class_id,
+                                display_dets.confidence,
+                            )
+                        ]
+
+                        annotated_image = BOUNDING_BOX_ANNOTATOR.annotate(rgb, display_dets)
+                        annotated_image = LABEL_ANNOTATOR.annotate(
+                            annotated_image, display_dets, labels=labels
                         )
-                    ]
 
-                    annotated_image = BOUNDING_BOX_ANNOTATOR.annotate(rgb, detections)
-                    annotated_image = LABEL_ANNOTATOR.annotate(
-                        annotated_image, detections, labels=labels
-                    )
-
-                    debug = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
-                    cv2.imwrite(
-                        os.path.join(perception_debug_dir, f"yolo_{stamp}.jpg"),
-                        annotated_image,
-                    )
+                        cv2.imwrite(
+                            os.path.join(perception_debug_dir, f"yolo_{stamp}.jpg"),
+                            annotated_image,
+                        )
+                    else:
+                        cv2.imwrite(
+                            os.path.join(perception_debug_dir, f"yolo_{stamp}.jpg"),
+                            rgb,
+                        )
 
                 # 4) 원본 boxes, masks, 소요시간을 메인 프로세스로 전달
-                #    - stamp: 이미지 timestamp (ns)
-                #    - detections: YOLO 결과
-                #    - infer_time: YOLO 추론 소요 시간
-                yolo_queue.put((stamp, detections, infer_time))
+                #    tracker_id가 포함된 display_dets를 전달 (없으면 원본 detections)
+                yolo_queue.put((stamp, display_dets, infer_time))
 
             except Exception as e:
                 msg = f"[YOLO worker] Exception during inference: {e}"

@@ -2,7 +2,7 @@
   "use_depth_for_seg": true,
   "compressed_image": false,
 
-  "classnames": [],
+  "classnames": ["desk", "book", "book shelf", "chair"],
   "image_topic": "/UGV4/camera/color/image_raw",
   "depth_topic": "/UGV4/camera/depth/image_rect_raw",
   "lidar_topic": "/cloud_registered_body",
