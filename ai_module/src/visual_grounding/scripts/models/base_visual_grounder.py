@@ -1875,6 +1875,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.last_update_time_path_points = rospy.Time.now()
         self.update_interval_path_points = rospy.Duration(5.0)  # (sec)
         self.current_gid = 0
+        self.history_eids = []
 
         self.logger.loginfo(f"=== configuration ===")
         for k, v in self.config.items():
@@ -2187,19 +2188,20 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             (gid, eids) = self.inference_signal_queue.get_nowait()
             # self.agg_results.generate(gid=gid)  # 모든 related_entity는 어떤 group에 할당됨
             self.logger.loginfo(f"<process.1> New EIDs are given: {eids} (GID={gid})")
+            self.history_eids += eids
         except queue.Empty:
             if self.action == 'find':
                 # NOTE: Only etype=='object' is supported.
                 # TODO: Need to check
-                # candidate_eids = self.sg.get_candidate_entities()
-                # pending_eids = sorted(
-                #     [
-                #         eid for eid in candidate_eids
-                #         if self.agg_results.results_by_entity.num_queries.get(eid, 0) < self.agg_results.min_query
-                #     ],
-                #     key=lambda eid: self.agg_results.results_by_entity.num_queries.get(eid, 0)
-                # )
-                pending_eids = []
+                candidate_eids = list(set(self.sg.get_candidate_entities()) & set(self.history_eids))
+                pending_eids = sorted(
+                    [
+                        eid for eid in candidate_eids
+                        if self.agg_results.results_by_entity.num_queries.get(eid, 0) < self.agg_results.min_query
+                    ],
+                    key=lambda eid: self.agg_results.results_by_entity.num_queries.get(eid, 0)
+                )
+                # pending_eids = []
                 gid = None
             elif self.action == 'count':
                 if self.etypes == ['object']:
