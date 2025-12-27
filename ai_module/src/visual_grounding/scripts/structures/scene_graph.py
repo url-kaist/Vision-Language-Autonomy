@@ -266,7 +266,7 @@ class SceneGraph:
                 #         continue
 
                 self.G.add_edge(source, target)
-                self.G.add_edge(target, target)
+                self.G.add_edge(target, source)
                 # print(f"Add edge: {source} <-> {target}")
 
             # self.update_projection_links(

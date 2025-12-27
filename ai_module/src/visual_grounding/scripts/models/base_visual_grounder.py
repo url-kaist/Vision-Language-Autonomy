@@ -19,6 +19,7 @@ import concurrent.futures
 import json
 import copy
 import queue
+import hashlib
 
 from ai_module.src.utils.logger import Logger
 from ai_module.src.utils.utils import (pointcloud2_to_xy_array, is_equal, find_closest_point, \
@@ -68,6 +69,16 @@ from visual_grounding.srv import SetSubplans, SetSubplansResponse
 from std_srvs.srv import Trigger, TriggerResponse
 from ai_module.src.utils.rr_logger import RRLogger, rotmat_to_quat_xyzw
 from cv_bridge import CvBridge
+
+
+def _stable_hash(payload: dict) -> str:
+    s = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.blake2b(s.encode("utf-8"), digest_size=16).hexdigest()
+
+def _as_list(x):
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    return x
 
 
 ANSWER_TYPE = {'find': Marker, 'count': Int32}
@@ -705,10 +716,58 @@ class BaseVisualGrounder(BaseModel):
             self.vis_traversable_points = False
 
     def log_sg(self, G):
+        """
+        변경된 노드만 rerun으로 갱신 로깅한다.
+        - (level, id)가 과거에 들어왔어도 _attrs가 변하면 fingerprint가 바뀌므로 다시 로깅됨.
+        - KEYFRAME의 Pinhole/EncodedImage는 '변경이 있을 때만' 로깅(추가 캐시 포함).
+        """
+        # --- 캐시 초기화 (처음 한 번만) ---
+        if not hasattr(self, "_sg_fp_cache"):
+            self._sg_fp_cache = {}      # node_key(level,id) -> fingerprint
+        if not hasattr(self, "_sg_logged_pinhole"):
+            self._sg_logged_pinhole = set()  # (level,id)
+        if not hasattr(self, "_sg_logged_image_path"):
+            self._sg_logged_image_path = set()  # image_path
+
         prefix = "SG/nodes"
         for (level, id), data in G.nodes(data=True):
             entity_path = f"{prefix}/{str(level)}/{id}"
             attrs = data.get('_attrs', {})
+
+            # --- 1) fingerprint 만들기 (가벼운 필드만) ---
+            # “이미지 배열” 같은 큰 데이터는 절대 fingerprint에 넣지 마세요.
+            if level == str(NodeLevel.OBJECT):
+                fp_payload = {
+                    "level": level,
+                    "id": id,
+                    # merge/points 업데이트를 잡기 위해 _attrs 핵심값 포함
+                    "name": attrs.get("name"),
+                    "centroid": _as_list(attrs.get("centroid")),
+                    "extent": _as_list(attrs.get("extent")),
+                    "R": _as_list(attrs.get("R")),
+                }
+            elif level == str(NodeLevel.KEYFRAME):
+                # pose/path만으로도 업데이트 감지 가능
+                fp_payload = {
+                    "level": level,
+                    "id": id,
+                    "pose": _as_list(attrs.get("pose")),
+                    "image_path": attrs.get("image_path", data.get("image_path")),
+                    # K가 바뀌는 경우가 있으면 포함(대부분 고정이라 불필요하지만 안전하게)
+                    "K": _as_list(getattr(self.sg, "rgb_K", None)),
+                }
+            else:
+                continue
+
+            fp = _stable_hash(fp_payload)
+
+            # --- 2) 변경이 없으면 로깅 skip ---
+            old_fp = self._sg_fp_cache.get((level, id))
+            if old_fp == fp:
+                continue
+            self._sg_fp_cache[(level, id)] = fp
+
+            # --- 3) 변경된 노드만 로깅 ---
             if level == str(NodeLevel.OBJECT):
                 centers = np.array([attrs['centroid']], dtype=np.float32) # (1, 3)
                 half_sizes = np.array([attrs['extent']], dtype=np.float32) * 0.5
@@ -723,26 +782,50 @@ class BaseVisualGrounder(BaseModel):
                         colors=colors, labels=f"{attrs['name']}({id})"
                     ),
                 })
-            # elif level == str(NodeLevel.KEYFRAME):
-            #     pose = np.array(attrs['pose'], dtype=np.float32)
-            #     R_b2w, t_b2w = pose[:3, :3], pose[:3, 3]
-            #     R_c2w = R_b2w @ self.sg.cam_to_body_R
-            #     t_c2w = R_b2w @ self.sg.cam_to_body_t + t_b2w
-            #     self.rr_logger.log({
-            #         entity_path: rr.Transform3D(
-            #             translation=t_c2w, quaternion=rotmat_to_quat_xyzw(R_c2w)
-            #         )
-            #     })
-            #     height, width, _ = attrs['image'].shape
-            #     self.rr_logger.log({
-            #         entity_path: rr.Pinhole(
-            #             resolution=[width, height], image_from_camera=self.sg.rgb_K, camera_xyz=rr.ViewCoordinates.RDF,
-            #         )
-            #     })
-            #     self.rr_logger.log({
-            #         entity_path: rr.EncodedImage(path=attrs['image_path'])
-            #     })
+            elif level == str(NodeLevel.KEYFRAME):
+                # Transform은 pose가 바뀌면 갱신되어야 함
+                pose = np.array(attrs['pose'], dtype=np.float32)
+                R_b2w, t_b2w = pose[:3, :3], pose[:3, 3]
+                R_c2w = R_b2w @ self.sg.cam_to_body_R
+                t_c2w = R_b2w @ self.sg.cam_to_body_t + t_b2w
+                self.rr_logger.log({
+                    entity_path: rr.Transform3D(
+                        translation=t_c2w, quaternion=rotmat_to_quat_xyzw(R_c2w)
+                    )
+                })
 
+                # Pinhole은 보통 keyframe당 1회면 충분 (K/해상도 고정일 때)
+                # 단, 위 fingerprint에 K/pose 등이 들어가 있으니 필요하면 매번 다시 찍어도 되지만,
+                # 비용 절감을 위해 "keyframe당 1회" 캐시로 제한
+                if (level, id) not in self._sg_logged_pinhole:
+                    # image 해상도: attrs['image']가 있으면 쓰고, 아니면 path에서 1회 로드
+                    img = attrs.get("image", None)
+                    if img is not None:
+                        height, width = img.shape[:2]
+                    else:
+                        image_path = attrs.get("image_path", data.get("image_path"))
+                        if image_path:
+                            im = cv2.imread(image_path)
+                            if im is None:
+                                continue
+                            height, width = im.shape[:2]
+                        else:
+                            continue
+
+                    self.rr_logger.log({
+                        entity_path: rr.Pinhole(
+                            resolution=[width, height], image_from_camera=self.sg.rgb_K, camera_xyz=rr.ViewCoordinates.RDF,
+                        )
+                    })
+                    self._sg_logged_pinhole.add((level, id))
+
+                # EncodedImage는 image_path 기준으로 1회 로깅 (같은 파일이면 재로깅 불필요)
+                image_path = attrs.get("image_path", data.get("image_path"))
+                if image_path and (image_path not in self._sg_logged_image_path):
+                    self.rr_logger.log({
+                        entity_path: rr.EncodedImage(path=image_path)
+                    })
+                    self._sg_logged_image_path.add(image_path)
 
 
     def update_resource(self, **kwargs):
@@ -2776,7 +2859,7 @@ if __name__ == "__main__":
         action = 'find'
         target_name = "pillow closest to the book on the stool"
         candidate_names, reference_names = ['pillow'], ['book', 'stool']
-    elif SCENE == '2find':
+    elif SCENE in ['2find', '2find_2025-12-27-06-59-58']:
         instruction = "Find a red chair below the halloween poster"
         action = 'find'
         target_name = "red chair below the halloween poster"
@@ -2804,7 +2887,7 @@ if __name__ == "__main__":
         raise TypeError(f"SCENE must be in ['office_1', 'hotel_room_1', 'chinese_room'], but {SCENE} was given.")
 
     # DATA_DIR = f"/ws/external/test_data/{SCENE}"
-    DATA_DIR = f"/ws/data/VLA/demo_20251224/{SCENE}"
+    DATA_DIR = f"/ws/data/demo/20251227/{SCENE}"
     MAP_DIR = os.path.join(DATA_DIR, "offline_map")
     KEYFRAMES_DIR = os.path.join(DATA_DIR, "keyframes")
 
