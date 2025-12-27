@@ -222,7 +222,11 @@ class SceneGraph:
                     continue
 
                 NodeCls = _NODE_LEVEL_TO_CLS[level]
-                node = NodeCls(id=id, **data)
+                try:
+                    node = NodeCls(id=id, **data)
+                except Exception as e:
+                    print(f">>>> Error at SceneGraph.update: {level}, {id}, {data}")
+                    continue
 
                 if level == str(NodeLevel.KEYFRAME) and \
                     (self.image_width is None or self.image_height is None):
@@ -249,26 +253,26 @@ class SceneGraph:
                     continue
 
                 # filter the obj and kf edges
-                s_is_obj = (source[0] == str(NodeLevel.OBJECT))
-                t_is_obj = (target[0] == str(NodeLevel.OBJECT))
-                s_is_kf = (source[0] == str(NodeLevel.KEYFRAME))
-                t_is_kf = (target[0] == str(NodeLevel.KEYFRAME))
+                # s_is_obj = (source[0] == str(NodeLevel.OBJECT))
+                # t_is_obj = (target[0] == str(NodeLevel.OBJECT))
+                # s_is_kf = (source[0] == str(NodeLevel.KEYFRAME))
+                # t_is_kf = (target[0] == str(NodeLevel.KEYFRAME))
 
-                if (s_is_obj and t_is_kf):
-                    if not self._ok_object_keyframe_edge(source, target, min_point_ratio=0.1, min_bbox_area_ratio=0.002):
-                        continue
-                elif (s_is_kf and t_is_obj):
-                    if not self._ok_object_keyframe_edge(target, source, min_point_ratio=0.1, min_bbox_area_ratio=0.002):
-                        continue
+                # if (s_is_obj and t_is_kf):
+                #     if not self._ok_object_keyframe_edge(source, target, min_point_ratio=0.1, min_bbox_area_ratio=0.002):
+                #         continue
+                # elif (s_is_kf and t_is_obj):
+                #     if not self._ok_object_keyframe_edge(target, source, min_point_ratio=0.1, min_bbox_area_ratio=0.002):
+                #         continue
 
                 self.G.add_edge(source, target)
                 self.G.add_edge(target, target)
                 # print(f"Add edge: {source} <-> {target}")
 
-            self.update_projection_links(
-                min_point_ratio=0.1,
-                min_bbox_area_ratio=0.002,
-            )
+            # self.update_projection_links(
+            #     min_point_ratio=0.1,
+            #     min_bbox_area_ratio=0.002,
+            # )
         print(f"=> Graph: {self.G}")
 
     def _projection_stats(self, pts_world: np.ndarray, pose: np.ndarray, image_size):

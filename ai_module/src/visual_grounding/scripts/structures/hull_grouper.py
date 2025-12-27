@@ -324,29 +324,36 @@ class GridGrouper:
         return b
 
     def update_visibility(self, agent_pose, sg=None, max_range=None):
+        print(f"<GridGrouper/update_visibility.1>")
         hulls = self.group_hulls()
+        print(f"<GridGrouper/update_visibility.2>")
         # self._visible_edges_cache.clear()
         fov_rad = sg.fov_x
 
+        print(f"<GridGrouper/update_visibility.3>")
         if len(hulls) > 0 and isinstance(agent_pose, dict):
             position = agent_pose['position']
             orientation = agent_pose['orientation']
             theta = theta_from_agent_pose(orientation)
             agent_pose = np.array([position[0], position[1], theta], dtype=np.float32)
+        print(f"<GridGrouper/update_visibility.4>")
 
         if sg is not None and len(hulls) > 0:
+            print(f"<GridGrouper/update_visibility.5>")
             agent_poses = []
             for (elevel, eid), entity in sg.G.nodes(data=True):
                 if elevel == str(NodeLevel.KEYFRAME):
-                    print(f"{eid}")
+                    # print(f"{eid}")
                     attrs = entity.get("_attrs", {})
                     T = np.asarray(attrs["pose"], dtype=np.float32)
                     x, y = T[0, 3], T[1, 3]
                     theta = np.arctan2(T[1, 0], T[0, 0])
                     agent_poses.append(np.array([x, y, theta], dtype=np.float32))
             agent_poses.append(agent_pose)
+        print(f"<GridGrouper/update_visibility.6>")
 
         for item in hulls:
+            print(f"<GridGrouper/update_visibility.7>")
             gid = item['gid']
             hull = np.asarray(item['hull'], np.float32)
             M = len(hull)
@@ -404,17 +411,23 @@ class GridGrouper:
             item['edge_visible'] = new_edge_visible
             item['edge_segs'] = np.asarray(new_edge_segs, dtype=np.float32)
             item['edge_sigs'] = new_sigs
+            print(f"<GridGrouper/update_visibility.8>")
 
     def group_hulls(self, use_boundary: bool = True):
+        print(f"<GridGrouper/group_hulls.1>")
         if not self._hulls_dirty and self._group_hulls_cache is not None:
+            print(f"<GridGrouper/group_hulls.1.2>")
             return self._group_hulls_cache
 
+        print(f"<GridGrouper/group_hulls.2>")
         # ---- old cache snapshot (for carry-over) ----
         old_cache = self._group_hulls_cache or []
         old_by_gid = {it["gid"]: it for it in old_cache}
+        print(f"<GridGrouper/group_hulls.3>")
 
         res = []
         for gid, eids in enumerate(self.groups()):
+            print(f"<GridGrouper/group_hulls.3.0>")
             cells = set()
             for eid in eids:
                 cells |= self.ent_cells.get(eid, set())
@@ -422,6 +435,7 @@ class GridGrouper:
                 cells = self.boundary_cells(cells)
             hull_xy = self.hull_from_cells(cells)
             M = len(hull_xy)
+            print(f"<GridGrouper/group_hulls.3.1>")
 
             # new signatures
             new_sigs = []
@@ -429,12 +443,14 @@ class GridGrouper:
                 p0 = hull_xy[i]
                 p1 = hull_xy[(i + 1) % M]
                 new_sigs.append(_edge_signature(p0, p1))
+            print(f"<GridGrouper/group_hulls.3.2>")
 
             # ---- default (fresh) ----
             new_edge_visible = np.zeros(M, dtype=bool)
             new_edge_segs = []
 
             # ---- carry over from old if possible ----
+            print(f"<GridGrouper/group_hulls.3.3>")
             old_item = old_by_gid.get(gid)
             if old_item is not None:
                 old_sigs = old_item.get("edge_sigs", [])
@@ -502,6 +518,7 @@ class GridGrouper:
                     if new_edge_visible[i]:
                         p0, p1 = hull_xy[i], hull_xy[(i + 1) % M]
                         new_edge_segs.append([p0, p1])
+            print(f"<GridGrouper/group_hulls.3.4>")
 
             res.append({
                 "gid": gid,
@@ -511,9 +528,12 @@ class GridGrouper:
                 "edge_segs": np.asarray(new_edge_segs, dtype=np.float32) if new_edge_segs else None,
                 "edge_sigs": new_sigs,
             })
+            print(f"<GridGrouper/group_hulls.3.5>")
+        print(f"<GridGrouper/group_hulls.4>")
 
         self._group_hulls_cache = res
         self._hulls_dirty = False
+        print(f"<GridGrouper/group_hulls.5>")
 
         return res
 

@@ -54,7 +54,7 @@ class SceneGraphClients(BaseModel):
     def start(self, candidate_names, reference_names, *args, **kwargs):
         self.sg = SceneGraph(
             candidate_names=candidate_names, reference_names=reference_names,
-            *args, **kwargs
+            logger=self.logger, *args, **kwargs
         )
 
     @staticmethod
@@ -140,8 +140,12 @@ class SceneGraphClients(BaseModel):
                     return
                 self.sg.update(scene_graph, objects)
                 self.logger.logrich(f"Scene Graph: {self.sg}", name="scene_graph")
-            except rospy.ServiceException as e:
-                self.logger.logerr(f"Failed to get and update scene graph: {e}")
+                self.logger.log(f"<update_scene_graph.1> res: {res}")
+            # except rospy.ServiceException as e:
+            #     self.logger.logerr(f"Error occurs: Failed to get and update scene graph: {e}")
+            except Exception as e:
+                self.logger.logerr(f"Error occurs: {e}")
+
         else:
             dir = kwargs.get('dir')
             with open(os.path.join(dir, 'scene_graph.json'), 'r', encoding='utf-8') as f:

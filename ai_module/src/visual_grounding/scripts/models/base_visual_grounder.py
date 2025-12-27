@@ -634,7 +634,10 @@ class BaseVisualGrounder(BaseModel):
         })
 
     def spin_once(self, event, **kwargs):
-        self.log_status()
+        try:
+            self.log_status()
+        except Exception as e:
+            self.logger.logerr(f"<spin_once.1> Error occurs: {e}")
         
         # current_main_state = ""
         # current_main_state += f"Status: {self.status} | "
@@ -653,20 +656,22 @@ class BaseVisualGrounder(BaseModel):
             f"#inferQ: {n_infer:>4d} | "
             f"Answer: {ans:<10}"
         )
+        try:
+            self.rr_log(current_main_state, panel=['main', 'summary/status'])
+            if self.status == Status.STANDBY:
+                self.log_status()
+                self.standby()
+                self.current_agent_message = f"Let's {self.action} {self.target_name}"
+            if self.status == Status.PROCESSING:
+                self.log_status()
+                # self.logger.logrich(f"Status: {self.status} | #inference_queue={len(self.inference_queue.queue)}", name='status')
+                self.process(**kwargs)
 
-        self.rr_log(current_main_state, panel=['main', 'summary/status'])
-        if self.status == Status.STANDBY:
-            self.log_status()
-            self.standby()
-            self.current_agent_message = f"Let's {self.action} {self.target_name}"
-        if self.status == Status.PROCESSING:
-            self.log_status()
-            # self.logger.logrich(f"Status: {self.status} | #inference_queue={len(self.inference_queue.queue)}", name='status')
-            self.process(**kwargs)
-
-        if self.status == Status.COMPLETED:
-            self.log_status()
-            self.answer_the_question(self.answer_result)
+            if self.status == Status.COMPLETED:
+                self.log_status()
+                self.answer_the_question(self.answer_result)
+        except Exception as e:
+            self.logger.logerr(f"<spin_once.2> Error occurs: {e}")
 
     def standby(self, **kwargs):
         self.scene_graph_clients.start(
@@ -708,7 +713,9 @@ class BaseVisualGrounder(BaseModel):
                 centers = np.array([attrs['centroid']], dtype=np.float32) # (1, 3)
                 half_sizes = np.array([attrs['extent']], dtype=np.float32) * 0.5
                 quaternions = rotmat_to_quat_xyzw(np.array(attrs['R'])).reshape(1, 4)
-                colors = self.rr_logger.palette[int(str(id).split('_')[-1])]
+                palette = self.rr_logger.palette
+                palette_idx = int(str(id).split('_')[-1]) % len(palette)
+                colors = palette[palette_idx]
 
                 self.rr_logger.log({
                     entity_path: rr.Boxes3D(
@@ -716,139 +723,145 @@ class BaseVisualGrounder(BaseModel):
                         colors=colors, labels=f"{attrs['name']}({id})"
                     ),
                 })
-            elif level == str(NodeLevel.KEYFRAME):
-                pose = np.array(attrs['pose'], dtype=np.float32)
-                R_b2w, t_b2w = pose[:3, :3], pose[:3, 3]
-                R_c2w = R_b2w @ self.sg.cam_to_body_R
-                t_c2w = R_b2w @ self.sg.cam_to_body_t + t_b2w
-                self.rr_logger.log({
-                    entity_path: rr.Transform3D(
-                        translation=t_c2w, quaternion=rotmat_to_quat_xyzw(R_c2w)
-                    )
-                })
-                height, width, _ = attrs['image'].shape
-                self.rr_logger.log({
-                    entity_path: rr.Pinhole(
-                        resolution=[width, height], image_from_camera=self.sg.rgb_K, camera_xyz=rr.ViewCoordinates.RDF,
-                    )
-                })
-                self.rr_logger.log({
-                    entity_path: rr.EncodedImage(path=attrs['image_path'])
-                })
+            # elif level == str(NodeLevel.KEYFRAME):
+            #     pose = np.array(attrs['pose'], dtype=np.float32)
+            #     R_b2w, t_b2w = pose[:3, :3], pose[:3, 3]
+            #     R_c2w = R_b2w @ self.sg.cam_to_body_R
+            #     t_c2w = R_b2w @ self.sg.cam_to_body_t + t_b2w
+            #     self.rr_logger.log({
+            #         entity_path: rr.Transform3D(
+            #             translation=t_c2w, quaternion=rotmat_to_quat_xyzw(R_c2w)
+            #         )
+            #     })
+            #     height, width, _ = attrs['image'].shape
+            #     self.rr_logger.log({
+            #         entity_path: rr.Pinhole(
+            #             resolution=[width, height], image_from_camera=self.sg.rgb_K, camera_xyz=rr.ViewCoordinates.RDF,
+            #         )
+            #     })
+            #     self.rr_logger.log({
+            #         entity_path: rr.EncodedImage(path=attrs['image_path'])
+            #     })
 
 
 
     def update_resource(self, **kwargs):
-        self.objects_prev = self.objects_curr
-
-        self.scene_graph_clients.update_scene_graph(**kwargs)
-        self.log_sg(self.sg.G)
-
-        self.objects_curr = [id for (level, id), e in self.sg.G.nodes(data=True) if level == str(NodeLevel.OBJECT)]
-        new_objects = list(set(self.objects_curr) - set(self.objects_prev))
-        if len(new_objects) > 0:
-            self.current_agent_message = f"New object({', '.join([str(_id) for _id in new_objects])})!"
-
+        # Default styles so they are available even if early steps fail
         styles = {
             # 'reference': {'show': True, 'color': 'blue'},
             'candidate': {'show': True, 'color': 'green'},
         }
+        try:
+            self.objects_prev = self.objects_curr
 
-        with self.sg_lock:
-            success_path, failed_path = [], []
-            visualizer = Visualizer()
-            for etype in self.etypes:
-                for (level, id), kf in self.sg.G.nodes(data=True):
-                    if level == str(NodeLevel.KEYFRAME):
-                        attrs = kf.get('_attrs', {})
+            self.scene_graph_clients.update_scene_graph(**kwargs)
+            self.log_sg(self.sg.G)
 
-                        image = attrs['image'].copy()
-                        fname = attrs['fname']
-                        detections = attrs['detections']
-                        if etype == 'detection':
-                            for det in detections:
-                                is_object = det['id'] > 0
-                                if not is_object:
-                                    continue
+            self.objects_curr = [id for (level, id), e in self.sg.G.nodes(data=True) if level == str(NodeLevel.OBJECT)]
+            new_objects = list(set(self.objects_curr) - set(self.objects_prev))
+            if len(new_objects) > 0:
+                self.current_agent_message = f"New object({', '.join([str(_id) for _id in new_objects])})!"
+        except Exception as e:
+            self.logger.logerr(f"<update_resource.1> Error occurs: {e}")
 
-                                is_candidate = (det['name'] in self.sg.candidate_names)
-                                is_reference = (det['name'] in self.sg.reference_names)
-                                if is_candidate:
-                                    style = styles.get('candidate', {'show': False})
-                                    if not style['show']:
+        try:
+            with self.sg_lock:
+                success_path, failed_path = [], []
+                visualizer = Visualizer()
+                for etype in self.etypes:
+                    for (level, id), kf in self.sg.G.nodes(data=True):
+                        if level == str(NodeLevel.KEYFRAME):
+                            attrs = kf.get('_attrs', {})
+
+                            image = attrs['image'].copy()
+                            fname = attrs['fname']
+                            detections = attrs['detections']
+                            if etype == 'detection':
+                                for det in detections:
+                                    is_object = det['id'] > 0
+                                    if not is_object:
                                         continue
-                                    color = style.get('color', 'green')
-                                elif is_reference:
-                                    style = styles.get('reference', {'show': False})
-                                    if not style['show']:
-                                        continue
-                                    color = style.get('color', 'blue')
-                                else:
-                                    continue
 
-                                bbox = det['bbox']
-                                color = visualizer._parse_color(color)
-                                u_min, v_min, u_max, v_max = bbox
-                                u_min, v_min, u_max, v_max = int(u_min), int(v_min), int(u_max), int(v_max)
-                                top_left, bottom_right = (u_min, v_min), (u_max, v_max)
-
-                                cv2.rectangle(image, top_left, bottom_right, color=color, thickness=2)
-                                cv2.putText(
-                                    image, f"{det['id']}", (u_min, v_min - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
-                                )
-                        elif etype == 'object':
-                            eids = self.sg.pid2eids.get(id, [])
-                            for (elevel, eid), entity in self.sg.G.nodes(data=True):
-                                if elevel == str(NodeLevel.OBJECT):
-                                    if eid in eids:
-                                        bbox = self.sg.project_entity_bbox(entity, kf)
-                                        e_attrs = entity.get("_attrs", {})
-
-                                        is_candidate = (e_attrs['name'] in self.sg.candidate_names)
-                                        is_reference = (e_attrs['name'] in self.sg.reference_names)
-
-                                        if is_candidate:
-                                            style = styles.get('candidate', {'show': False})
-                                            if not style['show']:
-                                                continue
-                                            color = style.get('color', 'green')
-                                        elif is_reference:
-                                            style = styles.get('reference', {'show': False})
-                                            if not style['show']:
-                                                continue
-                                            color = style.get('color', 'blue')
-                                        else:
+                                    is_candidate = (det['name'] in self.sg.candidate_names)
+                                    is_reference = (det['name'] in self.sg.reference_names)
+                                    if is_candidate:
+                                        style = styles.get('candidate', {'show': False})
+                                        if not style['show']:
                                             continue
+                                        color = style.get('color', 'green')
+                                    elif is_reference:
+                                        style = styles.get('reference', {'show': False})
+                                        if not style['show']:
+                                            continue
+                                        color = style.get('color', 'blue')
+                                    else:
+                                        continue
 
-                                        color = visualizer._parse_color(color)
-                                        u_min, v_min, u_max, v_max = bbox
-                                        u_min, v_min, u_max, v_max = int(u_min), int(v_min), int(u_max), int(v_max)
-                                        top_left, bottom_right = (u_min, v_min), (u_max, v_max)
+                                    bbox = det['bbox']
+                                    color = visualizer._parse_color(color)
+                                    u_min, v_min, u_max, v_max = bbox
+                                    u_min, v_min, u_max, v_max = int(u_min), int(v_min), int(u_max), int(v_max)
+                                    top_left, bottom_right = (u_min, v_min), (u_max, v_max)
 
-                                        cv2.rectangle(image, top_left, bottom_right, color=color, thickness=2)
-                                        cv2.putText(
-                                            image, f"{eid}", (u_min, v_min - 10),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
-                                        )
-                        else:
-                            raise NotImplementedError("No implementation for other etypes")
-                        save_path = self.sg.save_path(etype, fname)
-                        success = cv2.imwrite(save_path, image)
-                        self.rr_logger.log({f"SG/nodes/NodeLevel.KEYFRAME/{id}": rr.Image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))})
-                        if success:
-                            success_path.append(save_path)
-                        else:
-                            failed_path.append(save_path)
-                if len(success_path) > 0:
-                    txt = '- \n'.join(success_path)
-                    self.rr_logger.log({
-                        'VG/log': f"Saved images: {txt}"})
-                if len(failed_path) > 0:
-                    txt = '- \n'.join(failed_path)
-                    self.rr_logger.log({
-                        'VG/log': f"Failed to save images: {txt}"}, level='warn')
+                                    cv2.rectangle(image, top_left, bottom_right, color=color, thickness=2)
+                                    cv2.putText(
+                                        image, f"{det['id']}", (u_min, v_min - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+                                    )
+                            elif etype == 'object':
+                                eids = self.sg.pid2eids.get(id, [])
+                                for (elevel, eid), entity in self.sg.G.nodes(data=True):
+                                    if elevel == str(NodeLevel.OBJECT):
+                                        if eid in eids:
+                                            bbox = self.sg.project_entity_bbox(entity, kf)
+                                            e_attrs = entity.get("_attrs", {})
 
+                                            is_candidate = (e_attrs['name'] in self.sg.candidate_names)
+                                            is_reference = (e_attrs['name'] in self.sg.reference_names)
+
+                                            if is_candidate:
+                                                style = styles.get('candidate', {'show': False})
+                                                if not style['show']:
+                                                    continue
+                                                color = style.get('color', 'green')
+                                            elif is_reference:
+                                                style = styles.get('reference', {'show': False})
+                                                if not style['show']:
+                                                    continue
+                                                color = style.get('color', 'blue')
+                                            else:
+                                                continue
+
+                                            color = visualizer._parse_color(color)
+                                            u_min, v_min, u_max, v_max = bbox
+                                            u_min, v_min, u_max, v_max = int(u_min), int(v_min), int(u_max), int(v_max)
+                                            top_left, bottom_right = (u_min, v_min), (u_max, v_max)
+
+                                            cv2.rectangle(image, top_left, bottom_right, color=color, thickness=2)
+                                            cv2.putText(
+                                                image, f"{eid}", (u_min, v_min - 10),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+                                            )
+                            else:
+                                raise NotImplementedError("No implementation for other etypes")
+                            save_path = self.sg.save_path(etype, fname)
+                            success = cv2.imwrite(save_path, image)
+                            self.rr_logger.log({f"SG/nodes/NodeLevel.KEYFRAME/{id}": rr.Image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))})
+                            if success:
+                                success_path.append(save_path)
+                            else:
+                                failed_path.append(save_path)
+                    if len(success_path) > 0:
+                        txt = '- \n'.join(success_path)
+                        self.rr_logger.log({
+                            'VG/log': f"Saved images: {txt}"})
+                    if len(failed_path) > 0:
+                        txt = '- \n'.join(failed_path)
+                        self.rr_logger.log({
+                            'VG/log': f"Failed to save images: {txt}"}, level='warn')
+        except Exception as e:
+            self.logger.logerr(f"<update_resource.1> Error occurs: {e}")
+        
         self.updated_resource = True
 
     def select_keyframes(
@@ -1619,17 +1632,25 @@ class BaseVisualGrounder(BaseModel):
             keyframes = input_data['keyframes']
 
             candidate_eids_in_kfs = [] # TODO: Need to check
+            self.log(f"<query_worker.0> 1")
             pid2eids = self.sg.pid2eids
+            self.log(f"<query_worker.0> 2")
             for kf in keyframes:
                 pid = kf['id'][1]
+                self.log(f"<query_worker.0> 3")
                 if pid is not None:
-                    eids = pid2eids[pid]
+                    eids = pid2eids.get(pid, None)
+                    if eids is None:
+                        self.log(f"<query_worker.0> 4.1")
+                        continue
+                    self.log(f"<query_worker.0> 4.2")
                     filtered_eids = [
                         eid for (level, eid), entity in self.sg.G.nodes(data=True)
                         if (level == str(NodeLevel.OBJECT))
                            and (eid in eids)
                            and (entity.get("_attrs", {})['name'] in self.sg.candidate_names)
                     ]
+                    self.log(f"<query_worker.0> 5")
                     candidate_eids_in_kfs += filtered_eids
 
             options = input_data.get('options', self.default_options)
@@ -1637,6 +1658,7 @@ class BaseVisualGrounder(BaseModel):
 
             # Prepare the prompt and system instruction
             prompt = self.prompt_renderer.render(**options['prompt'], anno_ids=candidate_eids_in_kfs)
+            self.log(f"<query_worker.0> 6")
             system_instruction = self.system_instruction_renderer.render(**options['prompt'])
             images, image_paths = self.get_images(keyframes, **options['image']) # TODO: FIX
             self.log(f"<query_worker.1> Prepare the input data")
@@ -1954,70 +1976,83 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.active_clients.end()
 
     def log_agent(self, agent_pose):
-        theta = theta_from_agent_pose(agent_pose['orientation'])
-        pos = agent_pose['position']
-        dir_vec = np.array([[np.cos(theta), np.sin(theta), 0.0]], dtype=np.float32)
-        self.rr_logger.log({
-            "SG/agent": rr.Arrows3D(origins=pos, vectors=dir_vec * self.agent_arrow_len,
-                                    colors=[0, 0, 255], radii=0.1)
-        })
-        balloon_pos = pos + 0.3 * dir_vec * self.agent_arrow_len + np.array([[0.0, 0.0, 0.3]])
-        self.rr_logger.log({f'SG/message': rr.Points3D(
-            positions=balloon_pos, labels=[self.current_agent_message], radii=0.001, colors=[255, 255, 255])})
+        try:
+            theta = theta_from_agent_pose(agent_pose['orientation'])
+            pos = agent_pose['position']
+            dir_vec = np.array([[np.cos(theta), np.sin(theta), 0.0]], dtype=np.float32)
+            if hasattr(self, 'agent_arrow_len'):
+                if self.agent_arrow_len is not None:
+                    self.rr_logger.log({
+                        "SG/agent": rr.Arrows3D(origins=pos, vectors=dir_vec * self.agent_arrow_len,
+                                                colors=[0, 0, 255], radii=0.1)
+                    })
+                    balloon_pos = pos + 0.3 * dir_vec * self.agent_arrow_len + np.array([[0.0, 0.0, 0.3]])
+                    self.rr_logger.log({f'SG/message': rr.Points3D(
+                        positions=balloon_pos, labels=[self.current_agent_message], radii=0.001, colors=[255, 255, 255])})
+        except Exception as e:
+            self.logger.logerr(f"<log_agent.1> Error occurs: {e}")
         # arrow_tip = pos + 0.3 * dir_vec * self.agent_arrow_len + np.array([[0.0, 0.0, 0.1]])
         # tail = np.concatenate([arrow_tip, balloon_pos], axis=0).astype(np.float32)  # (2,3)
         # self.rr_logger.log({'SG/message_tail': rr.LineStrips3D(tail, colors=[49, 56, 59], radii=0.01)})
 
 # CALLBACKS
     def _odom_callback(self, msg):
-        self.log("_odom_callback")
-        self.agent_pose = agent_pose = {
-            "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
-            "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
-        }
-        self.log_agent(agent_pose)
+        try:
+            self.log("_odom_callback")
+            self.agent_pose = agent_pose = {
+                "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
+                "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
+            }
+            self.log_agent(agent_pose)
 
-        self.path_xy = path_xy = np.concatenate([self.path_xy, [agent_pose['position'][:2]]], axis=0)
-        if len(path_xy) > 1 and getattr(self, 'sg'):
-            if hasattr(self.sg, 'z_const'):
-                v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2,
-                                               rgb_u8=[0, 255, 255])
-                if (v0 is not None) and (t0 is not None):
-                    self.rr_logger.log(
-                        {'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
-                v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
-                if (v1 is not None) and (t1 is not None):
-                    self.rr_logger.log(
-                        {'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
+            if hasattr(self, 'path_xy'):
+                self.path_xy = path_xy = np.concatenate([self.path_xy, [agent_pose['position'][:2]]], axis=0)
+                if len(path_xy) > 1 and getattr(self, 'sg'):
+                    if hasattr(self.sg, 'z_const'):
+                        v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2,
+                                                    rgb_u8=[0, 255, 255])
+                        if (v0 is not None) and (t0 is not None):
+                            self.rr_logger.log(
+                                {'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
+                        v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
+                        if (v1 is not None) and (t1 is not None):
+                            self.rr_logger.log(
+                                {'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
 
-        if self.debug:  # TODO: debug: Save the path_xy
-            _ = save_path_xy(agent_pose['position'], base_dir=self.offline_map_dir, name="position")
-            _ = save_path_xy(agent_pose['orientation'], base_dir=self.offline_map_dir, name="orientation")
+            if self.debug:  # TODO: debug: Save the path_xy
+                _ = save_path_xy(agent_pose['position'], base_dir=self.offline_map_dir, name="position")
+                _ = save_path_xy(agent_pose['orientation'], base_dir=self.offline_map_dir, name="orientation")
+        except Exception as e:
+            self.logger.logerr(f"<_odom_callback.1> Error occurs: {e}")
 
     def _odom_callback2(self, msg):
-        self.log("_odom_callback2")
-        self.agent_pose = agent_pose = {
-            "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
-            "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
-        }
-        self.log_agent(agent_pose)
+        try:
+            self.log("_odom_callback2")
+            self.agent_pose = agent_pose = {
+                "position": np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]),
+                "orientation": np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]),
+            }
+            self.log_agent(agent_pose)
 
-        self.path_xy = path_xy = np.concatenate([self.path_xy, [agent_pose['position'][:2]]], axis=0)
-        if len(path_xy) > 1 and getattr(self, 'sg'):
-            if hasattr(self.sg, 'z_const'):
-                v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2,
-                                               rgb_u8=[0, 255, 255])
-                if (v0 is not None) and (t0 is not None):
-                    self.rr_logger.log(
-                        {'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
-                v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
-                if (v1 is not None) and (t1 is not None):
-                    self.rr_logger.log(
-                        {'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
+            if hasattr(self, 'path_xy'):
+                self.path_xy = path_xy = np.concatenate([self.path_xy, [agent_pose['position'][:2]]], axis=0)
+                if len(path_xy) > 1 and getattr(self, 'sg'):
+                    if hasattr(self.sg, 'z_const'):
+                        v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2,
+                                                    rgb_u8=[0, 255, 255])
+                        if (v0 is not None) and (t0 is not None):
+                            self.rr_logger.log(
+                                {'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
+                        v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
+                        if (v1 is not None) and (t1 is not None):
+                            self.rr_logger.log(
+                                {'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
 
-        if self.debug:  # TODO: debug: Save the path_xy
-            _ = save_path_xy(agent_pose['position'], base_dir=self.offline_map_dir, name="position")
-            _ = save_path_xy(agent_pose['orientation'], base_dir=self.offline_map_dir, name="orientation")
+            if self.debug:  # TODO: debug: Save the path_xy
+                _ = save_path_xy(agent_pose['position'], base_dir=self.offline_map_dir, name="position")
+                _ = save_path_xy(agent_pose['orientation'], base_dir=self.offline_map_dir, name="orientation")
+        except Exception as e:
+            self.logger.logerr(f"<_odom_callback.1> Error occurs: {e}")
 
     def _traversable_area_callback(self, msg) -> None:
         if self.traversable_points is None:
@@ -2102,9 +2137,12 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
 # MAIN LOOP
     def process(self, **kwargs):
-        self.log(f"<process.0> Start")
-        self.update_resource(**kwargs)
-        if 'dir' in kwargs:
+        try:
+            self.log(f"<process.0> Start")
+            self.update_resource(**kwargs)
+        except Exception as e:
+            self.logger.logerr(f"<process.0> Error occurs: {e}")
+        if False: #  'dir' in kwargs:
             def load_latest_data(dir_path: str, name: str='agent_pose_'):
                 pose_files = [
                     os.path.join(dir_path, f)
@@ -2302,20 +2340,28 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             self.rr_log(f"<update_path_points.1> Error occurs: {e}", panel='nav', level='error')
 
         try:
+            self.log(f"<update_path_points.2> 1")
             group_hulls_bef = None
             if self.hull_grouper is None:
                 self.hull_grouper = GridGrouper(threshold=self.group_threshold).fit(related_objects) # threshold 높을수록 넓은 범위까지 group으로 인정
+                self.log(f"<update_path_points.2> 1.1")
             else:
                 group_hulls_bef = self.hull_grouper.group_hulls()
+                self.log(f"<update_path_points.2> 1.2.1")
                 self.hull_grouper.update(related_objects)
+                self.log(f"<update_path_points.2> 1.2.2")
+            self.log(f"<update_path_points.2> 2")
 
             self.hull_grouper.update_visibility(self.agent_pose, sg=self.sg, max_range=8.0)
+            self.log(f"<update_path_points.2> 3")
 
             now = rospy.Time.now()
             updated_time_diff = now - self.last_update_time_path_points
             group_hulls = self.hull_grouper.group_hulls()
+            self.log(f"<update_path_points.2> 4")
 
             is_equal_group_hulls = is_equal(group_hulls_bef, group_hulls)
+            self.log(f"<update_path_points.2> 5")
             if is_equal_group_hulls and (updated_time_diff < self.update_interval_path_points):
                 self.log(f"<update_path_points.2> No update group_hulls: #GIDs={len(group_hulls)}")
                 self.rr_log(f"<update_path_points.2> No update group_hulls: #GIDs={len(group_hulls)}", panel='nav')
@@ -2548,6 +2594,10 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         try:
             if len(current_path_points) == 0:
                 current_eids = set(self.hull_grouper.dsu.idx.keys()) & set(self.sg.get_candidate_entities())
+                self.logger.loginfo(f"<navigate.4.0> current_eids: {current_eids}")
+                self.logger.loginfo(f"  >> current_gid: {current_gid}")
+                self.logger.loginfo(f"  >> self.hull_grouper.dsu.idx.keys(): {self.hull_grouper.dsu.idx.keys()}")
+                self.logger.loginfo(f"  >> self.sg.get_candidate_entities(): {self.sg.get_candidate_entities()}")
                 if self.action == 'find':
                     unprocessed_eids = [eid for eid in current_eids
                                         if self.agg_results.results_by_entity.num_queries.get(eid, 0) <= 0]
