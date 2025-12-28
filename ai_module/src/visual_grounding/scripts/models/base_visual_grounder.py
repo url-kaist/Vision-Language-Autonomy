@@ -746,16 +746,16 @@ class BaseVisualGrounder(BaseModel):
                     "extent": _as_list(attrs.get("extent")),
                     "R": _as_list(attrs.get("R")),
                 }
-            elif level == str(NodeLevel.KEYFRAME):
-                # pose/path만으로도 업데이트 감지 가능
-                fp_payload = {
-                    "level": level,
-                    "id": id,
-                    "pose": _as_list(attrs.get("pose")),
-                    "image_path": attrs.get("image_path", data.get("image_path")),
-                    # K가 바뀌는 경우가 있으면 포함(대부분 고정이라 불필요하지만 안전하게)
-                    "K": _as_list(getattr(self.sg, "rgb_K", None)),
-                }
+            # elif level == str(NodeLevel.KEYFRAME):
+            #     # pose/path만으로도 업데이트 감지 가능
+            #     fp_payload = {
+            #         "level": level,
+            #         "id": id,
+            #         "pose": _as_list(attrs.get("pose")),
+            #         "image_path": attrs.get("image_path", data.get("image_path")),
+            #         # K가 바뀌는 경우가 있으면 포함(대부분 고정이라 불필요하지만 안전하게)
+            #         "K": _as_list(getattr(self.sg, "rgb_K", None)),
+            #     }
             else:
                 continue
 
@@ -782,50 +782,50 @@ class BaseVisualGrounder(BaseModel):
                         colors=colors, labels=f"{attrs['name']}({id})"
                     ),
                 })
-            elif level == str(NodeLevel.KEYFRAME):
-                # Transform은 pose가 바뀌면 갱신되어야 함
-                pose = np.array(attrs['pose'], dtype=np.float32)
-                R_b2w, t_b2w = pose[:3, :3], pose[:3, 3]
-                R_c2w = R_b2w @ self.sg.cam_to_body_R
-                t_c2w = R_b2w @ self.sg.cam_to_body_t + t_b2w
-                self.rr_logger.log({
-                    entity_path: rr.Transform3D(
-                        translation=t_c2w, quaternion=rotmat_to_quat_xyzw(R_c2w)
-                    )
-                })
+            # elif level == str(NodeLevel.KEYFRAME):
+            #     # Transform은 pose가 바뀌면 갱신되어야 함
+            #     pose = np.array(attrs['pose'], dtype=np.float32)
+            #     R_b2w, t_b2w = pose[:3, :3], pose[:3, 3]
+            #     R_c2w = R_b2w @ self.sg.cam_to_body_R
+            #     t_c2w = R_b2w @ self.sg.cam_to_body_t + t_b2w
+            #     self.rr_logger.log({
+            #         entity_path: rr.Transform3D(
+            #             translation=t_c2w, quaternion=rotmat_to_quat_xyzw(R_c2w)
+            #         )
+            #     })
 
-                # Pinhole은 보통 keyframe당 1회면 충분 (K/해상도 고정일 때)
-                # 단, 위 fingerprint에 K/pose 등이 들어가 있으니 필요하면 매번 다시 찍어도 되지만,
-                # 비용 절감을 위해 "keyframe당 1회" 캐시로 제한
-                if (level, id) not in self._sg_logged_pinhole:
-                    # image 해상도: attrs['image']가 있으면 쓰고, 아니면 path에서 1회 로드
-                    img = attrs.get("image", None)
-                    if img is not None:
-                        height, width = img.shape[:2]
-                    else:
-                        image_path = attrs.get("image_path", data.get("image_path"))
-                        if image_path:
-                            im = cv2.imread(image_path)
-                            if im is None:
-                                continue
-                            height, width = im.shape[:2]
-                        else:
-                            continue
+            #     # Pinhole은 보통 keyframe당 1회면 충분 (K/해상도 고정일 때)
+            #     # 단, 위 fingerprint에 K/pose 등이 들어가 있으니 필요하면 매번 다시 찍어도 되지만,
+            #     # 비용 절감을 위해 "keyframe당 1회" 캐시로 제한
+            #     if (level, id) not in self._sg_logged_pinhole:
+            #         # image 해상도: attrs['image']가 있으면 쓰고, 아니면 path에서 1회 로드
+            #         img = attrs.get("image", None)
+            #         if img is not None:
+            #             height, width = img.shape[:2]
+            #         else:
+            #             image_path = attrs.get("image_path", data.get("image_path"))
+            #             if image_path:
+            #                 im = cv2.imread(image_path)
+            #                 if im is None:
+            #                     continue
+            #                 height, width = im.shape[:2]
+            #             else:
+            #                 continue
 
-                    self.rr_logger.log({
-                        entity_path: rr.Pinhole(
-                            resolution=[width, height], image_from_camera=self.sg.rgb_K, camera_xyz=rr.ViewCoordinates.RDF,
-                        )
-                    })
-                    self._sg_logged_pinhole.add((level, id))
+            #         self.rr_logger.log({
+            #             entity_path: rr.Pinhole(
+            #                 resolution=[width, height], image_from_camera=self.sg.rgb_K, camera_xyz=rr.ViewCoordinates.RDF,
+            #             )
+            #         })
+            #         self._sg_logged_pinhole.add((level, id))
 
-                # EncodedImage는 image_path 기준으로 1회 로깅 (같은 파일이면 재로깅 불필요)
-                image_path = attrs.get("image_path", data.get("image_path"))
-                if image_path and (image_path not in self._sg_logged_image_path):
-                    self.rr_logger.log({
-                        entity_path: rr.EncodedImage(path=image_path)
-                    })
-                    self._sg_logged_image_path.add(image_path)
+            #     # EncodedImage는 image_path 기준으로 1회 로깅 (같은 파일이면 재로깅 불필요)
+            #     image_path = attrs.get("image_path", data.get("image_path"))
+            #     if image_path and (image_path not in self._sg_logged_image_path):
+            #         self.rr_logger.log({
+            #             entity_path: rr.EncodedImage(path=image_path)
+            #         })
+            #         self._sg_logged_image_path.add(image_path)
 
 
     def update_resource(self, **kwargs):
@@ -2484,19 +2484,24 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 # Visualize edges (OBJECT <-> GROUP)
                 member_eids = group['members']
                 members = [self.sg.G.nodes[('NodeLevel.OBJECT', eid)] for eid in member_eids]
-                members_centroids = [np.array(mem.get("_attrs", {})['centroid']) for mem in members]
+                members_centroids = []
+                for mem in members:
+                    centroid = np.array(mem.get("_attrs", {}).get('centroid', None))
+                    if centroid is not None:
+                        members_centroids.append(centroid)
                 members_centroids = np.stack(members_centroids, axis=0)
-                group_xyz = np.mean(members_centroids, axis=0)
-                group_xyz[2] = 3.0
-                self.rr_logger.log({f"SG/nodes/NodeLevel.GROUP/{gid}": rr.Points3D(group_xyz, colors=[155, 155, 130], radii=0.15, labels=gid)})
+                if len(members_centroids) > 0:
+                    group_xyz = np.mean(members_centroids, axis=0)
+                    group_xyz[2] = 3.0
+                    self.rr_logger.log({f"SG/nodes/NodeLevel.GROUP/{gid}": rr.Points3D(group_xyz, colors=[155, 155, 130], radii=0.15, labels=gid)})
 
-                for eid in group['members']:
-                    mem = self.sg.G.nodes[('NodeLevel.OBJECT', eid)]
-                    mem_xyz = np.array(mem.get("_attrs", {})['centroid'])
-                    seg = np.stack([mem_xyz, group_xyz], axis=0)  # shape (2,3)
-                    self.rr_logger.log({
-                        f"SG/edges/GROUP{gid}/OBJECT{eid}": rr.LineStrips3D(seg, colors=[[155, 155, 130]], radii=0.02)
-                    })
+                    for eid in group['members']:
+                        mem = self.sg.G.nodes[('NodeLevel.OBJECT', eid)]
+                        mem_xyz = np.array(mem.get("_attrs", {})['centroid'])
+                        seg = np.stack([mem_xyz, group_xyz], axis=0)  # shape (2,3)
+                        self.rr_logger.log({
+                            f"SG/edges/GROUP{gid}/OBJECT{eid}": rr.LineStrips3D(seg, colors=[[155, 155, 130]], radii=0.02)
+                        })
 
                 # Compute active_waypoints
                 nearest_points = find_closest_point(hull_xy, self.traversable_points)
