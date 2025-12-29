@@ -151,7 +151,15 @@ class RRLogger:
         prefix_sg = "SG"
         log_root = "VG/"
         blueprint = rrb.Blueprint(
-            rrb.Vertical(
+            rrb.Horizontal(
+                # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
+                rrb.Spatial3DView(
+                    name="SceneGraph 3D",
+                    origin="/",
+                    contents=["SG/**"],
+                ),
+
+                # (2) 우측 패널: 2D 이미지 + 선택 패널
                 rrb.Vertical(
                     rrb.TextDocumentView(
                         name="Instruction",
@@ -160,30 +168,19 @@ class RRLogger:
                     ),
 
                     rrb.TextDocumentView(
-                        name="Answer",
+                        name="Agent Message",
                         origin="/",
                         contents=["answer/**"],
                     ),
-
-                    rrb.Horizontal(
-                        # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
-                        rrb.Spatial3DView(
-                            name="SceneGraph 3D",
-                            origin="/",
-                            contents=["SG/**"],
-                        ),
-
-                        # (2) 우측 패널: 2D 이미지 + 선택 패널
-                        rrb.Vertical(
-                            rrb.Spatial2DView(
-                                name="Observation",
-                                origin="/",
-                                contents=["obs/**"],
-                            ),
-                        ),
+                    rrb.Spatial2DView(
+                        name="Observation",
+                        origin="/",
+                        contents=["obs/**"],
                     ),
+
                 ),
             ),
+
             rrb.Vertical(
                 rrb.Horizontal(
                     # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
@@ -291,3 +288,98 @@ class RRLogger:
 
 if __name__ == "__main__":
     rr_logger = RRLogger(name="rerun_example")
+    
+
+    def fix_pcd_file(input_path, output_path):
+        with open(input_path, "r") as f:
+            lines = f.readlines()
+
+        header_end_idx = 0
+        new_header = []
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line: continue
+            
+            # Fix the "WIDTH 2049HEIGHT 1" and "POINTS 2049DATA" formatting bugs
+            if "WIDTH" in line and "HEIGHT" in line:
+                parts = line.replace("HEIGHT", " HEIGHT").split()
+                new_header.extend([f"WIDTH {parts[1]}", f"HEIGHT {parts[3]}"])
+            elif "POINTS" in line and "DATA" in line:
+                parts = line.replace("DATA", " DATA").split()
+                new_header.extend([f"POINTS {parts[1]}", f"DATA {parts[3]}"])
+                header_end_idx = i + 1
+                break
+            
+            # Fix the COUNT mismatch: Change orientation_xyzw COUNT from 4 to 1 
+            # to match the single 'nan' or value present in your data rows.
+            elif line.startswith("COUNT"):
+                counts = line.split()
+                # In your file, orientation_xyzw is the 16th field (index 15)
+                # We set it to 1 so the parser expects 1 value, not 4.
+                new_counts = ["1"] * (len(counts) - 1)
+                new_header.append("COUNT " + " ".join(new_counts))
+            else:
+                new_header.append(line)
+
+        # Extract data rows
+        data_rows = lines[header_end_idx:]
+        
+        # Write the corrected file
+        with open(output_path, "w") as f:
+            for h_line in new_header:
+                f.write(h_line + "\n")
+            for d_line in data_rows:
+                # Ensure each line is cleaned of extra whitespace
+                clean_d = " ".join(d_line.split())
+                if clean_d:
+                    f.write(clean_d + "\n")
+
+    traversable_path = "/ws/data/VLA/E3_3225_TRIP_wall_final.pcd"
+    output_pcd = "/ws/data/VLA/E3_3225_TRIP_wall_final_v2.pcd"
+    fix_pcd_file(traversable_path, output_pcd)
+    # path = traversable_path
+
+    # fields = None
+    # counts = None
+    # data_start = None
+
+    # with open(path, "r") as f:
+    #     lines = f.readlines()
+
+    # for i, line in enumerate(lines):
+    #     print(line)
+    #     s = line.strip()
+    #     if s.startswith("FIELDS"):
+    #         fields = s.split()[1:]
+    #     elif s.startswith("COUNT"):
+    #         counts = list(map(int, s.split()[1:]))
+    #     elif s.startswith("DATA"):
+    #         # DATA ascii
+    #         data_start = i + 1
+    #         break
+
+    # if fields is None or counts is None or data_start is None:
+    #     raise ValueError("PCD header parse failed (FIELDS/COUNT/DATA not found).")
+
+    # # Expand multi-count fields into per-component names
+    # col_names = []
+    # for name, c in zip(fields, counts):
+    #     if c == 1:
+    #         col_names.append(name)
+    #     else:
+    #         # orientation_xyzw 같은 경우 4개로 확장
+    #         # 관례적으로 _0.. 혹은 x/y/z/w로 쪼갬
+    #         if name.endswith("xyzw") and c == 4:
+    #             base = name.replace("xyzw", "")
+    #             col_names += [base + "x", base + "y", base + "z", base + "w"]
+    #         else:
+    #             col_names += [f"{name}_{k}" for k in range(c)]
+
+    # # Load numeric body
+    # data = np.loadtxt(lines[data_start:], dtype=np.float32)
+    # if data.ndim == 1:
+    #     data = data[None, :]
+
+    # if data.shape[1] != len(col_names):
+    #     raise ValueError(f"Column mismatch: got {data.shape[1]} values/line, expected {len(col_names)}")
