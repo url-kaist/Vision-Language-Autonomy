@@ -16,6 +16,8 @@ from geometry_msgs.msg import Point
 from std_msgs.msg import Header, ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 import sensor_msgs.point_cloud2 as pc2
+from std_msgs.msg import String
+
 
 class GridMapper:
     def __init__(self):
@@ -53,6 +55,8 @@ class GridMapper:
         self.wall_cloud_pub = rospy.Publisher("/map_points/wall", PointCloud2, queue_size=1)
         self.free_cloud_pub = rospy.Publisher("/map_points/free", PointCloud2, queue_size=1)
         self.frontier_cloud_pub = rospy.Publisher("/map_points/frontier", PointCloud2, queue_size=1)
+
+        self.instruction_following_pub = rospy.Publisher("/instruction_following_exp_status", String, queue_size=1, latch=False)
         
         self.fov_pub = rospy.Publisher("/fov_marker", Marker, queue_size=1)
         self.frontier_marker_pub = rospy.Publisher("/frontier_markers", MarkerArray, queue_size=1)
@@ -140,6 +144,11 @@ class GridMapper:
             
             # Find Frontiers (Returns: Centroids, All Points)
             frontier_centroids, frontier_points = self._find_and_cluster_frontiers()
+
+            if len(frontier_points) == 0:
+                self.instruction_following_pub.publish("no_frontier")
+            else:
+                print("no_frontier")
             
             self._publish_occupancy_grid()
             self._publish_fov_viz()
