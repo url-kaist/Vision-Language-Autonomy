@@ -615,7 +615,9 @@ class BaseVisualGrounder(BaseModel):
 
     @property
     def action(self):
-        return self.subtask.action
+        if hasattr(self, 'subtask'):
+            return getattr(self.subtask, 'action', None)
+        return None
 
     @property
     def etypes(self):
@@ -1305,6 +1307,7 @@ class BaseVisualGrounder(BaseModel):
 
         self.logger.loginfo(f"self.answer: {self.answer}")
         self.logger.logrich(f"Answer: {answer}", name='answer')
+        self.current_agent_message = f"Answer: {answer}"
         # self.rr_logger.rr.flush()
         # time.sleep(0.5)
         # sys.exit(0)
@@ -1369,22 +1372,42 @@ class BaseVisualGrounder(BaseModel):
                 except:
                     enough_time_elapsed = (elapsed >= 2 * 60)
                 has_any_result = (self.agg_results.best_answer is not None)
+                if self.action == 'count':
+                    if int(self.agg_results.best_answer) == 0:
+                        has_any_result = False
                 
                 # Determine if ready to answer
                 ## Option1: High confidence & Enough time elapsed
                 ## Option2: Enough observation & All inference is done & Has any result
                 ## Option3: Time is almost up
                 try:
-                    ready_to_answer = (((best_confidence > thres_high and enough_time_elapsed)
-                                        or (enough_observation and all_inference_done and has_any_result))
-                                       or (remaining_time <= rospy.Duration(30)))  # (sec)
+                    ready_to_answer = False
+                    if self.action == 'count':
+                        ready_to_answer = (((best_confidence > thres_high and enough_time_elapsed)
+                                            or (enough_observation and all_inference_done and has_any_result))
+                                        or (remaining_time <= rospy.Duration(30)))  # (sec)
+                        ready_to_answer = ready_to_answer and enough_observation
+                    else:
+                        ready_to_answer = (((best_confidence > thres_high and enough_time_elapsed)
+                                            or (enough_observation and all_inference_done and has_any_result))
+                                        or (remaining_time <= rospy.Duration(30)))  # (sec)
+                    self.logger.loginfo(f"self.action: {self.action},  enough_observation: {enough_observation}")
+
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
                     self.rr_log(f"<inference_loop.3.2> Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='inference')
                     self.rr_log(f"Time: {int(elapsed.to_sec())}/{int(self.time_limit.to_sec())} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='summary/status')
                 except Exception as e:
-                    ready_to_answer = (((best_confidence > thres_high and enough_time_elapsed)
+                    ready_to_answer = False
+                    if self.action == 'count':
+                        ready_to_answer = (((best_confidence > thres_high and enough_time_elapsed)
                                         or (enough_observation and all_inference_done and has_any_result))
                                        or (remaining_time <= 30))  # (sec)
+                        ready_to_answer = ready_to_answer and enough_observation
+                    else:
+                        ready_to_answer = (((best_confidence > thres_high and enough_time_elapsed)
+                                        or (enough_observation and all_inference_done and has_any_result))
+                                       or (remaining_time <= 30))  # (sec)
+                    self.logger.loginfo(f"self.action: {self.action},  enough_observation: {enough_observation}")
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
                     self.rr_log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='inference')
                     self.rr_log(f"Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='summary/status')
@@ -1604,13 +1627,15 @@ class BaseVisualGrounder(BaseModel):
             rate.sleep()
 
     def load_and_preprocess_image(self, image_path, preprocess=None):
-        image = Image.open(image_path)
-
-        if preprocess == "crop":
-            # TODO: Implement crop preprocessing
-            pass
-
-        return image
+        if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
+            raise FileNotFoundError(f"Invalid image file: {image_path}")
+        try:
+            return Image.open(image_path).convert("RGB")
+        except Exception:
+            img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            if img is None:
+                raise
+            return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
     def get_images(self, keyframes, suffix="", preprocess=None, **kwargs):
         # if isinstance(keyframes, Keyframe):
@@ -1958,6 +1983,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         super().__init__(*args, **kwargs)
 
         """ Navigation """
+        self.num_frontiers = -1
         # self.min_point_spacing = 0.5
         self.radius = self.config.get('path_radius', 0.55) # (m)
         self.group_threshold = self.config.get('group_threshold', 0.5) # (m)
@@ -2049,6 +2075,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         """ Exploration status """
         self.exploration_status = None
         self.exploration_status_sub = rospy.Subscriber("/instruction_following_exp_status", String, self._exploration_status_callback, queue_size=1)
+        self.logger.loginfo(f"Init self.exploration_status_sub")
 
         """ Timeout """
         self.timeout_sub = rospy.Subscriber(
@@ -2087,9 +2114,10 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                         "SG/agent": rr.Arrows3D(origins=pos, vectors=dir_vec * self.agent_arrow_len,
                                                 colors=[0, 0, 255], radii=0.1)
                     })
-                    balloon_pos = pos + 0.3 * dir_vec * self.agent_arrow_len + np.array([[0.0, 0.0, 0.3]])
-                    self.rr_logger.log({f'SG/message': rr.Points3D(
-                        positions=balloon_pos, labels=[self.current_agent_message], radii=0.001, colors=[255, 255, 255])})
+                    # balloon_pos = pos + 0.3 * dir_vec * self.agent_arrow_len + np.array([[0.0, 0.0, 0.3]])
+                    # self.rr_logger.log({f'SG/message': rr.Points3D(
+                    #     positions=balloon_pos, labels=[self.current_agent_message], radii=0.001, colors=[255, 255, 255])})
+                    self.rr_logger.log({"answer/answer": rr.TextDocument(f"## {self.current_agent_message}", media_type=rr.MediaType.MARKDOWN)})
         except Exception as e:
             self.logger.logerr(f"<log_agent.1> Error occurs: {e}")
         # arrow_tip = pos + 0.3 * dir_vec * self.agent_arrow_len + np.array([[0.0, 0.0, 0.1]])
@@ -2112,9 +2140,9 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     if hasattr(self.sg, 'z_const'):
                         v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2,
                                                     rgb_u8=[0, 255, 255])
-                        if (v0 is not None) and (t0 is not None):
-                            self.rr_logger.log(
-                                {'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
+                        # if (v0 is not None) and (t0 is not None):
+                        #     self.rr_logger.log(
+                        #         {'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
                         v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
                         if (v1 is not None) and (t1 is not None):
                             self.rr_logger.log(
@@ -2141,9 +2169,9 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     if hasattr(self.sg, 'z_const'):
                         v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2,
                                                     rgb_u8=[0, 255, 255])
-                        if (v0 is not None) and (t0 is not None):
-                            self.rr_logger.log(
-                                {'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
+                        # if (v0 is not None) and (t0 is not None):
+                        #     self.rr_logger.log(
+                        #         {'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
                         v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
                         if (v1 is not None) and (t1 is not None):
                             self.rr_logger.log(
@@ -2185,7 +2213,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
 
     def _exploration_status_callback(self, msg):
         self.exploration_status = msg.data
-        self.logger.loginfo(f"Exploration status: {self.exploration_status}")
+        self.logger.loginfo(f">>>>>>>> Exploration status: {self.exploration_status}")
         if self.exploration_status == 'no_frontier':
             (thres_low, thres_high) = self.confidence_threshold
             with self.agg_results_lock:
@@ -2214,6 +2242,8 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     self.answer_result = random.choice(list(self.sg.get_candidate_entities('object', include_untracked=False).ids))
                 elif self.action == 'count':
                     self.answer_result = random.randint(2, 6)
+                elif self.action is None:
+                    self.logger.logwarn(f"action is None")
                 else:
                     raise NotImplementedError(f"self.action must be in ['find', 'count'], but {self.action} was given.")
             self.answer_the_question(self.answer_result)
@@ -2684,11 +2714,29 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             # Success to find current_gid
             current_path_points = path_points_all.get(current_gid)
             if current_path_points is None:
-                self.logger.loginfo(f"<navigate.3> Current path_points for GID({current_gid}) is None.")
-                self.rr_log(f"<navigate.3> Current path_points for GID({current_gid}) is None.", panel='nav')
-                exp_strategy = "geometric_frontier"
-                self.exploration_strategy_pub.publish(String(exp_strategy))
-                return
+                self.logger.loginfo(f"<navigate.3> Current path_points for GID({current_gid}) is None. Selecting next GID.")
+                self.rr_log(f"<navigate.3> Current path_points for GID({current_gid}) is None. Selecting next GID.", panel='nav')
+                candidate_gids = [gid for gid, pts in path_points_all.items() if pts is not None and len(pts) > 0]
+                if not candidate_gids:
+                    self.logger.loginfo(f"<navigate.3> No valid path_points to switch.")
+                    self.rr_log(f"<navigate.3> No valid path_points to switch.", panel='nav')
+                    exp_strategy = "geometric_frontier"
+                    self.exploration_strategy_pub.publish(String(exp_strategy))
+                    return
+                candidate_gids.sort()
+                prev_gid = current_gid
+                next_gid = None
+                for gid in candidate_gids:
+                    if gid > current_gid:
+                        next_gid = gid
+                        break
+                if next_gid is None:
+                    next_gid = candidate_gids[0]
+                self.current_gid = next_gid
+                current_gid = next_gid
+                current_path_points = path_points_all.get(current_gid)
+                self.logger.loginfo(f"<navigate.3> Changed GID: {prev_gid} -> {self.current_gid}")
+                self.rr_log(f"<navigate.3> Changed GID: {prev_gid} -> {self.current_gid}", panel='nav')
             exp_strategy = "geometric_frontier"
             self.exploration_strategy_pub.publish(String(exp_strategy))
             self.logger.loginfo(f"<navigate.3> current_path_points: {current_path_points.shape}")

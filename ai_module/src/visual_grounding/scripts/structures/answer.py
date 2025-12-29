@@ -17,7 +17,7 @@ class Answer:
             for kf in keyframes:
                 pid = kf['id'][1]
                 pids += [pid]
-                eids += pid2eids[pid]
+                eids += pid2eids.get(pid, [])
         self.pids = tuple(pids)
         self.eids = tuple(eids)
 
