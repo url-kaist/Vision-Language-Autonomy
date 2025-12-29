@@ -1374,7 +1374,16 @@ class BaseVisualGrounder(BaseModel):
                     enough_time_elapsed = (elapsed >= 2 * 60)
                 has_any_result = (self.agg_results.best_answer is not None)
                 if self.action == 'count':
-                    if int(self.agg_results.best_answer) == 0:
+                    best_answer = self.agg_results.best_answer
+                    best_count = None
+                    if isinstance(best_answer, Answer):
+                        best_count = best_answer.count
+                    else:
+                        try:
+                            best_count = int(best_answer)
+                        except (TypeError, ValueError):
+                            best_count = None
+                    if best_count == 0:
                         has_any_result = False
                 
                 # Determine if ready to answer
@@ -1382,6 +1391,9 @@ class BaseVisualGrounder(BaseModel):
                 ## Option2: Enough observation & All inference is done & Has any result
                 ## Option3: Time is almost up
                 try:
+                    
+                    no_more_active_waypoints = (self.path_points is None) or (len(self.path_points) == 0)
+
                     ready_to_answer = False
                     if self.action == 'count':
                         ready_to_answer = (((best_confidence > thres_high and enough_time_elapsed)
@@ -1412,6 +1424,8 @@ class BaseVisualGrounder(BaseModel):
                     self.log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}")
                     self.rr_log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='inference')
                     self.rr_log(f"Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='summary/status')
+                
+                ready_to_answer = no_more_active_waypoints and ready_to_answer
 
                 if self.force_answer_signal:
                     ready_to_answer = True
@@ -1420,7 +1434,20 @@ class BaseVisualGrounder(BaseModel):
                     self.force_answer_signal = False
                 
                 if ready_to_answer:
-                    self.answer_result = self.agg_results.best_answer  # TODO
+                    self.answer_result = self.agg_results.best_answer
+                    if self.answer_result is None:
+                        if self.action == 'find':
+                            candidate_ids = list(self.sg.get_candidate_entities('object', include_untracked=False).ids)
+                            if candidate_ids:
+                                self.answer_result = random.choice(candidate_ids)
+                        elif self.action == 'count':
+                            self.answer_result = random.randint(2, 6)
+                        elif self.action is None:
+                            self.logger.logwarn("action is None")
+                        else:
+                            raise NotImplementedError(
+                                f"self.action must be in ['find', 'count'], but {self.action} was given."
+                            )
                     self.answer_the_question(self.answer_result)
                     self.rr_log(f"Answer: {self.answer_result}", panel=['default', 'summary/task'])
                     self.rr_logger.log({"answer/answer": rr.TextDocument(
@@ -1644,7 +1671,7 @@ class BaseVisualGrounder(BaseModel):
                                         mark_r = float(np.clip(mark_r, 0.08, 0.25))
 
                                         # (D) O/X 결정 + 색
-                                        is_ok = (confidence >= 0.5)
+                                        is_ok = (confidence >= 0.7)
                                         mark_char = "O" if is_ok else "X"
                                         mark_color = np.array([0, 255, 0] if is_ok else [255, 0, 0], dtype=np.uint8)  # O=초록, X=빨강
 
@@ -2084,6 +2111,9 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        self.start_record = False
+        self.test_target = None
+        self.test_target_sub = rospy.Subscriber("/test/target", String, self._test_target_callback, queue_size=1)
         """ Navigation """
         self.num_frontiers = -1
         # self.min_point_spacing = 0.5
@@ -2227,6 +2257,13 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         # self.rr_logger.log({'SG/message_tail': rr.LineStrips3D(tail, colors=[49, 56, 59], radii=0.01)})
 
 # CALLBACKS
+    def _test_target_callback(self, msg):
+        self.test_target = msg.data
+        if self.test_target == "vg_first":
+            self.start_record = True
+        else:
+            self.start_record = False
+
     def _odom_callback(self, msg):
         try:
             self.log("_odom_callback")
@@ -2236,7 +2273,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             }
             self.log_agent(agent_pose)
 
-            if hasattr(self, 'path_xy'):
+            if hasattr(self, 'path_xy') and self.start_record:
                 self.path_xy = path_xy = np.concatenate([self.path_xy, [agent_pose['position'][:2]]], axis=0)
                 if len(path_xy) > 1 and getattr(self, 'sg'):
                     if hasattr(self.sg, 'z_const'):
@@ -2265,7 +2302,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
             }
             self.log_agent(agent_pose)
 
-            if hasattr(self, 'path_xy'):
+            if hasattr(self, 'path_xy') and self.start_record:
                 self.path_xy = path_xy = np.concatenate([self.path_xy, [agent_pose['position'][:2]]], axis=0)
                 if len(path_xy) > 1 and getattr(self, 'sg'):
                     if hasattr(self.sg, 'z_const'):
@@ -2317,6 +2354,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         self.exploration_status = msg.data
         self.logger.loginfo(f">>>>>>>> Exploration status: {self.exploration_status}")
         if self.exploration_status == 'no_frontier':
+            self.start_record = True
             (thres_low, thres_high) = self.confidence_threshold
             with self.agg_results_lock:
                 agg_results = self.agg_results.snapshot()
@@ -2404,15 +2442,16 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 self.rr_logger.log({'obs/rgb': rr.Image(rgb)})
             self.log(f"<process.0> Read agent_pose from {_}")
 
-            self.path_xy = path_xy = np.concatenate([self.path_xy, [position[:2]]], axis=0)
-            if len(path_xy) > 1 and getattr(self, 'sg'):
-                if hasattr(self.sg, 'z_const'):
-                    v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2, rgb_u8=[0, 255, 255])
-                    if (v0 is not None) and (t0 is not None):
-                        self.rr_logger.log({'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
-                    v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
-                    if (v1 is not None) and (t1 is not None):
-                        self.rr_logger.log({'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
+            if self.start_record:
+                self.path_xy = path_xy = np.concatenate([self.path_xy, [position[:2]]], axis=0)
+                if len(path_xy) > 1 and getattr(self, 'sg'):
+                    if hasattr(self.sg, 'z_const'):
+                        v0, t0, c0 = build_ribbon_mesh(path_xy, z=self.sg.z_const - 0.01, width=self.radius * 2, rgb_u8=[0, 255, 255])
+                        if (v0 is not None) and (t0 is not None):
+                            self.rr_logger.log({'SG/agent/path_xy_range': rr.Mesh3D(vertex_positions=v0, triangle_indices=t0, vertex_colors=c0)})
+                        v1, t1, c1 = build_ribbon_mesh(path_xy, z=self.sg.z_const, width=0.05, rgb_u8=[0, 0, 255])
+                        if (v1 is not None) and (t1 is not None):
+                            self.rr_logger.log({'SG/agent/path_xy': rr.Mesh3D(vertex_positions=v1, triangle_indices=t1, vertex_colors=c1)})
 
         # Select Group ID
         num_queries_required = 1 # self.agg_results.min_query
@@ -2662,10 +2701,14 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 active_waypoints = []
                 for i, keep in enumerate(kept_mask):
                     if keep:
-                        x1, y1 = group_xyz[0], group_xyz[1]
-                        x2, y2 = new_filtered_path_points[i][0], new_filtered_path_points[i][1]
+                        x1, y1 = new_filtered_path_points[i][0], new_filtered_path_points[i][1]
+                        x2, y2 = group_xyz[0], group_xyz[1]
                         dx, dy = x2 - x1, y2 - y1
                         theta = math.atan2(dy, dx)
+                        self.logger.loginfo(f">>> x1, y1: {x1}, {y1}")
+                        self.logger.loginfo(f">>> x2, y2: {x2}, {y2}")
+                        self.logger.loginfo(f">>> dx, dy: {dx}, {dy}")
+                        self.logger.loginfo(f">>> theta: {theta}")
                         xytheta = np.concatenate([new_filtered_path_points[i], np.array([theta])])
                         active_waypoints.append(xytheta)
 
@@ -2844,8 +2887,8 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 current_path_points = path_points_all.get(current_gid)
                 self.logger.loginfo(f"<navigate.3> Changed GID: {prev_gid} -> {self.current_gid}")
                 self.rr_log(f"<navigate.3> Changed GID: {prev_gid} -> {self.current_gid}", panel='nav')
-            exp_strategy = "geometric_frontier"
-            self.exploration_strategy_pub.publish(String(exp_strategy))
+            # exp_strategy = "geometric_frontier"
+            # self.exploration_strategy_pub.publish(String(exp_strategy))
             self.logger.loginfo(f"<navigate.3> current_path_points: {current_path_points.shape}")
             self.rr_log(f"<navigate.3> current_path_points: {current_path_points.shape}", panel='nav')
             self.current_agent_message = f"Let's observe Group({current_gid})!"
@@ -2900,6 +2943,8 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 else:
                     self.logger.logwarn(f"<navigate.4.2> self.agent_pose is not available.")
                     self.rr_log(f"<navigate.4.2> self.agent_pose is not available.", panel='nav', level='warn')
+                exp_strategy = "geometric_frontier"
+                self.exploration_strategy_pub.publish(String(exp_strategy))
         except Exception as e:
             self.logger.logerr(f"<navigate.4> Error occurs: {e}")
             self.rr_log(f"<navigate.4> Error occurs: {e}", panel='nav', level='error')
@@ -2943,14 +2988,15 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
         # Set exploration strategy
         try:
             if len(current_path_points) > 0:
-                is_running = self.active_clients.start()
-                if is_running:
-                    if self.active_clients.is_paused:
-                        success = self.active_clients.resume()
-                if is_running:
-                    exp_strategy = "vg_first"
-                else:
-                    exp_strategy = "geometric_frontier"
+                # is_running = self.active_clients.start()
+                # if is_running:
+                #     if self.active_clients.is_paused:
+                #         success = self.active_clients.resume()
+                # if is_running:
+                #     exp_strategy = "vg_first"
+                # else:
+                #     exp_strategy = "geometric_frontier"
+                exp_strategy = "vg_first"
                 self.exploration_strategy_pub.publish(String(exp_strategy))
                 self.logger.logrich(f"<navigate.4.5> Exp Strategy: {exp_strategy}", name='navigation')
                 self.rr_log(f"<navigate.4.5> Exp Strategy: {exp_strategy}", panel='nav')

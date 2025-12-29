@@ -8,15 +8,15 @@ import tf.transformations as tft
 from threading import Lock
 import struct
 from collections import deque
+import random
 
 # ROS Messages
 from sensor_msgs.msg import PointCloud2, PointField
 from nav_msgs.msg import OccupancyGrid, Odometry
-from geometry_msgs.msg import Point
-from std_msgs.msg import Header, ColorRGBA
+from geometry_msgs.msg import Point, Quaternion
+from std_msgs.msg import Header, ColorRGBA, String
 from visualization_msgs.msg import Marker, MarkerArray
 import sensor_msgs.point_cloud2 as pc2
-from std_msgs.msg import String
 
 
 class GridMapper:
@@ -28,8 +28,8 @@ class GridMapper:
         self.resolution = rospy.get_param("~resolution", 0.1)
         
         # --- Frontier & Noise Filter Parameters ---
-        self.cluster_min_size = rospy.get_param("~frontier/cluster_min", 20) 
-        self.cluster_size_xy = rospy.get_param("~frontier/cluster_size_xy", 2.0)
+        self.cluster_min_size = rospy.get_param("~frontier/cluster_min", 10) 
+        self.cluster_size_xy = rospy.get_param("~frontier/cluster_size_xy", 1.0)
         self.wall_thickness = rospy.get_param("~wall_thickness", 1)
 
         self.fov_rad = np.deg2rad(self.fov_deg)
@@ -43,6 +43,9 @@ class GridMapper:
         self.local_grid = None
         self.origin_x = 0.0
         self.origin_y = 0.0
+        
+        self.prev_frontier_centroids = [] 
+        self.prev_frontier_colors = []    
         
         self.map_lock = Lock()
         
@@ -142,22 +145,19 @@ class GridMapper:
                     self.local_grid[r, c] = val
                     if val == 100: break
             
-            # Find Frontiers (Returns: Centroids, All Points)
-            frontier_centroids, frontier_points = self._find_and_cluster_frontiers()
+            frontier_centroids, frontier_points, frontier_colors, frontier_orientations = self._find_and_cluster_frontiers()
 
-            if len(frontier_points) == 0:
+            if len(frontier_centroids) == 0:
                 self.instruction_following_pub.publish("no_frontier")
-            else:
-                print("no_frontier")
             
             self._publish_occupancy_grid()
-            self._publish_fov_viz()
+            # self._publish_fov_viz()
             self._publish_split_clouds(frontier_points)
-            self._publish_frontier_markers(frontier_centroids)
+            self._publish_frontier_markers(frontier_centroids, frontier_colors, frontier_orientations)
 
     def _find_and_cluster_frontiers(self):
         if self.local_grid is None:
-            return [], []
+            return [], [], [], []
 
         grid = self.local_grid
         free_mask = (grid == 0)
@@ -174,7 +174,9 @@ class GridMapper:
         frontier_indices = np.argwhere(frontier_mask)
         
         if len(frontier_indices) == 0:
-            return [], []
+            self.prev_frontier_centroids = []
+            self.prev_frontier_colors = []
+            return [], [], [], []
 
         # BFS Clustering
         candidate_cells = set(map(tuple, frontier_indices))
@@ -203,67 +205,152 @@ class GridMapper:
                     world_cluster.append([wx, wy])
                 clusters.append(np.array(world_cluster))
 
-        # PCA Split & Representative Point Selection
-        final_centroids = []
+        # PCA Split with Orientation
+        split_results = []
         for cluster in clusters:
-            self._recursive_pca_split(cluster, final_centroids)
+            self._recursive_pca_split(cluster, split_results)
             
+        final_centroids = []
         all_frontier_points = []
-        blue_rgb = self._pack_rgb(0, 0, 255)
-        for cluster in clusters:
-            for pt in cluster:
-                all_frontier_points.append([pt[0], pt[1], 0.1, blue_rgb])
+        final_colors = []
+        final_orientations = []
+        current_colors = []
 
-        return final_centroids, all_frontier_points
+        for (centroid, points, orientation) in split_results:
+            assigned_color = None
+            min_dist = float('inf')
+            
+            for prev_cent, prev_col in zip(self.prev_frontier_centroids, self.prev_frontier_colors):
+                dist = np.linalg.norm(np.array(centroid) - np.array(prev_cent))
+                if dist < min_dist:
+                    min_dist = dist
+                    best_match_color = prev_col
+            
+            if min_dist < 0.5:
+                assigned_color = best_match_color
+            else:
+                r = random.randint(50, 255)
+                g = random.randint(50, 255)
+                b = random.randint(50, 255)
+                assigned_color = (r, g, b)
+            
+            final_centroids.append(centroid)
+            final_colors.append(assigned_color)
+            final_orientations.append(orientation)
+            current_colors.append(assigned_color)
+            
+            packed_rgb = self._pack_rgb(*assigned_color)
+            for pt in points:
+                all_frontier_points.append([pt[0], pt[1], 0.1, packed_rgb])
+
+        self.prev_frontier_centroids = final_centroids
+        self.prev_frontier_colors = current_colors
+
+        return final_centroids, all_frontier_points, final_colors, final_orientations
 
     def _recursive_pca_split(self, cluster_points, result_list):
         """
-        Recursively splits cluster.
-        [개선] 단순 평균(mean) 대신, 평균과 가장 가까운 실제 포인트를 반환합니다.
+        [수정됨] 단순하고 명확한 방향 계산 로직
+        1. 가장 긴 축(Tangent)을 찾는다.
+        2. 90도 회전시켜 법선(Normal)을 만든다.
+        3. 법선 방향으로 조금 갔을 때 'Unknown'이면 채택, 아니면 반대로 뒤집는다.
         """
         if len(cluster_points) < self.cluster_min_size:
+            if len(cluster_points) > 0:
+                result_list.append((cluster_points[0], cluster_points, [0,0,0,1]))
             return
 
         mean = np.mean(cluster_points, axis=0)
         diffs = cluster_points - mean
-        dists = np.linalg.norm(diffs, axis=1)
         
-        # PCA 분할이 더 이상 필요 없는 경우 (크기가 작음)
-        if np.max(dists) <= self.cluster_size_xy:
-            # --- [핵심 개선] ---
-            # 평균값(mean)은 허공일 수 있으므로, 평균과 가장 가까운 점(Medoid)을 찾습니다.
-            min_dist_idx = np.argmin(dists)
-            representative_point = cluster_points[min_dist_idx]
-            result_list.append(representative_point)
-            return
-
-        # PCA 계산
+        # PCA Calculation
         cov = np.cov(diffs.T)
         eig_vals, eig_vecs = np.linalg.eig(cov)
+        
+        # 가장 큰 고유값 -> 가장 긴 축 (프론티어 라인 방향, Tangent)
+        # 이 방식이 작은 고유값을 쓰는 것보다 훨씬 안정적임
         max_idx = np.argmax(eig_vals)
-        first_pc = eig_vecs[:, max_idx]
+        tangent_vec = eig_vecs[:, max_idx]
         
-        projections = np.dot(diffs, first_pc)
+        # PCA Split을 위한 Projection
+        projections = np.dot(diffs, tangent_vec)
         
+        # 분할 여부 결정 (Hollow & Size Check)
+        dists = np.linalg.norm(diffs, axis=1)
+        min_dist_to_mean = np.min(dists)
+        is_hollow_shape = min_dist_to_mean > (self.resolution * 2.0)
+        max_dist_from_mean = np.max(dists)
+        is_small_enough = max_dist_from_mean <= self.cluster_size_xy
+
+        # --- [Leaf Node 도달 시 방향 계산] ---
+        if is_small_enough and not is_hollow_shape:
+            min_dist_idx = np.argmin(dists)
+            representative_point = cluster_points[min_dist_idx]
+            
+            # 1. Tangent를 90도 회전하여 Normal 생성 (-y, x)
+            # (2D 벡터의 수직 벡터는 좌표 바꾸고 하나 부호 반대)
+            normal_vec = np.array([-tangent_vec[1], tangent_vec[0]])
+            
+            # 2. 방향 검증 (Check Direction)
+            # 법선 방향으로 2칸 정도 앞을 찔러봅니다.
+            check_dist = self.resolution * 2.0
+            check_pos = representative_point + normal_vec * check_dist
+            
+            # 3. 그곳이 Unknown(-1)이 아니면(즉, Free이거나 Obstacle이면) 방향 뒤집기
+            # 우리는 Unknown을 바라봐야 하니까요.
+            if self._check_grid_value(check_pos) != -1:
+                normal_vec = -normal_vec
+                
+            # 4. 안전장치: 만약 뒤집었는데도 Unknown이 아니면? (벽에 낀 경우)
+            # 로봇 반대 방향을 바라보게 합니다.
+            final_check_pos = representative_point + normal_vec * check_dist
+            if self._check_grid_value(final_check_pos) != -1:
+                vec_from_robot = representative_point - np.array([self.robot_x, self.robot_y])
+                if np.linalg.norm(vec_from_robot) > 0.01:
+                    normal_vec = vec_from_robot / np.linalg.norm(vec_from_robot)
+
+            # 5. 쿼터니언 변환
+            target_yaw = math.atan2(normal_vec[1], normal_vec[0])
+            orientation = tft.quaternion_from_euler(0, 0, target_yaw)
+            
+            result_list.append((representative_point, cluster_points, orientation))
+            return
+
+        # Splitting
         mask1 = projections >= 0
         mask2 = projections < 0
         
+        if np.sum(mask1) == 0 or np.sum(mask2) == 0:
+            min_dist_idx = np.argmin(dists)
+            result_list.append((cluster_points[min_dist_idx], cluster_points, [0,0,0,1]))
+            return
+
         self._recursive_pca_split(cluster_points[mask1], result_list)
         self._recursive_pca_split(cluster_points[mask2], result_list)
+
+    def _check_grid_value(self, world_pos):
+        """ 월드 좌표의 그리드 값 확인 """
+        c = int((world_pos[0] - self.origin_x) / self.resolution)
+        r = int((world_pos[1] - self.origin_y) / self.resolution)
+        
+        h, w = self.local_grid.shape
+        if 0 <= r < h and 0 <= c < w:
+            return self.local_grid[r, c]
+        return -2 # Out of bounds
 
     def _publish_split_clouds(self, frontier_points):
         if self.local_grid is None: return
 
-        # 1. Wall Cloud
+        # 1. Wall Cloud (Black & Elevated)
         wall_indices = np.where(self.local_grid == 100)
         wall_points = []
-        red_rgb = self._pack_rgb(0, 0, 0)
-        wall_z = self.obs_height
+        black_rgb = self._pack_rgb(0, 0, 0)
+        wall_z = 0.0
         
         for r, c in zip(wall_indices[0], wall_indices[1]):
             wx = self.origin_x + (c + 0.5) * self.resolution
             wy = self.origin_y + (r + 0.5) * self.resolution
-            wall_points.append([wx, wy, wall_z, red_rgb])
+            wall_points.append([wx, wy, wall_z, black_rgb])
             
         self._publish_pc2(self.wall_cloud_pub, wall_points)
 
@@ -281,8 +368,6 @@ class GridMapper:
         
         # 3. Frontier Cloud
         self._publish_pc2(self.frontier_cloud_pub, frontier_points)
-        #frontier_points를 geometry_msgs/PoseStamped: "/move_base_simple/goal"로 publish하면 됨
-
 
     def _publish_pc2(self, publisher, points_list):
         header = Header(stamp=rospy.Time.now(), frame_id="world")
@@ -293,7 +378,6 @@ class GridMapper:
             PointField('rgb', 12, PointField.FLOAT32, 1)
         ]
         
-        # [수정됨] 잔상 방지: 빈 리스트라도 발행해야 RViz에서 사라짐
         if not points_list:
             pc_msg = pc2.create_cloud(header, fields, [])
             publisher.publish(pc_msg)
@@ -347,27 +431,50 @@ class GridMapper:
         marker.points = [p0, p1, p2, p0]
         self.fov_pub.publish(marker)
 
-    def _publish_frontier_markers(self, frontier_centroids):
+    def _publish_frontier_markers(self, frontier_centroids, colors, orientations):
         marker_array = MarkerArray()
         del_marker = Marker()
         del_marker.action = Marker.DELETEALL
         marker_array.markers.append(del_marker)
         
-        for i, center in enumerate(frontier_centroids):
-            marker = Marker()
-            marker.header.frame_id = "world"
-            marker.header.stamp = rospy.Time.now()
-            marker.ns = "frontiers"
-            marker.id = i
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.pose.position.x = center[0]
-            marker.pose.position.y = center[1]
-            marker.pose.position.z = 0.5
-            marker.pose.orientation.w = 1.0
-            marker.scale.x = 0.3; marker.scale.y = 0.3; marker.scale.z = 0.3
-            marker.color = ColorRGBA(0.0, 0.0, 1.0, 1.0)
-            marker_array.markers.append(marker)
+        for i, (center, color, orient) in enumerate(zip(frontier_centroids, colors, orientations)):
+            # 1. Sphere (위치)
+            sphere = Marker()
+            sphere.header.frame_id = "world"
+            sphere.header.stamp = rospy.Time.now()
+            sphere.ns = "frontiers_pos"
+            sphere.id = i
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position.x = center[0]
+            sphere.pose.position.y = center[1]
+            sphere.pose.position.z = 0.5
+            sphere.pose.orientation.w = 1.0
+            sphere.scale.x = 0.3; sphere.scale.y = 0.3; sphere.scale.z = 0.3
+            sphere.color = ColorRGBA(color[0]/255.0, color[1]/255.0, color[2]/255.0, 1.0)
+            marker_array.markers.append(sphere)
+
+            # 2. Arrow (방향)
+            arrow = Marker()
+            arrow.header.frame_id = "world"
+            arrow.header.stamp = rospy.Time.now()
+            arrow.ns = "frontiers_dir"
+            arrow.id = i + 1000
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+            arrow.pose.position.x = center[0]
+            arrow.pose.position.y = center[1]
+            arrow.pose.position.z = 0.5
+            
+            arrow.pose.orientation.x = orient[0]
+            arrow.pose.orientation.y = orient[1]
+            arrow.pose.orientation.z = orient[2]
+            arrow.pose.orientation.w = orient[3]
+            
+            arrow.scale.x = 0.6; arrow.scale.y = 0.1; arrow.scale.z = 0.1
+            arrow.color = ColorRGBA(1.0, 0.0, 0.0, 1.0)
+            marker_array.markers.append(arrow)
+        
         self.frontier_marker_pub.publish(marker_array)
 
 if __name__ == "__main__":

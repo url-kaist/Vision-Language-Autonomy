@@ -1,6 +1,5 @@
 <launch>
-    <node pkg="pcl_ros" type="pcd_to_pointcloud" name="map_publisher" output="screen" 
-          args="$(find nav_package)/maps/vla_modified.pcd 0.1">
+    <node pkg="pcl_ros" type="pcd_to_pointcloud" name="map_publisher" output="screen" args="$(find nav_package)/maps/vla_modified.pcd 0.1">
         <param name="frame_id" value="world" />
         <remap from="cloud_pcd" to="global_points" />
     </node>
@@ -8,7 +7,7 @@
     <node pkg="nav_package" type="mapping.py" name="GridMapper" output="screen">
         <param name="fov_deg" value="90.0"/>
         <param name="max_dist" value="5.0"/>
-        <param name="obs_height" value="0.2"/>
+        <param name="obs_height" value="0.15"/>
     </node>
 
     <node pkg="rviz" type="rviz" name="rviz" args="-d $(find nav_package)/rviz/config.rviz"/>

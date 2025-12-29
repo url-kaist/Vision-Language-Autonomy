@@ -395,7 +395,7 @@ class AggregatedResult:
         return all(self.results_by_entity_count.num_queries.get(eid, 0) >= self.min_query for eid in eids)
     
     def _count_object_threshold(self) -> float:
-        return float(self.inference_cfg.get("count_obj_thres", 0.5))
+        return float(self.inference_cfg.get("count_obj_thres", 0.7))
 
     def _selected_object_eids(self) -> List[int]:
         th = self._count_object_threshold()
