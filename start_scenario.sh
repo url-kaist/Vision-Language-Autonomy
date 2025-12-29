@@ -22,6 +22,8 @@ SCENARIOS=(
   "How many fans on the drawer" # 15
   "Find a potted plant with orange flower" # 16
   "Find a chair below the halloween poster" # 17
+  "How many white fans on the drawer" # 15 ** 
+  "How many empty chairs?" # 19
   # 여기에 시나리오를 계속 추가하세요.
 )
 
