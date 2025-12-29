@@ -1,0 +1,2 @@
+- setup-file:
+    local-name: /ws/external/ai_module/src/GridMapper/install/setup.sh

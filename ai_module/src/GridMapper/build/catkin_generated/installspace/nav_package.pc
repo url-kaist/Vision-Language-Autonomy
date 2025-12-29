@@ -1,0 +1,8 @@
+prefix=/ws/external/ai_module/src/GridMapper/install
+
+Name: nav_package
+Description: Description of nav_package
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

@@ -1,0 +1,2 @@
+.
+-DCATKIN_DEVEL_PREFIX=/ws/external/ai_module/src/GridMapper/devel -DCMAKE_INSTALL_PREFIX=/ws/external/ai_module/src/GridMapper/install -G Unix Makefiles
