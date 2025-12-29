@@ -13,6 +13,6 @@
   "frame_id": "world",
 
   "_comment": "=== Navigation ===",
-  "path_radius": 1.0,
+  "path_radius": 0.7,
   "group_threshold": 1.5
 }
