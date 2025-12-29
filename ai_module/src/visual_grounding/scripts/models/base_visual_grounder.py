@@ -438,6 +438,11 @@ class BaseVisualGrounder(BaseModel):
         self.system_start_time_sub = rospy.Subscriber(
             "/system_start_time", Clock, self._system_start_time_callback, queue_size=1
         )
+        
+        self.force_answer_signal = False
+        self.force_answer_sub = rospy.Subscriber(
+            "/force_answer", Empty, lambda _msg: setattr(self, "force_answer_signal", True), queue_size=1
+        )
     
     def _init_publishers(self, use_ros=True, *args, **kwargs):
         # Visualizer
@@ -1384,6 +1389,12 @@ class BaseVisualGrounder(BaseModel):
                     self.rr_log(f"<inference_loop.3.2> Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='inference')
                     self.rr_log(f"Time: {int(elapsed)}/{int(self.time_limit.secs)} (sec)  |  Best Conf: {best_confidence:.2f}  |  Exp Status: {self.exploration_status} | Inference Status: {all_inference_done}", panel='summary/status')
 
+                if self.force_answer_signal:
+                    ready_to_answer = True
+                    self.log(f"<inference_loop.3.2> Force answer signal is given.")
+                    self.rr_log(f"<inference_loop.3.2> Force answer signal is given.", panel='inference')
+                    self.force_answer_signal = False
+                
                 if ready_to_answer:
                     self.answer_result = self.agg_results.best_answer  # TODO
                     self.answer_the_question(self.answer_result)
