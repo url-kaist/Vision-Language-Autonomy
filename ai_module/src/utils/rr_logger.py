@@ -155,15 +155,22 @@ class RRLogger:
                 rrb.Vertical(
                     rrb.TextDocumentView(
                         name="Instruction",
-                        origin=f"/",
-                        contents=[f"given/**"],
+                        origin="/",
+                        contents=["given/**"],
                     ),
+
+                    rrb.TextDocumentView(
+                        name="Answer",
+                        origin="/",
+                        contents=["answer/**"],
+                    ),
+
                     rrb.Horizontal(
                         # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
                         rrb.Spatial3DView(
                             name="SceneGraph 3D",
                             origin="/",
-                            contents=[f"SG/**"],
+                            contents=["SG/**"],
                         ),
 
                         # (2) 우측 패널: 2D 이미지 + 선택 패널
@@ -171,9 +178,8 @@ class RRLogger:
                             rrb.Spatial2DView(
                                 name="Observation",
                                 origin="/",
-                                contents=[f"obs/**"],
+                                contents=["obs/**"],
                             ),
-
                         ),
                     ),
                 ),

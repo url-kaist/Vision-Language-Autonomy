@@ -1388,6 +1388,8 @@ class BaseVisualGrounder(BaseModel):
                     self.answer_result = self.agg_results.best_answer  # TODO
                     self.answer_the_question(self.answer_result)
                     self.rr_log(f"Answer: {self.answer_result}", panel=['default', 'summary/task'])
+                    self.rr_logger.log({"answer/answer": rr.TextDocument(
+                        f"## {self.answer_result}", media_type=rr.MediaType.MARKDOWN)})
 
                     if best_confidence > thres_high:
                         self.log(f"<inference_loop.3.2> Answer the final result. Confidence: {best_confidence} > {thres_high}.")
