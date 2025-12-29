@@ -1578,7 +1578,108 @@ class BaseVisualGrounder(BaseModel):
                                                     )
                                                 )
                                 elif self.action == 'count':
-                                    print("")
+                                    eids = self.agg_results.results_by_entity_count.results.keys()
+
+                                    for (level, id), data in self.sg.G.nodes(data=True):
+                                        if level != str(NodeLevel.OBJECT):
+                                            continue
+                                        if id not in eids:
+                                            continue
+
+                                        entity_path = f"SG/nodes/{str(level)}/{id}"
+                                        attrs = data.get("_attrs", {})
+
+                                        # agg
+                                        agg_result = self.agg_results.results_by_entity_count.results[id]
+                                        confidence = float(agg_result.get("confidence", 0.0))
+                                        count = int(agg_result.get("count", 0))
+                                        order = agg_result.get("order", None)
+
+                                        centers = np.array([attrs["centroid"]], dtype=np.float32)  # (1, 3)
+                                        half_sizes = np.array([attrs["extent"]], dtype=np.float32) * 0.5
+                                        quaternions = rotmat_to_quat_xyzw(np.array(attrs["R"])).reshape(1, 4)
+
+                                        colors = self.rr_logger.palette[int(str(id).split("_")[-1])]
+
+                                        # (A) 메타 값 기록
+                                        self.rr_logger.log({
+                                            entity_path: rr.AnyValues(
+                                                confidence=f"{confidence:.2f}",
+                                                count=count,
+                                                order=order if order is not None else -1,
+                                            ),
+                                        })
+                                        
+                                        # (B) 라벨 위치(기존 유지)
+                                        label_pos = copy.deepcopy(centers)        # (1,3)
+                                        label_pos[:, 2] = 1.5
+                                        p = label_pos[0]                          # (3,)
+
+                                        # (C) 표시 크기: count 기반(원/엑스의 "반지름")
+                                        mark_r = 0.10 + 0.04 * np.log1p(count)    # 원하는대로 키워도 됨
+                                        mark_r = float(np.clip(mark_r, 0.08, 0.25))
+
+                                        # (D) O/X 결정 + 색
+                                        is_ok = (confidence >= 0.5)
+                                        mark_char = "O" if is_ok else "X"
+                                        mark_color = np.array([0, 255, 0] if is_ok else [255, 0, 0], dtype=np.uint8)  # O=초록, X=빨강
+
+                                        # (E) anchor 점(원하는 경우 유지): UI 픽셀 크기로 키우려면 radii를 음수로
+                                        #     (음수 radii = UI points; zoom해도 크기 고정) :contentReference[oaicite:1]{index=1}
+                                        self.rr_logger.log({
+                                            f"{entity_path}/confidence/anchor": rr.Points3D(
+                                                positions=label_pos,
+                                                radii=-10.0,              # <-- UI points (픽셀 느낌). 더 키우려면 -14, -18 등
+                                                colors=mark_color,
+                                            )
+                                        })
+
+                                        # (F) O/X를 "텍스트"가 아니라 "선"으로 그림 => 크기 완전 제어 가능
+                                        if mark_char == "O":
+                                            # 원: XY 평면에 원형 폴리라인(원 개수 늘리면 더 매끈)
+                                            n = 32
+                                            th = np.linspace(0, 2*np.pi, n, endpoint=True)
+                                            circle = np.stack([
+                                                p[0] + mark_r * np.cos(th),
+                                                p[1] + mark_r * np.sin(th),
+                                                np.full_like(th, p[2]),
+                                            ], axis=1).astype(np.float32)
+
+                                            self.rr_logger.log({
+                                                f"{entity_path}/confidence/mark": rr.LineStrips3D(
+                                                    strips=[circle],
+                                                    radii=0.015,           # 선 굵기(원 두께)
+                                                    colors=mark_color,
+                                                )
+                                            })
+
+                                        else:  # "X"
+                                            # X: 두 개의 대각선
+                                            a = np.array([ mark_r,  mark_r, 0.0], dtype=np.float32)
+                                            b = np.array([ mark_r, -mark_r, 0.0], dtype=np.float32)
+
+                                            x1 = np.stack([p - a, p + a], axis=0).astype(np.float32)
+                                            x2 = np.stack([p - b, p + b], axis=0).astype(np.float32)
+
+                                            self.rr_logger.log({
+                                                f"{entity_path}/confidence/mark": rr.LineStrips3D(
+                                                    strips=[x1, x2],
+                                                    radii=0.02,            # 선 굵기
+                                                    colors=mark_color,
+                                                )
+                                            })
+
+                                        # (G) 중심-라벨 연결선도 같은 색으로
+                                        strips = [np.stack([c, l], axis=0) for c, l in zip(centers, label_pos)]
+                                        self.rr_logger.log({
+                                            f"{entity_path}/entity-confidence": rr.LineStrips3D(
+                                                strips=strips,
+                                                radii=0.02,
+                                                colors=mark_color,
+                                            )
+                                        })
+                                                                                
+
                             else:
                                 self.log(f"<inference_loop.4.4.{_}> No updated agg_results")
                         except Exception as e:
