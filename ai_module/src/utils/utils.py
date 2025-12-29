@@ -1,3 +1,4 @@
+import math
 import numpy as np
 try:
     import rospy
@@ -8,6 +9,7 @@ except:
     use_ros = False
 import sensor_msgs.point_cloud2 as pc2
 from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
 
 
 def min_distance(point, points, ord=2, return_index=False):
@@ -165,6 +167,11 @@ def filter_waypoints_by_path(waypoints_xy, path_xy, radius):
 def make_marker_array_from_points(points, ns="", color=(1.0, 0.0, 0.0), frame_id="map"):
     marker_array = MarkerArray()
     for id, target_point in enumerate(points):
+        x, y = target_point[0], target_point[1]
+        theta = target_point[2] if len(target_point) > 2 else None
+        z, w = (math.sin(theta), math.cos(theta)) if theta is not None else (0.0, 1.0)
+
+        # Sphere
         marker = Marker()
         marker.header.frame_id = frame_id
         marker.header.stamp = rospy.Time.now()
@@ -172,13 +179,13 @@ def make_marker_array_from_points(points, ns="", color=(1.0, 0.0, 0.0), frame_id
         marker.id = id
         marker.type = Marker.SPHERE
         marker.action = Marker.ADD
-        marker.pose.position.x = target_point[0]
-        marker.pose.position.y = target_point[1]
+        marker.pose.position.x = x
+        marker.pose.position.y = y
         marker.pose.position.z = 0.0
         marker.pose.orientation.x = 0.0
         marker.pose.orientation.y = 0.0
-        marker.pose.orientation.z = 0.0
-        marker.pose.orientation.w = 1.0
+        marker.pose.orientation.z = z
+        marker.pose.orientation.w = w
         marker.scale.x = 0.2
         marker.scale.y = 0.2
         marker.scale.z = 0.2
@@ -188,4 +195,36 @@ def make_marker_array_from_points(points, ns="", color=(1.0, 0.0, 0.0), frame_id
         marker.color.a = color[3] if len(color) > 3 else 1.0  # 불투명
         marker.lifetime = rospy.Duration(0)  # 0이면 계속 표시
         marker_array.markers.append(marker)
+
+        # # 2) heading arrow (points 기반이 가장 직관적)
+        # marker = Marker()
+        # marker.header.frame_id = frame_id
+        # marker.header.stamp = rospy.Time.now()
+        # marker.ns = ns
+        # marker.id = id
+        # marker.type = Marker.ARROW
+        # marker.action = Marker.ADD
+        # marker.pose.position.x = x
+        # marker.pose.position.y = y
+        # marker.pose.position.z = 0.0
+        # marker.pose.orientation.x = 0.0
+        # marker.pose.orientation.y = 0.0
+        # marker.pose.orientation.z = z
+        # marker.pose.orientation.w = w
+        # marker.scale.x = 0.35
+        # marker.scale.y = 0.06
+        # marker.scale.z = 0.10
+        # marker.color.r = color[0]
+        # marker.color.g = color[1]
+        # marker.color.b = color[2]
+        # marker.color.a = color[3] if len(color) > 3 else 1.0  # 불투명
+        # marker.lifetime = rospy.Duration(0)  # 0이면 계속 표시
+        #
+        # # ARROW는 "points"로 시작/끝을 주면 orientation 계산이 필요없고 확실히 보임
+        # start = Point(x=x, y=y, z=0.0)
+        # L = 0.6  # arrow length
+        # end = Point(x=x + L * math.cos(theta), y=y + L * math.sin(theta), z=0.0)
+        # marker.points = [start, end]
+        # marker_array.markers.append(marker)
+
     return marker_array

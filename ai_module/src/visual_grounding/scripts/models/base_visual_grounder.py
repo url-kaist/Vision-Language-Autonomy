@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 sys.path.append('/ws/external/')
 import cv2
 import glob
@@ -2661,7 +2662,12 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                 active_waypoints = []
                 for i, keep in enumerate(kept_mask):
                     if keep:
-                        active_waypoints.append(new_filtered_path_points[i])
+                        x1, y1 = group_xyz[0], group_xyz[1]
+                        x2, y2 = new_filtered_path_points[i][0], new_filtered_path_points[i][1]
+                        dx, dy = x2 - x1, y2 - y1
+                        theta = math.atan2(dy, dx)
+                        xytheta = np.concatenate([new_filtered_path_points[i], np.array([theta])])
+                        active_waypoints.append(xytheta)
 
                 current_path_points = np.array(active_waypoints)
                 with self.navigation_lock:
@@ -2918,6 +2924,12 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                     path_points, ns=f"path_points_{gid}", color=colors[gid], frame_id=self.frame_id)
                 marker_array_all.extend(path_points_marker.markers)
             if marker_array_all:
+                delete_all = MarkerArray()
+                m = Marker()
+                m.action = Marker.DELETEALL
+                delete_all.markers.append(m)
+                self.path_points_vis_pub.publish(delete_all)
+
                 marker_array = MarkerArray(markers=marker_array_all)
                 self.previous_path_points = marker_array
                 self.path_points_vis_pub.publish(self.previous_path_points)
