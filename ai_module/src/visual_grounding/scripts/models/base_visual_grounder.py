@@ -491,6 +491,9 @@ class BaseVisualGrounder(BaseModel):
             self.rr_log(f"Target Name: \"{subtask.entity.target_name}\"", panel=['default', 'summary/task'])
             self.rr_log(f"Candidate names: {self.candidate_names}", panel=['default', 'summary/task'])
             self.rr_log(f"Reference names: {self.reference_names}", panel=['default', 'summary/task'])
+
+            self.rr_logger.log({"given/instructoin": rr.TextDocument(
+                f"## {req.text_instruction}", media_type=rr.MediaType.MARKDOWN)})
             return SetSubplansResponse(success=True, message=self.status)
         else:
             return SetSubplansResponse(success=False, message=self.status)

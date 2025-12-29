@@ -152,6 +152,33 @@ class RRLogger:
         log_root = "VG/"
         blueprint = rrb.Blueprint(
             rrb.Vertical(
+                rrb.Vertical(
+                    rrb.TextDocumentView(
+                        name="Instruction",
+                        origin=f"/",
+                        contents=[f"given/**"],
+                    ),
+                    rrb.Horizontal(
+                        # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
+                        rrb.Spatial3DView(
+                            name="SceneGraph 3D",
+                            origin="/",
+                            contents=[f"SG/**"],
+                        ),
+
+                        # (2) 우측 패널: 2D 이미지 + 선택 패널
+                        rrb.Vertical(
+                            rrb.Spatial2DView(
+                                name="Observation",
+                                origin="/",
+                                contents=[f"obs/**"],
+                            ),
+
+                        ),
+                    ),
+                ),
+            ),
+            rrb.Vertical(
                 rrb.Horizontal(
                     # (1) 3D: 오브젝트 박스 + 키프레임 Transform(카메라 frustum 포함)
                     rrb.Spatial3DView(
@@ -197,7 +224,6 @@ class RRLogger:
                     column_shares=[1, 1],
                 ),
             ),
-            # row_shares=[1, 1],
 
             rrb.Vertical(
                 rrb.Horizontal(
