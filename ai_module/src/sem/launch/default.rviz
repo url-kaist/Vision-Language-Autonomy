@@ -5,9 +5,7 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /Status1
-        - /TRG1
         - /TRG1/Path1
-        - /SceneGraph1
       Splitter Ratio: 0.5
     Tree Height: 519
   - Class: rviz/Selection
@@ -60,7 +58,10 @@ Visualization Manager:
           Marker Topic: /active_waypoints_vis
           Name: MarkerArray
           Namespaces:
-            {}
+            path_points_0: true
+            path_points_1: true
+            path_points_2: true
+            path_points_all: true
           Queue Size: 1
           Value: true
         - Angle Tolerance: 0.10000000149011612
@@ -112,7 +113,7 @@ Visualization Manager:
           Marker Topic: /trg/debug/default_graph
           Name: MarkerArray
           Namespaces:
-            {}
+            "": true
           Queue Size: 1
           Value: true
         - Alpha: 1
@@ -193,14 +194,14 @@ Visualization Manager:
           Channel Name: intensity
           Class: rviz/PointCloud2
           Color: 255; 255; 255
-          Color Transformer: ""
+          Color Transformer: RGB8
           Decay Time: 0
           Enabled: true
           Invert Rainbow: false
           Max Color: 255; 255; 255
           Min Color: 0; 0; 0
           Name: HashMap
-          Position Transformer: ""
+          Position Transformer: XYZ
           Queue Size: 1
           Selectable: true
           Size (Pixels): 3
@@ -216,7 +217,9 @@ Visualization Manager:
           Marker Topic: /scene_graph_markers
           Name: SceneGraph
           Namespaces:
-            {}
+            node/building: true
+            node/keyframe: true
+            node/object: true
           Queue Size: 1
           Value: true
         - Class: rviz/MarkerArray
@@ -224,11 +227,21 @@ Visualization Manager:
           Marker Topic: /object_marker
           Name: Object
           Namespaces:
-            {}
+            bubbles: true
+            labels: true
+            lines: true
           Queue Size: 1
           Value: true
       Enabled: true
       Name: SceneGraph
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /frontier_markers
+      Name: MarkerArray
+      Namespaces:
+        frontiers: true
+      Queue Size: 100
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -257,7 +270,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 8.044708251953125
+      Distance: 11.302236557006836
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -265,17 +278,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 1.6905992031097412
-        Y: 1.9047017097473145
-        Z: -0.5820146799087524
+        X: 2.8325884342193604
+        Y: 0.053904853761196136
+        Z: -0.22866950929164886
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.6697971820831299
+      Pitch: 1.519796371459961
       Target Frame: <Fixed Frame>
-      Yaw: 2.750377655029297
+      Yaw: 3.0903780460357666
     Saved: ~
 Window Geometry:
   Displays:
