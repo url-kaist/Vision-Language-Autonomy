@@ -11,6 +11,17 @@ SCENARIOS=(
   "How many books are on the bookshelf?"
   "How many chairs does the doll sit on?"
   "How many silver fire extinguishers are there next to the TV monitor?"
+  "How many chairs below the halloween poster"
+  "Find a chair below the christmas poster"
+  "Find a chair below the tree poster"
+  "Find a silver extinguisher next to the blue extinguisher" # 10
+  "Find the chair below the halloween poster" # 11
+  "How many fans on the desk" # 12
+  "How many potted plants on the desk" # 13
+  "Find the chair below the orange poster" # 14
+  "How many fans on the drawer" # 15
+  "Find a potted plant with orange flower" # 16
+  "Find a chair below the halloween poster" # 17
   # 여기에 시나리오를 계속 추가하세요.
 )
 

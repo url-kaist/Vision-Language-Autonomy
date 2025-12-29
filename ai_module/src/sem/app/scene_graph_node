@@ -134,7 +134,7 @@ class SceneGraphProcessor:
         base_dir = os.environ.get("OFFLINE_MAP_DIR", "/ws/external/offline_map")
         if os.path.exists(base_dir) and os.path.isdir(base_dir):
             try:
-                shutil1.rmtree(base_dir)
+                shutil.rmtree(base_dir)
             except Exception as e:
                 self.logger.logerr(f"ERROR MSG: {e}")
                 pass
@@ -955,9 +955,9 @@ class SceneGraphProcessor:
                 )
 
                 tracks = tracker.update_with_detections(detections)
+                display_dets = tracks if tracks is not None and len(tracks) > 0 else detections
 
                 if False:
-                    display_dets = tracks if tracks is not None and len(tracks) > 0 else detections
 
                     if len(display_dets) > 0:
                         # tracker_id가 None인 경우 -1로 채운 배열 생성
