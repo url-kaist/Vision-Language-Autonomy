@@ -182,33 +182,12 @@ def make_marker_array_from_points(points, ns="", color=(1.0, 0.0, 0.0), frame_id
     if len(points) == 0:
         return marker_array
 
-    # 1. Calculate Centroid (Geometric Center)
-    # This is the "target" every arrow will look at.
-    points_np = np.array(points)
-    # Handle cases where points might be (N, 2) or (N, 3)
-    # if points_np.shape[1] >= 2:
-    #     centroid = np.mean(points_np[:, :2], axis=0)
-    # else:
-    #     rospy.logwarn("Points array shape invalid")
-    #     return marker_array
-
     for i, point in enumerate(points):
         x, y = point[0], point[1]
-        yaw_inward = point[2] if len(point) > 2 else 0.0
-        print(f">>>>>>>>>. yaw_inward: {yaw_inward}")
+        theta = point[2] if len(point) > 2 else 0.0
+        print(f">>>>>>>>>. theta: {theta}")
 
-        # 2. Calculate Vector to Centroid
-        # Vector = Target - Current
-        # dx = centroid[0] - x
-        # dy = centroid[1] - y
-
-        # 3. Calculate Yaw (Angle)
-        # yaw_inward = math.atan2(dy, dx)
-
-        # 4. Use TF Library for Quaternion
-        # quaternion_from_euler takes (roll, pitch, yaw)
-        # Returns [x, y, z, w]
-        q = quaternion_from_euler(0, 0, yaw_inward)
+        q = quaternion_from_euler(0, 0, theta)
         print(f">>>>>>>>>. q: {q}")
 
         # --- Marker Creation ---
@@ -244,68 +223,3 @@ def make_marker_array_from_points(points, ns="", color=(1.0, 0.0, 0.0), frame_id
         marker_array.markers.append(marker)
 
     return marker_array
-# def make_marker_array_from_points(points, ns="", color=(1.0, 0.0, 0.0), frame_id="map"):
-#     marker_array = MarkerArray()
-#     for id, target_point in enumerate(points):
-#         x, y = target_point[0], target_point[1]
-#         theta = target_point[2] + math.pi if len(target_point) > 2 else None
-#         print(f"============== theta: {theta} ============")
-#         print(f"============== len(target_point): {len(target_point)} ============")
-#         z_quat, w_quat = (math.sin(theta / 2.0), math.cos(theta / 2.0)) if theta is not None else (0.0, 1.0)
-#         # z, w = (math.sin(theta / 2.0), math.cos(theta / 2.0)) if theta is not None else (0.0, 1.0)
-#         # z, w = (math.sin(theta), math.cos(theta)) if theta is not None else (0.0, 1.0)
-
-#         # Sphere
-#         marker = Marker()
-#         marker.header.frame_id = frame_id
-#         marker.header.stamp = rospy.Time.now()
-#         marker.ns = ns
-#         marker.id = id
-#         marker.type = Marker.SPHERE
-#         marker.action = Marker.ADD
-#         marker.pose.position.x = x
-#         marker.pose.position.y = y
-#         marker.pose.position.z = 0.0
-#         marker.pose.orientation.x = 0.0
-#         marker.pose.orientation.y = 0.0
-#         marker.pose.orientation.z = z_quat
-#         marker.pose.orientation.w = w_quat
-#         marker.scale.x = 0.2
-#         marker.scale.y = 0.2
-#         marker.scale.z = 0.2
-#         marker.color.r = color[0]
-#         marker.color.g = color[1]
-#         marker.color.b = color[2]
-#         marker.color.a = color[3] if len(color) > 3 else 1.0  # 불투명
-#         marker.lifetime = rospy.Duration(0)  # 0이면 계속 표시
-#         marker_array.markers.append(marker)
-
-#         # FIX 2: Use ARROW to visualize orientation. 
-#         # If you really want a SPHERE, switch this back, but orientation won't be visible.
-
-#         marker.type = Marker.ARROW 
-#         marker.action = Marker.ADD
-        
-#         marker.pose.position.x = x
-#         marker.pose.position.y = y
-#         marker.pose.position.z = target_point[2] # Use the actual Z from input
-        
-#         marker.pose.orientation.x = 0.0
-#         marker.pose.orientation.y = 0.0
-#         marker.pose.orientation.z = z_quat
-#         marker.pose.orientation.w = w_quat
-        
-#         # Scale for ARROW: x is length, y is width, z is height
-#         marker.scale.x = 0.5 
-#         marker.scale.y = 0.1
-#         marker.scale.z = 0.1
-        
-#         marker.color.r = color[0]
-#         marker.color.g = color[1]
-#         marker.color.b = color[2]
-#         marker.color.a = color[3] if len(color) > 3 else 1.0
-        
-#         marker.lifetime = rospy.Duration(0)
-#         marker_array.markers.append(marker)
-
-#     return marker_array

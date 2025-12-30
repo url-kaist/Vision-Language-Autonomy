@@ -2705,11 +2705,7 @@ class BaseActiveVisualGrounder(BaseVisualGrounder):
                         x2, y2 = group_xyz[0], group_xyz[1]
                         dx, dy = x2 - x1, y2 - y1
                         theta = math.atan2(dy, dx)
-                        self.logger.loginfo(f">>> x1, y1: {x1}, {y1}")
-                        self.logger.loginfo(f">>> x2, y2: {x2}, {y2}")
-                        self.logger.loginfo(f">>> dx, dy: {dx}, {dy}")
-                        self.logger.loginfo(f">>> theta: {theta}")
-                        xytheta = np.concatenate([new_filtered_path_points[i], np.array([theta])])
+                        xytheta = np.array([x1, y1, theta])
                         active_waypoints.append(xytheta)
 
                 current_path_points = np.array(active_waypoints)
